@@ -16,10 +16,10 @@ impl Evaluator {
             }
             _ => (adapter.top.clone(), None, 0),
         };
-        let mut argv = vec![OsString::from(&adapter.bin)];
+        let mut argv = crate::args::ArgvBuilder::new(OsString::from(&adapter.bin))?;
         match (&spec.invoke, &sub) {
-            (Some(rewrite), _) => argv.extend(rewrite.iter().map(OsString::from)),
-            (None, Some(sub)) => argv.push(sub.into()),
+            (Some(rewrite), _) => argv.extend(rewrite.iter().map(OsString::from))?,
+            (None, Some(sub)) => argv.push(sub.into())?,
             (None, None) => {}
         }
         let mut positional = 0usize;
@@ -53,13 +53,13 @@ impl Evaluator {
                         } else {
                             format!("--{}", name.replace('_', "-"))
                         };
-                        argv.push(spelled.into());
+                        argv.push(spelled.into())?;
                     }
                     if let Some(value) = value {
                         let v = self.cmd_arg_value(value)?;
                         validate_adapter_value(&v, &param.ty)?;
                         if !consumed {
-                            argv.push(self.argv_value(v)?);
+                            argv.push(self.argv_value(v)?)?;
                         }
                     } else if !param.ty.trim_end_matches('?').eq("bool") {
                         i += 1;
@@ -69,7 +69,7 @@ impl Evaluator {
                         let v = self.cmd_arg_value(next)?;
                         validate_adapter_value(&v, &param.ty)?;
                         if !consumed {
-                            argv.push(self.argv_value(v)?);
+                            argv.push(self.argv_value(v)?)?;
                         }
                     }
                 }
@@ -89,10 +89,10 @@ impl Evaluator {
                         }
                     }
                     if !kept.is_empty() {
-                        argv.push(format!("-{kept}").into());
+                        argv.push(format!("-{kept}").into())?;
                     }
                 }
-                CmdArg::DashDash { .. } => argv.push("--".into()),
+                CmdArg::DashDash { .. } => argv.push("--".into())?,
                 arg => {
                     let expected = spec
                         .positional
@@ -105,15 +105,15 @@ impl Evaluator {
                     // A parameter typed glob owns expansion; T0/list<path> expansion remains elsewhere.
                     if matches!(expected.map(|p| p.ty.trim_end_matches('?')), Some("glob")) {
                         match value {
-                            Value::Glob(g) => argv.push(g.pattern.into()),
-                            v => argv.push(self.argv_value(v)?),
+                            Value::Glob(g) => argv.push(g.pattern.into())?,
+                            v => argv.push(self.argv_value(v)?)?,
                         }
                     } else if matches!(value, Value::Glob(_)) {
                         for value in self.expand_arg(arg)? {
-                            argv.push(self.argv_value(value)?);
+                            argv.push(self.argv_value(value)?)?;
                         }
                     } else {
-                        argv.push(self.argv_value(value)?);
+                        argv.push(self.argv_value(value)?)?;
                     }
                     positional += 1;
                 }
@@ -145,6 +145,7 @@ impl Evaluator {
         } else {
             position
         };
+        let argv = argv.finish();
         if output_redirected {
             self.run_argv_redirected(
                 argv,

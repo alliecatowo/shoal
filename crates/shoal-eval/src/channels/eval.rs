@@ -148,11 +148,24 @@ impl Evaluator {
         // finish before its TaskVal can be discovered through jobs/task APIs.
         // A Builder failure completes this already-registered task below.
         self.exec.jobs.register(task.clone());
+        // A successful thread spawn is not the same as a scheduled, initialized
+        // handler. Do not return the task until the child evaluator exists and
+        // the worker is entering its receive loop. This one-slot startup
+        // handoff prevents a heavily loaded host from letting the caller race
+        // arbitrarily far ahead of handler initialization.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let launch = std::thread::Builder::new()
             .name(format!("shoal-on-{chan}"))
             .spawn(move || {
                 let _lease = lease;
                 let mut ev = ctx.build(ChildKind::OnHandler, child_cancel.clone());
+                if ready_tx.send(()).is_err() {
+                    worker.finish(Err(ErrorVal::new(
+                        "task_spawn",
+                        "channel handler owner disappeared during startup",
+                    )));
+                    return;
+                }
                 let result = loop {
                     let event = match rx.recv(None, Some(&child_cancel)) {
                         Received::Event(event) => event,
@@ -171,6 +184,14 @@ impl Evaluator {
             let failure = ErrorVal::new(
                 "task_spawn",
                 format!("could not start channel handler task: {error}"),
+            );
+            task.finish(Err(failure.clone()));
+            return Err(failure);
+        }
+        if ready_rx.recv().is_err() {
+            let failure = ErrorVal::new(
+                "task_spawn",
+                "channel handler exited before completing startup",
             );
             task.finish(Err(failure.clone()));
             return Err(failure);

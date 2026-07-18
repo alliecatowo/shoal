@@ -571,13 +571,20 @@ impl Evaluator {
                 self.eval_lang_block(tool, src, stdin, position, *span)
             }
             Expr::Cmd { call, .. } => {
-                let mut argv = vec![OsString::from(&call.head)];
+                let mut argv = crate::args::ArgvBuilder::new(OsString::from(&call.head))?;
                 for a in &call.args {
                     for v in self.expand_arg(a)? {
-                        argv.push(self.argv_value(v)?);
+                        argv.push(self.argv_value(v)?)?;
                     }
                 }
-                self.run_argv(argv, position, stdin, &call.env_prefix, call.span, None)
+                self.run_argv(
+                    argv.finish(),
+                    position,
+                    stdin,
+                    &call.env_prefix,
+                    call.span,
+                    None,
+                )
             }
             Expr::Var { name, .. } => {
                 self.run_argv(vec![OsString::from(name)], position, stdin, &[], span, None)

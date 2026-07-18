@@ -83,6 +83,7 @@ impl Evaluator {
         span: Span,
         meta: Option<ExecMeta>,
     ) -> VResult<Value> {
+        crate::args::validate_argv(&argv)?;
         let (position, force_capture, emit_failed_output) = match process_mode {
             ProcessMode::Auto(position) => (position, false, true),
             ProcessMode::Redirected(position) => (position, true, false),

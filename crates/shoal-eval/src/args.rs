@@ -5,6 +5,90 @@ use super::*;
 
 pub(crate) const MAX_GLOB_MATCHES: usize = 16_384;
 pub(crate) const MAX_GLOB_PATH_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PROCESS_ARGV_VALUES: usize = 16_384;
+pub(crate) const MAX_PROCESS_ARGV_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) struct ArgvBuilder {
+    values: Vec<OsString>,
+    bytes: usize,
+    max_values: usize,
+    max_bytes: usize,
+}
+
+impl ArgvBuilder {
+    pub(crate) fn new(head: OsString) -> VResult<Self> {
+        Self::with_limits(head, MAX_PROCESS_ARGV_VALUES, MAX_PROCESS_ARGV_BYTES)
+    }
+
+    fn with_limits(head: OsString, max_values: usize, max_bytes: usize) -> VResult<Self> {
+        let mut builder = Self {
+            values: Vec::new(),
+            bytes: 0,
+            max_values,
+            max_bytes,
+        };
+        builder.push(head)?;
+        Ok(builder)
+    }
+
+    pub(crate) fn push(&mut self, value: OsString) -> VResult<()> {
+        if self.values.len() >= self.max_values {
+            return Err(argv_limit(format!(
+                "process argv reached its {}-value limit",
+                self.max_values
+            )));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(value.as_os_str().as_encoded_bytes().len())
+            .ok_or_else(|| argv_limit("process argv byte accounting overflowed"))?;
+        if self.bytes > self.max_bytes {
+            return Err(argv_limit(format!(
+                "process argv exceeds its {}-byte limit",
+                self.max_bytes
+            )));
+        }
+        self.values.push(value);
+        Ok(())
+    }
+
+    pub(crate) fn extend(&mut self, values: impl IntoIterator<Item = OsString>) -> VResult<()> {
+        for value in values {
+            self.push(value)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Vec<OsString> {
+        self.values
+    }
+}
+
+pub(crate) fn validate_argv(values: &[OsString]) -> VResult<()> {
+    if values.len() > MAX_PROCESS_ARGV_VALUES {
+        return Err(argv_limit(format!(
+            "process argv has {} values; the limit is {MAX_PROCESS_ARGV_VALUES}",
+            values.len()
+        )));
+    }
+    let mut bytes = 0usize;
+    for value in values {
+        bytes = bytes
+            .checked_add(value.as_os_str().as_encoded_bytes().len())
+            .ok_or_else(|| argv_limit("process argv byte accounting overflowed"))?;
+        if bytes > MAX_PROCESS_ARGV_BYTES {
+            return Err(argv_limit(format!(
+                "process argv exceeds its {MAX_PROCESS_ARGV_BYTES}-byte limit"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn argv_limit(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::new("argv_limit", message)
+        .with_hint("reduce arguments, narrow glob expansions, or feed data through stdin")
+}
 
 impl Evaluator {
     pub(crate) fn cmd_arg_value(&mut self, a: &CmdArg) -> VResult<Value> {
@@ -203,5 +287,15 @@ mod tests {
                 .code,
             "glob_expansion_limit"
         );
+    }
+
+    #[test]
+    fn argv_builder_checks_count_and_bytes_before_retaining_the_next_value() {
+        let mut count = ArgvBuilder::with_limits("cmd".into(), 2, 1024).unwrap();
+        count.push("one".into()).unwrap();
+        assert_eq!(count.push("two".into()).unwrap_err().code, "argv_limit");
+
+        let mut bytes = ArgvBuilder::with_limits("c".into(), 8, 3).unwrap();
+        assert_eq!(bytes.push("abc".into()).unwrap_err().code, "argv_limit");
     }
 }

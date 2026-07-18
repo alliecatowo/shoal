@@ -130,9 +130,11 @@ fn on_handler_inherits_the_spawn_gate() {
     let (d, ok) = scene();
     let mut ev = restricted_evaluator(d.path());
     let src = format!(
-        "on(channel(\"cmd\"), (ev) => {{ channel(\"res\").emit(try {{ ({}).ok }} catch {{ \"DENIED\" }}) }})\n\
+        "let listener = on(channel(\"cmd\"), (ev) => {{ channel(\"res\").emit(try {{ ({}).ok }} catch {{ \"DENIED\" }}) }})\n\
          channel(\"cmd\").emit(1)\n\
-         channel(\"res\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()",
+         let result = channel(\"res\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()\n\
+         listener.cancel()\n\
+         result",
         cat_src(&ok)
     );
     let out = ev
@@ -198,9 +200,11 @@ fn parallel_inherits_config() {
 fn on_handler_inherits_config() {
     let (d, _ok) = scene();
     let mut ev = config_evaluator(d.path());
-    let src = "on(channel(\"cmd\"), (ev) => { channel(\"cfg\").emit(config.get(\"b_marker\")) })\n\
+    let src = "let listener = on(channel(\"cmd\"), (ev) => { channel(\"cfg\").emit(config.get(\"b_marker\")) })\n\
                channel(\"cmd\").emit(1)\n\
-               channel(\"cfg\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()";
+               let result = channel(\"cfg\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()\n\
+               listener.cancel()\n\
+               result";
     let out = ev.eval_program(&parse(src)).expect("handler config read");
     assert_eq!(out, Value::Str("propagated".into()), "on: {out:?}");
 }
@@ -352,9 +356,11 @@ fn on_handler_inherits_reef_resolution() {
     // resolved to the fixture inside the handler's child; a child that dropped
     // the reef inputs could not resolve it, so `(faketool).ok` raises and the
     // handler reports `"MISS"`.
-    let src = "on(channel(\"cmd\"), (ev) => { channel(\"res\").emit(try { (faketool).ok } catch { \"MISS\" }) })\n\
+    let src = "let listener = on(channel(\"cmd\"), (ev) => { channel(\"res\").emit(try { (faketool).ok } catch { \"MISS\" }) })\n\
                channel(\"cmd\").emit(1)\n\
-               channel(\"res\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()";
+               let result = channel(\"res\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()\n\
+               listener.cancel()\n\
+               result";
     let out = ev
         .eval_program(&parse(src))
         .expect("on-handler reports a result");

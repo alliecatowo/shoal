@@ -243,6 +243,11 @@ Runtime command/list/loop expansion and static plan path derivation share one bo
 produce at most 16,384 matched paths and 16 MiB of path bytes. Exceeding either wall raises
 `glob_expansion_limit`; narrow the pattern or walk the directory incrementally.
 
+External, adapted, script-runner, and stream-feed process invocations admit at most 16,384 argv
+values and 16 MiB of encoded argument bytes. Glob-capable builders enforce the envelope before
+retaining each next expanded argument, and the final spawn boundary revalidates every caller.
+Exceeding it raises `argv_limit`; pass bulk data through stdin instead.
+
 ### Cancellation and process trees
 
 Cancellation is cooperative through evaluator tokens and process handles. It is not a universal transaction or guaranteed descendant-process-tree cleanup on every platform. Side effects completed before cancellation remain.

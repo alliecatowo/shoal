@@ -294,12 +294,13 @@ impl Evaluator {
             return self.enforce_command_position(value, position, false);
         }
         debug_assert_eq!(resolution.source, CommandSource::External);
-        let mut argv = vec![OsString::from(&call.head)];
+        let mut argv = crate::args::ArgvBuilder::new(OsString::from(&call.head))?;
         for a in &call.args {
             for v in self.expand_arg(a)? {
-                argv.push(self.argv_value(v)?);
+                argv.push(self.argv_value(v)?)?;
             }
         }
+        let argv = argv.finish();
         let mut stdin = StdinSpec::Null;
         for r in &call.redirects {
             if r.kind == RedirectKind::In {

@@ -500,7 +500,7 @@ launcher, and descendants inherit the ceilings. Accounting remains per process: 
 ceiling on each member, not one aggregate CPU/memory pool, and a deliberately detached descendant is
 not owned as a Shoal task.
 
-Connections, retained principal Sessions, active tasks, PTYs (per Session/principal/global), subscriptions, plan/source bytes, transcripts, stream cursors, frames, and event queues have explicit bounds. There is still no general per-principal rate, aggregate memory/CPU, or descendant-process-tree meter. Use OS service controls (cgroups/launchd limits/container quotas where appropriate), supervise the daemon, and keep hostile code outside a shared kernel process.
+Connections, retained principal Sessions, active tasks, PTYs (per Session/principal/global), subscriptions, plan/source bytes, transcripts, stream cursors, frames, event queues, glob results, and process argv have explicit bounds. There is still no general per-principal rate, aggregate memory/CPU, or descendant-process-tree meter. Use OS service controls (cgroups/launchd limits/container quotas where appropriate), supervise the daemon, and keep hostile code outside a shared kernel process.
 
 `task.await` no longer holds a connection worker indefinitely: it defaults to 30 seconds and has a
 60-second server ceiling. A timed-out wait leaves the underlying task running for later poll,
