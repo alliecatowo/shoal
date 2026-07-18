@@ -93,7 +93,7 @@ error messages never quote the rejected URI, tool name, path, body, or bearer.
 | `plan.get/list/apply` | `handlers_task.rs` | yes | session/principal-scoped plan registry |
 | `cap.request` | `handlers_task.rs` | yes | attached approval mutation, approver-bound |
 | `journal.query` | `handlers_value.rs` | yes | attached persistent journal read |
-| `events.read/publish/subscribe/unsubscribe` | `eventbus.rs` | yes | global bus plus session bridge |
+| `events.read/publish/subscribe/unsubscribe` | `eventbus.rs` | yes | exact-owner bus; `journal` reads/subscriptions require `JournalRead` |
 
 Both former exemptions are closed: `journal.query` requires attachment (HR-D4), and `cap.request`
 requires attachment and binds an approver identity distinct from the requester (HR-D1/D2/D3). The only
@@ -526,6 +526,11 @@ the journal. `page.next_since` continues a truncated page, while `page.history_l
 ring-only cursor older than `oldest_available`. A page is also bounded to 8 MiB of encoded events;
 an individually oversized payload becomes an explicit `payload_truncated` marker without losing its
 sequence cursor. Approval, render, task, and `user.*` channels are ring-only and lose old history.
+
+`events.read` and `events.subscribe` require `JournalRead` when their declared channel is `journal`.
+That check precedes full cursor decoding and any durable owner hydration. `events.unsubscribe` does
+not require the grant, so a client can always remove an existing subscription. Other channels retain
+their normal exact principal/Session attachment scope.
 
 `events.publish` rejects kernel-owned names and validates before the first retained clone: channel
 names are at most 128 ASCII bytes, user payloads at most 64 KiB encoded and 64 levels deep, and one

@@ -334,10 +334,11 @@ Exact current behavior:
 
 ## Journal query boundary
 
-`journal.query` requires an attachment and an allowed `JournalRead` policy effect before decoding
-filters. It caps each page server-side, treats `limit:0` as an empty page, and forces
-principal/Session filters to the exact attached owner. An ungranted, unattached, or cross-principal
-query is rejected. Journal rows and CAS remain sensitive persisted data, so
+`journal.query`, journal-backed `blob.get`, and `events.read`/`events.subscribe` for the `journal`
+channel require an attachment and an allowed `JournalRead` policy effect. Authorization precedes
+query/blob decoding and journal-event cursor decoding or durable access. Pages are capped server-side,
+and every row/hash/event remains scoped to the exact attached principal/Session. An ungranted,
+unattached, or cross-principal read is rejected. Journal rows and CAS remain sensitive persisted data, so
 filesystem/state-directory permissions and bearer handling still matter.
 
 ## Named sessions are principal-private
@@ -488,9 +489,8 @@ Connections, retained principal Sessions, active tasks, PTYs (per Session/princi
 Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:
 
 1. add optional peer-credential binding beyond the current public machine-only attach contract;
-2. align durable journal-event replay reads with explicit journal policy;
-3. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
-4. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
-5. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
+2. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
+3. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
+4. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
 
 Track implementation status in [Current status and limits](@/docs/status-limits.md) and [Roadmap](@/docs/roadmap.md).

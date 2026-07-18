@@ -7,9 +7,14 @@ fn owner(name: &str) -> OwnerKey {
 }
 
 fn attachment(kernel: &Arc<Kernel>, name: &str) -> Option<Attachment> {
+    // `Kernel::new()` installs the permissive local-principal policy. Use the
+    // matching real principal so tests exercising journal internals reach the
+    // intended corruption/quarantine boundary instead of being stopped by the
+    // production JournalRead guard first.
+    let principal = principal();
     Some(Attachment {
-        session: kernel.session(name, "principal:test").unwrap(),
-        principal: "principal:test".into(),
+        session: kernel.session(name, &principal).unwrap(),
+        principal,
         can_approve: false,
         tty: false,
         cancel_epoch: None,

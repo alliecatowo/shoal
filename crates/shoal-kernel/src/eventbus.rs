@@ -525,6 +525,21 @@ fn push_bounded_event(
 }
 
 impl Kernel {
+    /// Protect the kernel-owned `journal` event channel with the same policy
+    /// as direct journal rows and their CAS outputs. Inspect only the declared
+    /// channel before full decoding so a denied caller cannot use malformed
+    /// cursor fields to probe replay behavior.
+    fn require_journal_event_read(
+        &self,
+        params: &Json,
+        attachment: &Attachment,
+    ) -> Result<(), RpcError> {
+        if params.get("channel").and_then(Json::as_str) == Some("journal") {
+            self.require_journal_read(attachment)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_event_owner(&self, owner: &OwnerKey) -> Result<(), RpcError> {
         let journal = self
             .journal
@@ -541,11 +556,12 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        self.require_journal_event_read(&params, attachment)?;
         self.events.ensure_replay_subsystem()?;
-        let owner = attachment.session.key.owner();
-        self.ensure_event_owner(&owner)?;
         let p: EventsReadParams = decode(params)?;
         validate_channel_name(&p.channel)?;
+        let owner = attachment.session.key.owner();
+        self.ensure_event_owner(&owner)?;
         let effective_limit = p.limit.unwrap_or(EVENTS_DEFAULT_PAGE).min(EVENTS_MAX_PAGE);
         // The `journal` and `session.transcript` channels are journal-backed:
         // a `since` older than the ring's oldest retained seq is served from
@@ -928,6 +944,7 @@ impl Kernel {
         conn: Option<&SharedWriter>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        self.require_journal_event_read(&params, attachment)?;
         let p: EventsSubParams = decode(params)?;
         validate_channel_name(&p.channel)?;
         let Some(writer) = conn else {

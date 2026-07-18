@@ -77,12 +77,11 @@ Include malformed params tests so decoding cannot occur before the authorization
 
 ### Authorize journal reads
 
-The direct query baseline is implemented: `journal.query` checks attachment and `JournalRead`
-before decoding filters, then forces the attached principal-private Session and caps the page.
-Remaining work is to define broader administration and align durable replay:
+The exact-owner read baseline is implemented: `journal.query`, journal-backed `blob.get`, and the
+`journal` event channel require attachment plus `JournalRead`, then remain scoped to the attached
+principal-private Session. Remaining work is broader administration:
 
 - supervisor/admin cross-principal query through a distinct grant;
-- durable journal-event replay aligned with the same policy.
 
 Acceptance:
 
@@ -90,7 +89,7 @@ Acceptance:
 - principal A cannot search principal B by omitting filters;
 - filtering cannot widen scope;
 - output hashes/blobs inherit entry authorization; **implemented for `blob.get`**;
-- durable event replay does not bypass query policy;
+- durable journal-event replay does not bypass query policy; **implemented**;
 - tests include same session/different principal and different session/same principal.
 
 ### Extend the bound approval workflow

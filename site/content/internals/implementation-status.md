@@ -268,7 +268,7 @@ failure without restart. `profile`/`--cap` values are echoed metadata, not enfor
 | effect derivation | Implemented for modeled operations | opaque/raw paths remain explicitly opaque |
 | plan hashing/storage | Implemented bounded object identity | full source/AST/effects/Session/principal digest plus unique object suffix; ephemeral across restart |
 | capability approval caller | Implemented one-shot boundary | attached authorized approver, default separation of duties, durable immutable grant audit |
-| journal query/blob caller | Implemented policy + exact-owner boundary | attachment and `JournalRead` required before decode; principal+Session rows/hashes only; server-capped pages |
+| journal query/blob/event callers | Implemented policy + exact-owner boundary | attachment and `JournalRead` before row/blob/cursor decode; principal+Session rows/hashes/events only; server-capped pages |
 | allow/ask/deny policy | Implemented | verdict is not itself OS containment |
 | filesystem sandbox | Implemented on supported Linux/macOS paths | enforcement tier reports actual backend result |
 | process hash gate | Implemented preflight | content is checked before exec; TOCTOU remains |

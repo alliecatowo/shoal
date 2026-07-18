@@ -5408,6 +5408,20 @@ fn journal_query_requires_policy_before_decoding_filters() {
     assert_eq!(blob_denied.code, LEASH_DENIED);
     assert_eq!(blob_denied.data.unwrap()["effect"], "journal.read");
 
+    for (id, method) in [(4, "events.read"), (5, "events.subscribe")] {
+        let event_denied = call(
+            &mut client,
+            &mut reader,
+            id,
+            method,
+            json!({"channel":"journal", "since":"invalid-before-decode"}),
+        )
+        .error
+        .unwrap_or_else(|| panic!("{method} journal access requires JournalRead"));
+        assert_eq!(event_denied.code, LEASH_DENIED);
+        assert_eq!(event_denied.data.unwrap()["effect"], "journal.read");
+    }
+
     drop(client);
     drop(reader);
     thread.join().unwrap();

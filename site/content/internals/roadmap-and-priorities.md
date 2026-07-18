@@ -123,9 +123,9 @@ cannot assert local-human presence.
 
 **Remaining design.** Centralize method attachment classes so new handlers cannot regress; add
 optional peer-credential/mandatory-bearer modes. Continue to evolve approver routing,
-expiration/reason metadata, cross-principal journal grants, and policy alignment for durable
-event-replay surfaces without weakening the existing exact-owner default. Journal-output
-`blob.get` already shares the direct query's `JournalRead` gate.
+expiration/reason metadata and cross-principal journal grants without weakening the existing
+exact-owner default. Journal-output `blob.get` and `journal` event reads/subscriptions share the
+direct query's `JournalRead` gate.
 
 **Acceptance tests.** Through raw kernel connections and MCP:
 

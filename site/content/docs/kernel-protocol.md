@@ -198,9 +198,9 @@ unattached caller before approval or storage access.
 | `pty.resize` | yes | Resize grid/window. |
 | `pty.close` | yes | Terminate and reap. |
 | `pty.list` | yes | List session PTYs. |
-| `events.read` | yes | Cursor-read channel. |
+| `events.read` | yes | Cursor-read channel; `journal` requires `JournalRead`. |
 | `events.publish` | yes | Publish `user.*`. |
-| `events.subscribe` | yes | Push channel events on connection. |
+| `events.subscribe` | yes | Push channel events; `journal` requires `JournalRead`. |
 | `events.unsubscribe` | yes | Remove same-connection subscription. |
 
 ## Token administration
@@ -579,6 +579,10 @@ Then the same connection receives:
 ```
 
 Replay from `since` is enqueued through the same subscriber queue as live events, bounded at 256 entries and 512 KiB. Overflow emits `{dropped, dropped_bytes, latest_seq}`. Channel rings are bounded at 1,024 entries and 2 MiB. Pull-based `events.read` returns forward pages of at most 256 events (and 8 MiB); continue with `page.next_since`. `journal` and `session.transcript` support journal-backed older replay with bounded in-memory pointer windows; other channels lose history evicted by either ring wall. User publishes are admitted before cloning: 128-byte ASCII channel names, 64 KiB/64-level payloads, and 256 distinct user channels per exact owner.
+
+Reading or subscribing to the kernel-owned `journal` channel requires the attached principal's
+`JournalRead` grant before cursor fields are decoded or durable state is touched. Other channels keep
+their exact principal/Session attachment boundary; `events.unsubscribe` remains available for cleanup.
 
 ### Unsubscribe
 
