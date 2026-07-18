@@ -348,7 +348,7 @@ All arguments are optional.
 
 Journal entries describe executions and plans; they are not raw terminal transcripts. Treat field additions as forward-compatible. A client should select the fields it understands rather than requiring byte-for-byte object equality.
 
-The kernel journal and the standalone `shoal-history` CLI use compatible storage code but can default to different XDG roots. See [Companion CLI reference](@/docs/companion-cli-reference.md) before diagnosing an apparently empty journal.
+The kernel journal and standalone `shoal-history` use compatible storage. History loads layered `journal.state_dir` and the shared XDG fallback; a durable kernel launched with an explicit root can still differ. See [Companion CLI reference](@/docs/companion-cli-reference.md) before diagnosing an apparently empty journal.
 
 ## `shoal_cancel`
 

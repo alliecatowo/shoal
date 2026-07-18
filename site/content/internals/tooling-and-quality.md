@@ -66,9 +66,9 @@ checks and exit codes 0, 1, or 2. It checks:
 - TOML syntax for core config and full policy parsing.
 
 `Options::from_env`, the evaluator/kernel, and `shoal-history` use the shared `ShoalPaths` state root.
-Doctor also loads layered config and honors `journal.state_dir`, resolving relative values from its
-startup cwd. A caller that starts components from different cwd values while using a relative custom
-state path can still point them at different trees; the default path contract itself is shared.
+Doctor and history also load layered config and honor `journal.state_dir`, resolving relative values
+from startup cwd. A caller that starts components from different cwd values while using a relative
+custom state path can still point them at different trees; the default path contract itself is shared.
 
 
 The journal probe uses a temporary subdirectory, so it proves SQLite/CAS prerequisites without

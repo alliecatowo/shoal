@@ -261,7 +261,7 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 
 ## Journal, history, undo, and secret limitations
 
-- Shell, kernel, history, and doctor share the canonical XDG state default. Pass `--state-dir` when layered config deliberately moves the journal elsewhere.
+- Shell, history, and doctor share the canonical XDG state default and layered `journal.state_dir`. Pass history `--state-dir` for a durable kernel launched with a different explicit root or to bypass malformed config.
 - GC may age out output blobs that journal entries still reference unless pinned; metadata remains but bytes become unavailable.
 - Undo covers only operations that recorded a typed inverse; it is not arbitrary command rollback.
 - Undo depends on surviving CAS bytes/current fingerprint and refuses stale/symlink-escaped targets.

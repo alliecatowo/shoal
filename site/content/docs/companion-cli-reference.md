@@ -108,13 +108,13 @@ State and data are intentionally separate. This table is operationally important
 | --- | --- |
 | `shoal-kernel` journal/tokens | `$XDG_STATE_HOME/shoal`, else `~/.local/state/shoal` |
 | main `shoal` journal/history | state-rooted (`XDG_STATE_HOME`) |
-| `shoal-history` | `$SHOAL_STATE_DIR`, else `$XDG_STATE_HOME/shoal`, else `~/.local/state/shoal` |
+| `shoal-history` | explicit `--state-dir`, else layered `journal.state_dir`, else the shared XDG state root |
 | evaluator secrets | `$SHOAL_SECRET_DIR`, else `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` |
 | `shoal-secret` | `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` (ignores `SHOAL_SECRET_DIR`) |
 | `shoal-doctor` “state dir” probe | effective `journal.state_dir`, else the shared state root above |
 | user config/policy/adapters | `$XDG_CONFIG_HOME/shoal`, else `~/.config/shoal` |
 
-When layered config sets a custom `journal.state_dir`, pass the same path to `shoal-history --state-dir`. When using `SHOAL_SECRET_DIR` for the evaluator, the CLI cannot target it by flag or environment today; temporarily align `XDG_DATA_HOME`, or manage the store with a process/environment layout that points both at the same directory.
+Relative `journal.state_dir` values resolve from each process's startup cwd. Use explicit `--state-dir` for a durable kernel launched with its own root, to override config, or to recover while layered config is malformed. When using `SHOAL_SECRET_DIR` for the evaluator, the CLI cannot target it by flag or environment today; temporarily align `XDG_DATA_HOME`, or manage the store with a process/environment layout that points both at the same directory.
 
 ## `shoal-kernel`
 
@@ -411,22 +411,21 @@ shoal-history [--state-dir PATH] [--json] [COMMAND] [COMMAND OPTIONS]
 
 Global flags are removed before command parsing and may appear before or after the command. The omitted command is `query`.
 
-### Always select the right journal
+### Journal selection
 
-The utility defaults to XDG **data**:
+Selection precedence is:
 
-```text
-$XDG_DATA_HOME/shoal
-~/.local/share/shoal
-```
+1. explicit `--state-dir` (also bypasses layered config loading);
+2. bounded, validated layered `journal.state_dir`, relative to startup cwd;
+3. the shared XDG state root.
 
-The main shell and kernel normally write under XDG **state**. Use:
+An explicitly launched durable kernel does not inherit shell config; target its CLI root directly:
 
 ```bash
 shoal-history --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/shoal" query
 ```
 
-An empty result from the default location often means path mismatch, not absent history.
+An empty result can still mean the history process started from a different cwd with a relative configured root, or that a durable kernel uses a separate explicit root.
 
 ### Query
 
@@ -446,7 +445,7 @@ shoal-history --state-dir "$STATE" --json query \
   --limit 50
 ```
 
-`--since` is a signed nanosecond timestamp. `--effects` is one substring-style effect matcher, despite the plural spelling; repeat/multiple all-of matching is not implemented. Default limit is 100; if an effect filter is present the library scans all rows, filters in memory, then truncates.
+`--since` is a signed nanosecond timestamp. `--effects` is one structured effect-kind matcher, despite the plural spelling; repeat/multiple all-of matching is not implemented. Default limit is 100. The journal steps candidates and stops after retaining the requested number of matching entries rather than materializing the entire history.
 
 Human output prints ID, principal, verdict, and first source line. `--json` adds AST, effects, cwd, timing/status, and output descriptors. Treat it as sensitive.
 

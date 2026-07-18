@@ -221,7 +221,6 @@ These are four separate, explicitly unimplemented surfaces:
 | WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
 | WASM compilation latency | invocation has fuel/epoch/cancellation/wall-time limits, but synchronous compilation is only byte-capped | cache/admission policy if compile latency becomes an operational problem |
 | Reef provider subprocess sandboxing | restricted evaluator probes/installers fail closed when policy requires an OS filesystem sandbox | carry the sandboxed spawn capability into allowed provider subprocesses |
-| custom journal-root parity | defaults share `ShoalPaths`, but `shoal-history` does not load layered `journal.state_dir` | pass `--state-dir`, or add explicit shared config loading without changing CLI precedence |
 
 PTY change subscription is also absent; MCP callers poll rendered screens. Do not paper over these
 gaps with eager materialization or background threads without a lifecycle protocol.

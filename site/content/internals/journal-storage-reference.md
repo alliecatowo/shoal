@@ -534,10 +534,10 @@ setting should be documented accordingly.
 
 ## State-root ownership
 
-The local evaluator and persistent kernel generally use XDG state paths. `shoal-history` and doctor
-currently derive defaults through XDG data paths in some code paths. That can make a healthy journal
-appear missing or make maintenance target a different store. Move root selection to one leaf helper or
-require every companion binary to receive the resolved state directory explicitly.
+The local evaluator, history CLI, and doctor use the shared XDG state fallback. History and doctor
+also load bounded layered config and honor `journal.state_dir`; relative values resolve from startup
+cwd. An explicit history `--state-dir` wins and skips config loading, which both targets a durable
+kernel's explicit root and provides a recovery path for malformed config.
 
 Kernel sessions open a second handle to exactly the kernel's recorded `state_dir`, which is correct;
 they do not independently rediscover a different path.

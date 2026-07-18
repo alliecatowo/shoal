@@ -339,7 +339,8 @@ Nested evaluators now build through one audited child context that carries Reef,
 
 ### `shoal-history` returns nothing
 
-It defaults to XDG **data**, while main shell/kernel normally use XDG **state**:
+It loads layered `journal.state_dir`, then falls back to the same XDG state root as the shell. Check
+for a relative configured root and the process startup cwd. For an explicitly rooted durable kernel:
 
 ```bash
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/shoal"

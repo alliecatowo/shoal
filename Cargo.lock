@@ -2643,6 +2643,7 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde_json",
+ "shoal-config",
  "shoal-journal",
  "shoal-paths",
  "tempfile",

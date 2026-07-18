@@ -15,7 +15,7 @@ fn main() {
 fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
     if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
         println!(
-            "Shoal journal history\n\nUsage: shoal-history [--state-dir PATH] [--json] COMMAND [OPTIONS]\n\nCommands:\n  query   Filter journal entries\n  show    Show one entry\n  pin     Retain a CAS object\n  unpin   Release a CAS object\n  gc      Collect journal storage\n  status  Show storage use\n  undo    Apply an entry's inverse operations"
+            "Shoal journal history\n\nUsage: shoal-history [--state-dir PATH] [--json] COMMAND [OPTIONS]\n\nState: explicit --state-dir, else layered journal.state_dir, else the shared XDG state root\n\nCommands:\n  query   Filter journal entries\n  show    Show one entry\n  pin     Retain a CAS object\n  unpin   Release a CAS object\n  gc      Collect journal storage\n  status  Show storage use\n  undo    Apply an entry's inverse operations"
         );
         return Ok(());
     }
@@ -23,9 +23,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
         println!("shoal-history {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let mut state = shoal_paths::ShoalPaths::discover()
-        .state_dir()
-        .to_path_buf();
+    let mut state_override = None;
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
@@ -34,7 +32,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
                 if i + 1 >= args.len() {
                     return Err((2, "--state-dir requires PATH".into()));
                 }
-                state = PathBuf::from(args.remove(i + 1));
+                state_override = Some(PathBuf::from(args.remove(i + 1)));
                 args.remove(i);
             }
             "--json" => {
@@ -44,6 +42,16 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
             _ => i += 1,
         }
     }
+    let state = match state_override {
+        Some(state) => state,
+        None => {
+            let cwd = std::env::current_dir().map_err(op)?;
+            let fallback = shoal_paths::ShoalPaths::discover()
+                .state_dir()
+                .to_path_buf();
+            configured_state_dir(&cwd, fallback, shoal_config::LoadOptions::discover(&cwd))?
+        }
+    };
     let command = args.first().map(String::as_str).unwrap_or("query");
     let journal = Journal::open(&state).map_err(op)?;
     match command {
@@ -178,6 +186,20 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
     }
     Ok(())
 }
+
+fn configured_state_dir(
+    cwd: &std::path::Path,
+    fallback: PathBuf,
+    options: shoal_config::LoadOptions,
+) -> Result<PathBuf, (i32, String)> {
+    let loaded =
+        shoal_config::load(&options).map_err(|error| (1, format!("configuration: {error}")))?;
+    Ok(match loaded.config.journal.state_dir {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => cwd.join(path),
+        None => fallback,
+    })
+}
 fn parse_query(args: &[String]) -> Result<QueryFilter, (i32, String)> {
     let mut f = QueryFilter::default();
     let mut i = 0;
@@ -238,6 +260,8 @@ fn op(e: impl std::fmt::Display) -> (i32, String) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn production_cli_has_no_json_serialization_panics() {
         let source = include_str!("main.rs");
@@ -251,5 +275,40 @@ mod tests {
             }
         }
         assert!(!production.contains("serializable inverse"));
+    }
+
+    #[test]
+    fn layered_journal_state_dir_resolves_from_startup_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".shoal.toml");
+        std::fs::write(&config, "[journal]\nstate_dir = 'relative-state'\n").unwrap();
+        let options = shoal_config::LoadOptions {
+            system: None,
+            user: None,
+            project: Some(config),
+            env: vec![],
+        };
+        assert_eq!(
+            configured_state_dir(dir.path(), dir.path().join("fallback"), options).unwrap(),
+            dir.path().join("relative-state")
+        );
+    }
+
+    #[test]
+    fn invalid_layered_config_fails_instead_of_opening_fallback_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".shoal.toml");
+        std::fs::write(&config, "[journal]\nstate_dir = 5\n").unwrap();
+        let options = shoal_config::LoadOptions {
+            system: None,
+            user: None,
+            project: Some(config),
+            env: vec![],
+        };
+        let error =
+            configured_state_dir(dir.path(), dir.path().join("fallback"), options).unwrap_err();
+        assert_eq!(error.0, 1);
+        assert!(error.1.contains("configuration:"));
+        assert!(error.1.contains("journal.state_dir"));
     }
 }

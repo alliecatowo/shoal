@@ -48,8 +48,9 @@ readers and leaves an appended-but-unfinished row visible after a crash.
 
 The main shell, kernel, `shoal-history`, and `shoal-doctor` share `ShoalPaths::state_dir`: explicit
 `SHOAL_STATE_DIR`, otherwise `$XDG_STATE_HOME/shoal`, otherwise `~/.local/state/shoal`. A relative or
-absolute `journal.state_dir` in layered config can intentionally move the shell/doctor journal;
-`shoal-history` then needs the matching `--state-dir` because it does not load the shell config.
+absolute `journal.state_dir` in layered config intentionally moves the shell, doctor, and history
+CLI journal; relative paths resolve from each process's startup cwd. `shoal-history --state-dir`
+has highest precedence and targets durable kernels launched with an explicit CLI root.
 
 Source: [`shoal-journal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-journal/src).
 

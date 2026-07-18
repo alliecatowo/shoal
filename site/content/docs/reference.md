@@ -109,7 +109,7 @@ The packages are separate. See [install commands](@/docs/companion-cli-reference
 | Secret directory | XDG data `shoal/secrets` (or evaluator override) | `master.key` + authenticated encrypted envelope. |
 | Kernel socket | XDG runtime or UID-qualified temp fallback | Local IPC boundary. |
 
-Do not assume all companion defaults agree: `shoal-history`/doctor use XDG data in places where shell/kernel use XDG state. The [path matrix](@/docs/companion-cli-reference.md#xdg-path-matrix) is authoritative.
+Shell, history, and doctor share the XDG state fallback and layered `journal.state_dir`; a durable kernel's explicit CLI root can still differ. The [path matrix](@/docs/companion-cli-reference.md#xdg-path-matrix) is authoritative.
 
 ## Environment-variable inventory
 
