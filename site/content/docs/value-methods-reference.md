@@ -369,10 +369,14 @@ The implemented signatures are exactly:
 
 ```text
 list.get(index: int, default = null) -> value
+table.get(index: int, default = null) -> record | value
+range.get(index: int, default = null) -> int | value
 record.get(key: str, default = null) -> value
 ```
 
-Negative list indexes count from the end; out-of-range returns the default. `table.get` and `range.get` are not implemented even though current completion/did-you-mean metadata groups `get` with sequence methods.
+Negative sequence indexes count from the end; out-of-range returns the default. Table lookup returns
+the selected row as a record. Range lookup computes the integer directly without materializing the
+range.
 
 ## String methods
 
@@ -529,15 +533,15 @@ A table is semantically an ordered record collection, but method outputs are usu
 - `map`, `where`, `filter`, `sort`, `reverse`, and grouping return `list`;
 - `collect()` returns the table unchanged;
 - `len` counts rows;
-- `get(index)` is currently not implemented;
+- `get(index, default = null)` returns a row record or the default;
 - `table[index]` is also not implemented by strict index access;
-- use `.first()`, `.last()`, `.find()`, `.take(n)`, or convert via a mapping when row selection is needed.
+- `.first()`, `.last()`, `.find()`, and `.take(n)` remain useful for selection by shape or predicate.
 
-This inconsistency is a current API rough edge.
+Strict bracket indexing and forgiving `.get()` deliberately remain different operations.
 
 ## Range methods
 
-Ranges share eager collection transforms and materialize integers when needed. `1..5` yields 1,2,3,4; `1..=5` includes 5. They support iteration, length, collect, transforms, aggregations, and finite stream conversion. `.get()` is not implemented despite sequence completion metadata.
+Ranges share eager collection transforms and materialize integers when needed. `1..5` yields 1,2,3,4; `1..=5` includes 5. They support iteration, length, collect, transforms, aggregations, finite stream conversion, and non-materializing `.get(index, default = null)` with negative indexes.
 
 ## Glob fields and methods
 

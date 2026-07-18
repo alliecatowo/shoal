@@ -230,9 +230,9 @@ style spec equals that name. They are not macros inside a compound spec such as 
 | `custom_<name>` | `Ready/Pending/Stale/Error` segment | ready/stale output only | bounded background producer with TTL cache |
 | `indent` | none | empty reserved placeholder | active as no-op |
 
-This split is crucial: renderer unit tests can prove that a hand-built agent snapshot renders
-correctly even though the real host does not yet produce one. Renderer completeness and end-to-end
-feature completeness are different maturity claims.
+This split is crucial: renderer unit tests prove snapshot semantics, while kernel-backed producer
+tests prove that authenticated agent/human authority reaches the real host. Renderer completeness
+and end-to-end feature completeness remain different maturity claims.
 
 ### Trimmed schema and host-owned producers
 
@@ -255,7 +255,7 @@ deadline and 4 KiB output cap, and publishes only sanitized snapshots to the pur
 
 | Domain | Fields |
 |---|---|
-| terminal | width, no-color, nerd-font, Unicode, edit mode, multiline |
+| terminal | width, no-color, nerd-font, Unicode, edit mode |
 | location | cwd, home, read-only |
 | prior command | outcome ok/status/signal/duration/head |
 | session | jobs, principal, Leash tier/enforcement, user/host/SSH/root |
@@ -275,7 +275,8 @@ It does not perform discovery.
 - Leash enforcement capability/status;
 - home directory;
 - `NO_COLOR`, Unicode, and nerd-font decision;
-- principal, currently hardcoded to `Human`.
+- standalone fallback principal (`Human`); kernel-backed authority is refreshed from the
+  authenticated session snapshot.
 
 These do not refresh during the process. Environment or enforcement changes after startup therefore
 do not alter the prompt unless a future reload path reconstructs static facts.
