@@ -48,16 +48,27 @@ pub(crate) enum Action {
 }
 
 pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Action, String> {
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().peekable();
+    let mut standalone = false;
+    while iter
+        .peek()
+        .and_then(|argument| argument.to_str())
+        .is_some_and(|argument| argument == "--standalone")
+    {
+        iter.next();
+        if standalone {
+            return Err("--standalone may be specified only once".into());
+        }
+        standalone = true;
+    }
     let Some(first) = iter.next() else {
         return Ok(if stdin_is_tty {
-            Action::Interactive { standalone: false }
+            Action::Interactive { standalone }
         } else {
             Action::Stdin
         });
     };
     match first.to_str() {
-        Some("--standalone") => no_trailing(iter, Action::Interactive { standalone: true }),
         Some("fmt") => {
             let mut check = false;
             let mut files = vec![];
@@ -251,6 +262,19 @@ mod tests {
             parse_args(vec!["--standalone".into()], true).unwrap(),
             Action::Interactive { standalone: true }
         ));
+        assert!(matches!(
+            parse_args(
+                vec!["--standalone".into(), "-c".into(), "1 + 1".into()],
+                true
+            )
+            .unwrap(),
+            Action::Command(_, _)
+        ));
+        assert!(matches!(
+            parse_args(vec!["--standalone".into(), "script.shl".into()], true).unwrap(),
+            Action::Script(_, _)
+        ));
+        assert!(parse_args(vec!["--standalone".into(), "--standalone".into()], true).is_err());
         assert!(matches!(parse_args(vec![], false).unwrap(), Action::Stdin));
         assert!(matches!(
             parse_args(vec!["-c".into(), "1 + 1".into()], true).unwrap(),
