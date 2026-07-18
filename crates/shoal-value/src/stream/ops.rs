@@ -302,7 +302,7 @@ fn distinct_limit(message: impl Into<String>) -> ErrorVal {
 /// useful structural hash exists. Identity values use their identity pointer.
 /// Collisions are always safe because the bucket performs the final equality
 /// check.
-fn semantic_hash(value: &Value) -> u64 {
+pub(crate) fn semantic_hash(value: &Value) -> u64 {
     fn record_hash<H: Hasher>(record: &super::Record, state: &mut H) {
         // IndexMap equality is key/value equality, independent of insertion
         // order, so canonicalize keys before hashing.

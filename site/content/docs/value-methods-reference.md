@@ -155,6 +155,13 @@ The eager collection core accepts `list`, `table`, and `range`. Many operations 
 | `contains` | `(item)` | bool |
 | `get` | see below | only list+int, not table/range |
 
+Methods that produce an eager collection (`first(n)`, `last(n)`, `map`, `where`, `sort`,
+`reverse`, `uniq`, `flat_map`, `flatten`, `enumerate`, `skip`, `take`, `chunks`, `zip`, `group`,
+record projections, and collection `tee`) share a 16,384-value / 16 MiB retained-state wall.
+They raise `collection_materialization_limit` before admitting the next result. Collection `tee`
+stores one admitted replay vector shared by all forks; it does not clone the complete vector for
+each fork.
+
 ### Size and endpoints
 
 ```shoal

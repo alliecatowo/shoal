@@ -508,7 +508,7 @@ mod tests {
 
     struct NonCooperativeSource {
         dropped: Arc<AtomicBool>,
-        started: Arc<AtomicBool>,
+        rendezvous: Arc<std::sync::Barrier>,
     }
 
     impl shoal_value::Upstream for NonCooperativeSource {
@@ -517,8 +517,11 @@ mod tests {
             _ctx: &mut dyn shoal_value::CallCtx,
             _timeout: Option<Duration>,
         ) -> shoal_value::VResult<shoal_value::Pull> {
-            self.started.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(250));
+            // Tell the test the source is inside `pull`, then refuse to return
+            // until the test explicitly releases us after the RPC response.
+            // This proves deadline detachment by ordering, not runner timing.
+            self.rendezvous.wait();
+            self.rendezvous.wait();
             Ok(shoal_value::Pull::Item(Value::Int(1)))
         }
     }
@@ -532,9 +535,9 @@ mod tests {
     #[test]
     fn hard_deadline_detaches_a_non_cooperative_in_process_source() {
         let kernel = Kernel::new();
-        let (session, mut attached) = attached(&kernel);
+        let (session, attached) = attached(&kernel);
         let dropped = Arc::new(AtomicBool::new(false));
-        let pull_started = Arc::new(AtomicBool::new(false));
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
         let value_ref = Ref::new("out", 90);
         let cursor = StreamCursorRef {
             r#ref: value_ref.clone(),
@@ -547,20 +550,42 @@ mod tests {
                 false,
                 Box::new(NonCooperativeSource {
                     dropped: dropped.clone(),
-                    started: pull_started.clone(),
+                    rendezvous: rendezvous.clone(),
                 }),
             )),
         );
 
-        let started = Instant::now();
-        let response = kernel
-            .handle_stream_pull(json!({"cursor":cursor,"deadline_ms":20}), &mut attached)
-            .unwrap();
-        assert!(started.elapsed() < Duration::from_millis(150));
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        let request_kernel = kernel.clone();
+        let request_cursor = cursor.clone();
+        let request = std::thread::spawn(move || {
+            let mut attached = attached;
+            let response = request_kernel.handle_stream_pull(
+                json!({"cursor":request_cursor,"deadline_ms":20}),
+                &mut attached,
+            );
+            let _ = response_tx.send(response);
+        });
+
+        // The source is now blocked inside a pull that ignores cancellation.
+        rendezvous.wait();
+        let response = match response_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(response) => response.unwrap(),
+            Err(error) => {
+                // Always release and join the worker before reporting failure.
+                rendezvous.wait();
+                request.join().unwrap();
+                panic!("deadline response waited for the blocked source: {error}");
+            }
+        };
         assert_eq!(response["done"], true);
         assert_eq!(response["timed_out"], true);
         assert_eq!(response["error"]["code"], "stream_pull_deadline");
         assert!(!session.has_stream_cursor(&cursor));
+
+        // Only now may the detached source finish and be dropped.
+        rendezvous.wait();
+        request.join().unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
         while !dropped.load(Ordering::SeqCst) && Instant::now() < deadline {
@@ -568,8 +593,7 @@ mod tests {
         }
         assert!(
             dropped.load(Ordering::SeqCst),
-            "source was not dropped (pull_started={})",
-            pull_started.load(Ordering::SeqCst)
+            "source was not dropped after the detached pull returned"
         );
     }
 

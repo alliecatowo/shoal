@@ -11,6 +11,11 @@ pub(crate) const EAGER_STRING_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) struct MaterializedCollection {
     values: Vec<Value>,
+    budget: MaterializationBudget,
+}
+
+pub(crate) struct MaterializationBudget {
+    values: usize,
     retained_bytes: usize,
     max_values: usize,
     max_retained_bytes: usize,
@@ -27,21 +32,68 @@ impl MaterializedCollection {
     pub(crate) fn new(max_values: usize, max_retained_bytes: usize) -> Self {
         Self {
             values: Vec::new(),
+            budget: MaterializationBudget::new(max_values, max_retained_bytes),
+        }
+    }
+
+    pub(crate) fn push(&mut self, value: Value) -> VResult<()> {
+        self.budget.admit(&value)?;
+        self.values.push(value);
+        Ok(())
+    }
+
+    pub(crate) fn extend(&mut self, values: impl IntoIterator<Item = Value>) -> VResult<()> {
+        for value in values {
+            self.push(value)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Value {
+        Value::List(self.values)
+    }
+
+    pub(crate) fn finish_vec(self) -> Vec<Value> {
+        self.values
+    }
+
+    pub(crate) fn values(&self) -> &[Value] {
+        &self.values
+    }
+}
+
+impl MaterializationBudget {
+    pub(crate) fn eager() -> Self {
+        Self::new(
+            EAGER_COLLECTION_MAX_VALUES,
+            EAGER_COLLECTION_MAX_RETAINED_BYTES,
+        )
+    }
+
+    pub(crate) fn new(max_values: usize, max_retained_bytes: usize) -> Self {
+        Self {
+            values: 0,
             retained_bytes: 0,
             max_values,
             max_retained_bytes,
         }
     }
 
-    pub(crate) fn push(&mut self, value: Value) -> VResult<()> {
-        if self.values.len() >= self.max_values {
+    pub(crate) fn admit(&mut self, value: &Value) -> VResult<()> {
+        if self.values >= self.max_values {
             return Err(collection_materialization_limit(format!(
                 "eager collection reached its {}-value limit",
                 self.max_values
             )));
         }
+        self.charge_retained(value)?;
+        self.values += 1;
+        Ok(())
+    }
+
+    pub(crate) fn charge_retained(&mut self, value: &Value) -> VResult<()> {
         let retained = retained_size(
-            &value,
+            value,
             RetainedLimits {
                 max_bytes: self.max_retained_bytes.saturating_sub(self.retained_bytes),
                 max_depth: 64,
@@ -59,19 +111,7 @@ impl MaterializedCollection {
         self.retained_bytes = self.retained_bytes.checked_add(retained).ok_or_else(|| {
             collection_materialization_limit("eager collection accounting overflowed")
         })?;
-        self.values.push(value);
         Ok(())
-    }
-
-    pub(crate) fn extend(&mut self, values: impl IntoIterator<Item = Value>) -> VResult<()> {
-        for value in values {
-            self.push(value)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn finish(self) -> Value {
-        Value::List(self.values)
     }
 }
 

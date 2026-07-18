@@ -209,10 +209,12 @@ state is at most 1 MiB, depth 64, and 16,384 nodes. Separately, eager expansion 
 capped at 16,384 integers; larger ranges remain lazily streamable. Replacing an existing binding is still allowed when the
 identity cap is full, and temporary scope charges are reclaimed when that scope is dropped.
 
-Pure value methods also admit their transient results before retaining them. Eager string-to-list
-operations (`lines`, `words`, `chars`, `split`, regex `matches`) and list concatenation stop at
-16,384 values / 16 MiB measured retained state with `collection_materialization_limit`. String
-concatenation, `join`, Unicode case conversion, and literal/regex replacement stop at 16 MiB with
+Pure value methods also admit their transient results before retaining them. Eager collection
+transforms and projections, string-to-list operations (`lines`, `words`, `chars`, `split`, regex
+`matches`), and list concatenation stop at 16,384 values / 16 MiB measured retained state with
+`collection_materialization_limit`. Collection and bounded-stream `tee` share one admitted replay
+vector across fork cursors instead of multiplying the full allocation. String concatenation,
+`join`, Unicode case conversion, and literal/regex replacement stop at 16 MiB with
 `string_materialization_limit`; replacement capture expansion is written directly into the bounded
 destination rather than creating an unchecked intermediate.
 

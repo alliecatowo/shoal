@@ -19,6 +19,8 @@ mod cas;
 mod ops;
 mod tee;
 
+pub(crate) use ops::semantic_hash;
+
 use super::*;
 
 #[derive(Clone)]
@@ -180,6 +182,28 @@ impl Upstream for IterSource {
     }
 }
 
+/// One cursor over shared, immutable replay storage. Collection and bounded
+/// stream `.tee(n)` use one backing allocation rather than cloning the entire
+/// materialized value vector once per fork.
+struct ReplaySource {
+    values: Arc<[Value]>,
+    index: usize,
+}
+
+impl Upstream for ReplaySource {
+    fn pull(
+        &mut self,
+        _ctx: &mut dyn CallCtx,
+        _timeout: Option<std::time::Duration>,
+    ) -> VResult<Pull> {
+        let Some(value) = self.values.get(self.index) else {
+            return Ok(Pull::End);
+        };
+        self.index += 1;
+        Ok(Pull::Item(value.clone()))
+    }
+}
+
 /// Base source over a live channel fed by a background producer (`every`'s timer,
 /// `watch`/`tail`'s notify thread, a `channel().events()` subscription). Supports
 /// timed reads so timing combinators (`debounce`/`throttle`) work.
@@ -243,6 +267,10 @@ impl StreamVal {
         I: Iterator<Item = VResult<Value>> + Send + 'static,
     {
         StreamVal::from_source(label, true, Box::new(IterSource(Box::new(iter))))
+    }
+
+    pub(crate) fn replay_shared(label: impl Into<String>, values: Arc<[Value]>) -> StreamVal {
+        StreamVal::from_source(label, true, Box::new(ReplaySource { values, index: 0 }))
     }
 
     /// Build a stream from a live channel fed by a background producer. Unbounded
