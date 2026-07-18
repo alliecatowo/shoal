@@ -65,4 +65,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "data_codecs"
+path = "fuzz_targets/data_codecs.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

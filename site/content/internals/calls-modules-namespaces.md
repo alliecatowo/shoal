@@ -254,20 +254,28 @@ JSON, YAML, and TOML parsing first deserialize into `serde_json::Value`, then us
 common bridge means unsupported or lossy runtime types have the same JSON-shaped fallback concerns
 across all three formats.
 
+All four data namespaces route through `data_codecs.rs`. Parsing admits no more than 16 MiB of input,
+131,072 structural nodes, depth 128, or 16 MiB of retained Shoal values. JSON, YAML, and CSV encode
+through a writer that cannot cross 16 MiB. TOML preflights a conservative escape and repeated table
+path bound before its internally buffered serializer runs, then renders through that same writer.
+Limit failures are typed `data_materialization_limit` errors and leave the evaluator reusable.
+
 `json.stringify` accepts `pretty` either as a named boolean or second positional `true`. TOML
 stringification can reject values which are legal Shoal/JSON but invalid at TOML's top level.
 
 CSV parse treats the first row as headers and returns a `Table`; all fields are strings. CSV
 stringify accepts a table, a list of records, or one record. It chooses header order from the first
 record and renders non-string cells inline. Missing fields become empty cells, and later-record keys
-that were absent from the first record are omitted.
+that were absent from the first record are omitted. CSV also stops at 16,384 rows and 131,072 cells.
 
 ## HTTP namespace limits
 
 HTTP calls are synchronous evaluator effects. The implementation applies a 30-second request timeout
-and caps response bodies at 64 MiB before projecting the response. `get` and `delete` do not take a
-body; `post` and `put` do. Changes here belong in the effect/security audit because namespace syntax
-can otherwise make network access look like a pure method.
+and caps response bodies at 64 MiB before projecting the response. Its convenience JSON projection
+uses the data-codec input/tree walls and becomes `null` when the body is invalid or outside them; the
+raw bounded body remains available. `get` and `delete` do not take a body; `post` and `put` do. Changes
+here belong in the effect/security audit because namespace syntax can otherwise make network access
+look like a pure method.
 
 ## Configuration namespace
 

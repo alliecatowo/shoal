@@ -7,6 +7,7 @@ mod channels;
 mod child_context;
 mod coerce;
 mod command;
+mod data_codecs;
 mod exec_state;
 mod expr;
 mod expr_access;

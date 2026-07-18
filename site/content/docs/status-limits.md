@@ -223,6 +223,13 @@ the injected streaming filesystem port and a 16 MiB plus-one sentinel. `.lines` 
 at most 16,384 lines and 16 MiB of retained line values while reading. Overflow is
 `path_read_limit`; `.stream()` and `head` remain the incremental/bounded alternatives.
 
+The JSON/YAML/TOML/CSV namespaces admit at most 16 MiB of input, 16 MiB of retained value state,
+131,072 structural nodes, and depth 128. Encoders write through a 16 MiB hard wall; TOML performs a
+conservative escape/path expansion preflight because its serializer owns table strings internally.
+CSV additionally stops at 16,384 rows and 131,072 cells. HTTP only attempts its convenience `.json`
+projection inside the same input/tree walls, so a 64 MiB response body is never accompanied by an
+equally unbounded parsed clone. Any of these walls raises `data_materialization_limit`.
+
 Structured builtins apply a separate transient result boundary before ordinary outcome wrapping or
 lexical binding. Eager results stop at 16,384 values / 16 MiB retained state with
 `builtin_output_limit`. `ls` bounds production directory iteration, `cat` reads against the
@@ -240,7 +247,8 @@ Implicit resident methods refuse a declared blob above 16 MiB with `cas_material
 `stream_line_limit`.
 
 Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,
-`binding_value_limit`, `binding_aggregate_limit`, `builtin_output_limit`, or `builtin_work_limit`. Runtime handles such as closures, tasks, and
+`binding_value_limit`, `binding_aggregate_limit`, `data_materialization_limit`,
+`builtin_output_limit`, or `builtin_work_limit`. Runtime handles such as closures, tasks, and
 streams receive a conservative fixed charge here and remain subject to their own subsystem quotas;
 this is accounting protection, not a complete process-memory meter. Use an OS memory limit for
 mutually hostile workloads.

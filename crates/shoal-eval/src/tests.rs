@@ -1333,6 +1333,36 @@ fn yaml_and_toml_and_csv_namespaces() {
 }
 
 #[test]
+fn oversized_structured_data_is_typed_and_the_evaluator_recovers() {
+    let document = format!(
+        "[{}]",
+        std::iter::repeat_n("null", crate::data_codecs::MAX_DATA_NODES)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let source = format!("json.parse('{document}')");
+    let program = shoal_syntax::parse(&source).unwrap();
+    let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+    let error = evaluator.eval_program(&program).unwrap_err();
+    assert_eq!(error.code, "data_materialization_limit");
+    assert!(error.msg.contains("nodes"));
+    assert!(
+        error
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("stream"))
+    );
+
+    assert_eq!(
+        evaluator
+            .eval_program(&shoal_syntax::parse("40 + 2").unwrap())
+            .unwrap(),
+        Value::Int(42),
+        "rejecting oversized structured data must leave the evaluator usable"
+    );
+}
+
+#[test]
 fn math_namespace_constants_and_fns() {
     assert_eq!(run("math.sqrt(4)").unwrap(), Value::Float(2.0));
     let Value::Float(pi) = run("math.pi").unwrap() else {

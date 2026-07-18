@@ -7,7 +7,7 @@
 //! namespace has no runtime representation of its own, only its members do.
 
 use crate::Evaluator;
-use shoal_value::{CallArgs, ErrorVal, Record, VResult, Value, json_to_value, value_to_json};
+use shoal_value::{CallArgs, ErrorVal, Record, VResult, Value};
 use std::time::Duration;
 
 /// The namespace names intercepted before ordinary variable resolution. A name
@@ -42,10 +42,7 @@ pub(crate) fn call_method(
     args: CallArgs,
 ) -> VResult<Value> {
     match ns {
-        "json" => json_ns(method, args),
-        "yaml" => yaml_ns(method, args),
-        "toml" => toml_ns(method, args),
-        "csv" => csv_ns(method, args),
+        "json" | "yaml" | "toml" | "csv" => crate::data_codecs::call(ns, method, args),
         "math" => math_ns(method, args),
         "http" => ev.http_ns(method, args),
         "os" => ev.os_ns(method, args),
@@ -56,8 +53,6 @@ pub(crate) fn call_method(
         )),
     }
 }
-
-// --- json / yaml / toml / csv -------------------------------------------------
 
 fn one_str<'a>(args: &'a CallArgs, what: &str) -> VResult<&'a str> {
     match args.pos.first() {
@@ -70,161 +65,6 @@ fn one_str<'a>(args: &'a CallArgs, what: &str) -> VResult<&'a str> {
             "{what} expects a str argument"
         ))),
     }
-}
-
-fn json_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "json.parse")?;
-            let j: serde_json::Value = serde_json::from_str(s)
-                .map_err(|e| ErrorVal::arg_error(format!("json.parse: {e}")))?;
-            Ok(json_to_value(&j))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("json.stringify expects a value"))?;
-            let pretty =
-                named_bool(&args, "pretty") || matches!(args.pos.get(1), Some(Value::Bool(true)));
-            let j = value_to_json(v)?;
-            let out = if pretty {
-                serde_json::to_string_pretty(&j)
-            } else {
-                serde_json::to_string(&j)
-            }
-            .map_err(|e| ErrorVal::new("custom", format!("json.stringify: {e}")))?;
-            Ok(Value::Str(out))
-        }
-        _ => unknown_method("json", method),
-    }
-}
-
-fn yaml_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "yaml.parse")?;
-            let j: serde_json::Value = serde_norway::from_str(s)
-                .map_err(|e| ErrorVal::arg_error(format!("yaml.parse: {e}")))?;
-            Ok(json_to_value(&j))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("yaml.stringify expects a value"))?;
-            serde_norway::to_string(&value_to_json(v)?)
-                .map(Value::Str)
-                .map_err(|e| ErrorVal::new("custom", format!("yaml.stringify: {e}")))
-        }
-        _ => unknown_method("yaml", method),
-    }
-}
-
-fn toml_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "toml.parse")?;
-            let j: serde_json::Value =
-                toml::from_str(s).map_err(|e| ErrorVal::arg_error(format!("toml.parse: {e}")))?;
-            Ok(json_to_value(&j))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("toml.stringify expects a value"))?;
-            toml::to_string(&value_to_json(v)?)
-                .map(Value::Str)
-                .map_err(|e| {
-                    ErrorVal::new(
-                        "arg_error",
-                        format!("toml.stringify: {e} (toml needs a record/table at the top level)"),
-                    )
-                })
-        }
-        _ => unknown_method("toml", method),
-    }
-}
-
-fn csv_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "csv.parse")?;
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(true)
-                .from_reader(s.as_bytes());
-            let headers = rdr
-                .headers()
-                .map_err(|e| ErrorVal::arg_error(format!("csv.parse: {e}")))?
-                .clone();
-            let mut rows = Vec::new();
-            for rec in rdr.records() {
-                let rec = rec.map_err(|e| ErrorVal::arg_error(format!("csv.parse: {e}")))?;
-                let mut r = Record::new();
-                for (h, field) in headers.iter().zip(rec.iter()) {
-                    r.insert(h.to_string(), Value::Str(field.to_string()));
-                }
-                rows.push(r);
-            }
-            Ok(Value::Table(rows))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("csv.stringify expects a table"))?;
-            csv_stringify(v)
-        }
-        _ => unknown_method("csv", method),
-    }
-}
-
-fn csv_stringify(v: &Value) -> VResult<Value> {
-    let rows: Vec<&Record> = match v {
-        Value::Table(rows) => rows.iter().collect(),
-        Value::List(xs) => xs
-            .iter()
-            .map(|x| match x {
-                Value::Record(r) => Ok(r),
-                other => Err(ErrorVal::type_error(format!(
-                    "csv.stringify expects a list of records, found a {}",
-                    other.type_name()
-                ))),
-            })
-            .collect::<VResult<Vec<_>>>()?,
-        Value::Record(r) => vec![r],
-        other => {
-            return Err(ErrorVal::type_error(format!(
-                "csv.stringify expects a table, found {}",
-                other.type_name()
-            )));
-        }
-    };
-    let mut wtr = csv::Writer::from_writer(Vec::new());
-    if let Some(first) = rows.first() {
-        let headers: Vec<&str> = first.keys().map(String::as_str).collect();
-        wtr.write_record(&headers)
-            .map_err(|e| ErrorVal::new("custom", format!("csv.stringify: {e}")))?;
-        for row in &rows {
-            let fields: Vec<String> = first
-                .keys()
-                .map(|k| match row.get(k) {
-                    Some(Value::Str(s)) => s.clone(),
-                    Some(other) => shoal_value::render::render_inline(other),
-                    None => String::new(),
-                })
-                .collect();
-            wtr.write_record(&fields)
-                .map_err(|e| ErrorVal::new("custom", format!("csv.stringify: {e}")))?;
-        }
-    }
-    let bytes = wtr
-        .into_inner()
-        .map_err(|e| ErrorVal::new("custom", format!("csv.stringify: {e}")))?;
-    String::from_utf8(bytes)
-        .map(Value::Str)
-        .map_err(|_| ErrorVal::new("utf8_error", "csv.stringify produced non-UTF-8"))
 }
 
 // --- math ---------------------------------------------------------------------
@@ -300,12 +140,6 @@ fn math_ns(method: &str, args: CallArgs) -> VResult<Value> {
         _ => return unknown_method("math", method),
     };
     Ok(Value::Float(r))
-}
-
-// --- shared helpers -----------------------------------------------------------
-
-fn named_bool(args: &CallArgs, name: &str) -> bool {
-    matches!(args.get_named(name), Some(Value::Bool(true)))
 }
 
 fn unknown_method(ns: &str, method: &str) -> VResult<Value> {
@@ -398,9 +232,7 @@ impl Evaluator {
             .map_err(|e| ErrorVal::new("net_error", format!("http.{method} body: {e}")))?;
         // `json`: the body parsed as JSON when it is valid JSON, else null. This
         // is the `resp.json` accessor of the typed response (site/content/internals/roadmap-and-priorities.md).
-        let json = serde_json::from_str::<serde_json::Value>(body.trim())
-            .map(|j| json_to_value(&j))
-            .unwrap_or(Value::Null);
+        let json = crate::data_codecs::http_json_projection(body.trim());
 
         let mut r = Record::new();
         r.insert("status".into(), Value::Int(status));

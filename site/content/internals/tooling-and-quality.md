@@ -161,7 +161,7 @@ resolves through the live kernel. Keep the expensive layer focused but real.
 
 ## Fuzz targets
 
-The `fuzz/` workspace has seven libFuzzer targets:
+The `fuzz/` workspace has eight libFuzzer targets:
 
 | Target | Current operation |
 |---|---|
@@ -170,6 +170,7 @@ The `fuzz/` workspace has seven libFuzzer targets:
 | `proto_frame` | decode up to 64 frames, require cursor progress, and round-trip valid requests |
 | `planner` | derive a plan for every complete parse without executing it |
 | `value_wire` | normalize JSON values idempotently and round-trip valid wire values |
+| `data_codecs` | exercise JSON/YAML/TOML/CSV parse/stringify admission, output walls, and evaluator recovery |
 | `stream` | compose bounded closure-free stream operations and pin single consumption |
 | `policy` | evaluate parsed policies against decoded plans and each effect |
 
