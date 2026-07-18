@@ -45,7 +45,7 @@ accDescr: Shows the components and relationships described in REPL assembly sequ
   H->>H: apply render color/pager policy
   H->>E: new(cwd), interactive = true
   H->>E: user Reef path, aliases, env, echo, config snapshot
-  H->>J: open writer and independent reader
+  H->>J: open statement journal
   H->>E: install journal + frecency
   H->>E: load bundled and configured adapters
   H->>E: evaluate init files

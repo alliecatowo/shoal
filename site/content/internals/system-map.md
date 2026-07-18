@@ -228,10 +228,11 @@ accDescr: Shows the default isolated private kernel, the explicit local evaluato
   Kernel --> EvalB["durable machine Session"]
 ```
 
-As implemented, a newly created kernel session installs journal/frecency support and a channel
-forwarder, but does not load the CLI's layered config, aliases, environment overrides, init files,
-bundled/extra adapter directories, or user Reef manifest. This is a parity boundary, not merely a
-documentation omission. Test a feature through the intended host before describing it as universal.
+The shared `SessionBootstrap` supplies layered config, aliases/environment, adapters, plugins, Reef,
+echo, and policy inputs to both local and kernel evaluators. Profile-owned differences remain:
+prompt/editor/history presentation belongs to the CLI; init files run for the standalone or trusted
+private interactive profile, never a durable/headless agent Session; journal/event transport wiring
+belongs to its host.
 
 Parser-context parity is shared: the evaluator constructs the live value/callable snapshot used by
 both the local REPL and kernel `exec` plan/run handlers. Public context-free parse/completion RPCs do

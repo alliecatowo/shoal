@@ -110,13 +110,11 @@ pub(crate) struct Attachment {
     pub(crate) can_approve: bool,
     /// Whether the attaching client declared itself a real interactive
     /// terminal (`session.attach`'s `client.tty`). Every client this
-    /// codebase actually ships today (`shoal-mcp`, the test harness) attaches
-    /// with `tty:false` — `shoal` (the REPL binary) never goes through the
-    /// kernel at all (CLAUDE.md: "shoal never depends on or spawns
-    /// shoal-kernel"), so this is currently always `false` in practice. It
-    /// exists so kernel-side rendering can tell a genuine future interactive
-    /// kernel-hosted client (colors wanted) apart from a headless/MCP one
-    /// (colors are agent-hostile noise) — see `bound_render`'s `strip` param.
+    /// `shoal-mcp` attaches with `tty:false`; the default private `shoal` REPL
+    /// attaches over an inherited human transport with `tty:true`. The latter
+    /// selects the interactive bootstrap profile (including init files) and
+    /// preserves terminal color; durable/headless clients cannot assert that
+    /// profile over a public socket.
     pub(crate) tty: bool,
     /// Request-local cancellation epoch for a queued task. The task worker
     /// installs it only after acquiring the session evaluator, so a later
@@ -624,7 +622,20 @@ fn out_index_literal(arg: &CmdArg) -> Option<i64> {
 
 impl Kernel {
     /// Get-or-create the principal-private named session.
+    #[cfg(test)]
     pub(crate) fn session(&self, name: &str, principal: &str) -> Result<Arc<Session>, RpcError> {
+        self.session_with_surface(name, principal, shoal_host::Surface::Kernel)
+    }
+
+    /// Get-or-create a session under an explicit host profile. Only the
+    /// inherited private human transport may select `Interactive`; ordinary
+    /// kernel callers use [`Self::session`] and cannot execute init files.
+    fn session_with_surface(
+        &self,
+        name: &str,
+        principal: &str,
+        surface: shoal_host::Surface,
+    ) -> Result<Arc<Session>, RpcError> {
         let key = SessionKey::new(principal, name);
         self.sessions.get_or_try_insert_with(
             key.clone(),
@@ -633,7 +644,7 @@ impl Kernel {
                 let bootstrap = shoal_host::SessionBootstrap::discover(&cwd).map_err(internal)?;
                 let mut evaluator = Evaluator::new(cwd);
                 let report = bootstrap
-                    .apply(&mut evaluator, shoal_host::Surface::Kernel, &key.principal)
+                    .apply(&mut evaluator, surface, &key.principal)
                     .map_err(internal)?;
                 for warning in bootstrap.config_warnings() {
                     eprintln!("shoal-kernel: warning: config: {warning}");
@@ -643,8 +654,8 @@ impl Kernel {
                 }
                 // Request execution sets this again at its own boundary to
                 // prevent stale identity. Configured aliases/environment are
-                // already seeded by `apply`; interactive `init.files` are not
-                // run for durable agent Sessions.
+                // already seeded by `apply`; only the inherited private-human
+                // interactive profile may run `init.files` below.
                 evaluator.set_leash_policy(self.policy.clone(), key.principal.clone());
                 // Long-lived agent/interactive sessions build up `j`/`jump` directory
                 // history against the shared per-user store, same as the REPL (frecency
@@ -700,6 +711,9 @@ impl Kernel {
                         .unwrap_or(serde_json::Value::Null);
                     let _ = wire_bus.publish_user(&wire_owner, channel, json);
                 }));
+                bootstrap
+                    .run_init(&mut evaluator, surface)
+                    .map_err(internal)?;
                 let lang_bus = evaluator.event_bus();
                 Ok(Arc::new(Session {
                     key: key.clone(),
@@ -891,7 +905,12 @@ impl Kernel {
             || profile == "supervisor"
             || token_caps.iter().any(|cap| cap == "plan.approve");
         let name = params.session.unwrap_or_else(|| "default".into());
-        let session = self.session(&name, &who)?;
+        let surface = if local_human && tty && connection_trust == ConnectionTrust::EmbeddedHuman {
+            shoal_host::Surface::Interactive
+        } else {
+            shoal_host::Surface::Kernel
+        };
+        let session = self.session_with_surface(&name, &who, surface)?;
         session.ensure_healthy()?;
         self.ensure_event_owner(&session.key.owner())?;
         let cwd = session.lock_evaluator()?.cwd().as_os_str().to_owned();

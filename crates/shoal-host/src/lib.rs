@@ -33,6 +33,10 @@ impl Surface {
             Self::NonInteractive | Self::Kernel => EchoMode::Quiet,
         }
     }
+
+    const fn runs_init(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
 }
 
 /// Fully resolved config plus discovery diagnostics shared by all hosts.
@@ -122,8 +126,13 @@ impl SessionBootstrap {
     }
 
     /// Run configured session init files after the host has installed its
-    /// surface-specific journal, output sink, and event forwarding.
-    pub fn run_init(&self, evaluator: &mut Evaluator) -> Result<(), String> {
+    /// surface-specific journal, output sink, and event forwarding. The
+    /// profile is authoritative: non-interactive and kernel calls are no-ops,
+    /// so an agent host cannot accidentally execute terminal startup code.
+    pub fn run_init(&self, evaluator: &mut Evaluator, surface: Surface) -> Result<(), String> {
+        if !surface.runs_init() {
+            return Ok(());
+        }
         for init in &self.loaded.config.init.files {
             evaluator
                 .eval_source_file(init)
@@ -244,6 +253,21 @@ mod tests {
 
     #[test]
     fn bootstrap_seeds_config_and_init_is_an_explicit_second_phase() {
+        fn assert_common_bindings(evaluator: &mut Evaluator) {
+            assert_eq!(
+                evaluator
+                    .eval_program(&parse("env.FROM_CONFIG").unwrap())
+                    .unwrap(),
+                Value::Str("value {safe}".into())
+            );
+            let alias = evaluator.eval_program(&parse("hi").unwrap()).unwrap();
+            assert!(
+                matches!(alias, Value::Outcome(ref outcome)
+                    if outcome.ok && outcome.stdout.as_ref() == b"hello\n"),
+                "configured alias must be identical across profiles: {alias:?}"
+            );
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let init = dir.path().join("init.shoal");
         std::fs::write(&init, "env.FROM_INIT = \"yes\"\n").unwrap();
@@ -263,12 +287,10 @@ mod tests {
         bootstrap
             .apply(&mut script, Surface::NonInteractive, "human")
             .unwrap();
-        assert_eq!(
-            script
-                .eval_program(&parse("env.FROM_CONFIG").unwrap())
-                .unwrap(),
-            Value::Str("value {safe}".into())
-        );
+        bootstrap
+            .run_init(&mut script, Surface::NonInteractive)
+            .unwrap();
+        assert_common_bindings(&mut script);
         assert!(
             script
                 .eval_program(&parse("env.FROM_INIT").unwrap())
@@ -279,6 +301,8 @@ mod tests {
         bootstrap
             .apply(&mut kernel, Surface::Kernel, "agent:test")
             .unwrap();
+        bootstrap.run_init(&mut kernel, Surface::Kernel).unwrap();
+        assert_common_bindings(&mut kernel);
         assert!(
             kernel
                 .eval_program(&parse("env.FROM_INIT").unwrap())
@@ -289,7 +313,10 @@ mod tests {
         bootstrap
             .apply(&mut interactive, Surface::Interactive, "human")
             .unwrap();
-        bootstrap.run_init(&mut interactive).unwrap();
+        bootstrap
+            .run_init(&mut interactive, Surface::Interactive)
+            .unwrap();
+        assert_common_bindings(&mut interactive);
         assert_eq!(
             interactive
                 .eval_program(&parse("env.FROM_INIT").unwrap())
@@ -312,18 +339,30 @@ mod tests {
         let mut evaluator = Evaluator::new(dir.path().to_path_buf());
 
         std::fs::write(&init, [0xff]).unwrap();
-        let error = bootstrap.run_init(&mut evaluator).unwrap_err();
+        // Non-interactive profiles never touch even a malformed init path.
+        bootstrap
+            .run_init(&mut evaluator, Surface::NonInteractive)
+            .unwrap();
+        bootstrap.run_init(&mut evaluator, Surface::Kernel).unwrap();
+
+        let error = bootstrap
+            .run_init(&mut evaluator, Surface::Interactive)
+            .unwrap_err();
         assert!(error.contains("source_utf8"), "{error}");
         assert!(error.contains(&init.display().to_string()), "{error}");
 
         let file = std::fs::File::create(&init).unwrap();
         file.set_len((shoal_syntax::MAX_SOURCE_BYTES + 1) as u64)
             .unwrap();
-        let error = bootstrap.run_init(&mut evaluator).unwrap_err();
+        let error = bootstrap
+            .run_init(&mut evaluator, Surface::Interactive)
+            .unwrap_err();
         assert!(error.contains("source_too_large"), "{error}");
 
         std::fs::write(&init, "env.INIT_RECOVERED = 'yes'\n").unwrap();
-        bootstrap.run_init(&mut evaluator).unwrap();
+        bootstrap
+            .run_init(&mut evaluator, Surface::Interactive)
+            .unwrap();
         assert_eq!(
             evaluator
                 .eval_program(&parse("env.INIT_RECOVERED").unwrap())
@@ -364,22 +403,27 @@ mod tests {
             warnings: Vec::new(),
             sources: Vec::new(),
         });
-        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
-        let report = bootstrap
-            .apply(&mut evaluator, Surface::NonInteractive, "human")
-            .unwrap();
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("9bad"))
-        );
-        for command in ["onlyfirst", "onlysecond"] {
-            let value = evaluator.eval_program(&parse(command).unwrap()).unwrap();
+        for surface in [
+            Surface::NonInteractive,
+            Surface::Interactive,
+            Surface::Kernel,
+        ] {
+            let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+            let report = bootstrap.apply(&mut evaluator, surface, "human").unwrap();
             assert!(
-                matches!(value, Value::Outcome(ref outcome) if outcome.ok),
-                "{command} should dispatch through its configured adapter: {value:?}"
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("9bad"))
             );
+            for command in ["onlyfirst", "onlysecond"] {
+                let value = evaluator.eval_program(&parse(command).unwrap()).unwrap();
+                assert!(
+                    matches!(value, Value::Outcome(ref outcome) if outcome.ok),
+                    "{command} should dispatch through its configured adapter on {surface:?}: \
+                     {value:?}"
+                );
+            }
         }
     }
 }

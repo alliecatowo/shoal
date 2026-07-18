@@ -270,12 +270,13 @@ naming/schema clarity if those metadata fields continue to use capability vocabu
 
 ## P1 — stabilize shared composition, protocol, and persistence
 
-### P1.1 Shared evaluator host builder
+### Delivered: shared evaluator host builder
 
-**Problem.** Local and kernel composition roots install different config, aliases, environment,
-init, adapters, Reef, journal/frecency, event, and prompt-related services.
+`shoal-host::SessionBootstrap` is the host-neutral builder for language-visible configuration.
+Named `Surface` profiles select echo, interactivity, and init eligibility; init eligibility is
+enforced inside the bootstrap API rather than left to a caller comment.
 
-**Design.** Create a host-neutral builder whose inputs are explicit:
+The implemented ownership split is explicit:
 
 | Input | Examples |
 |---|---|
@@ -287,15 +288,15 @@ init, adapters, Reef, journal/frecency, event, and prompt-related services.
 | interaction | terminal/PTY, opener, picker, prompt snapshot producer |
 | agent bridge | EventBus publisher, ref store, output limits |
 
-Define named profiles such as `InteractiveLocal`, `NonInteractiveLocal`, and `KernelSession`. A profile
-must state deliberate omissions; it must not rely on which setter a caller happened to remember.
+Local CLI owns terminal/editor/prompt/history presentation. Kernel owns journals, event forwarding,
+authenticated policy, and protocol refs. Only the inherited private-human TTY can select the
+interactive kernel profile and run init files.
 
-**Acceptance tests.** Feed the same temp config, adapter, Reef manifest, init file, cwd, env, and fake
-ports into local and kernel profiles. Assert equal language-visible bindings where parity is promised
-and exact, documented differences where it is not.
+Tests feed the same config env, aliases, adapter directories, and init input to every profile, plus
+real private and durable kernel processes, and assert both parity and deliberate omissions.
 
-**Exit.** Composition roots primarily parse CLI/protocol inputs and select a profile. Feature wiring
-does not require unrelated edits to two hand-built evaluator sequences.
+Composition roots now primarily parse CLI/protocol inputs, select a profile, and wire their owned
+transport/presentation services.
 
 ### P1.2 Subscription ownership and bounded EventBus delivery
 

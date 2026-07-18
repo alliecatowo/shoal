@@ -94,7 +94,7 @@ interactive `shoal` REPL or `shoal -c`; “kernel” means direct newline-delimi
 | evaluate structured values | yes | yes | yes | `shoal_exec` | no |
 | persistent evaluator variables | REPL lifetime | process lifetime | named-session lifetime | named-session lifetime | no |
 | layered core config | yes | yes | yes | inherits kernel | no |
-| init scripts | yes | yes | yes | inherits kernel | no |
+| init scripts | yes | no | trusted private-human REPL only | no | no |
 | rich prompt | yes | n/a | no | no | no |
 | bundled/configured adapters | yes | yes | yes | inherits kernel | names only |
 | user/project Reef | yes | yes | yes | inherits kernel | no |
@@ -107,9 +107,9 @@ interactive `shoal` REPL or `shoal -c`; “kernel” means direct newline-delimi
 | completion | Reedline | n/a | context-free endpoint | tool route | protocol completion |
 | diagnostics with spans | terminal | terminal | structured RPC | structured tool error | diagnostics |
 
-The former composition gap is now narrowed by `shoal-host::SessionBootstrap`: local and kernel
-evaluators share config snapshots, aliases/environment, adapters, plugins, Reef inputs, and init
-files. Surface-owned behavior remains deliberately different: only the interactive CLI owns the
+The former composition gap is closed by `shoal-host::SessionBootstrap`: local and kernel evaluators
+share config snapshots, aliases/environment, adapters, plugins, and Reef inputs. Surface-owned
+behavior remains deliberately different: only an interactive profile runs init; the CLI owns the
 prompt/editor/history UI, while the durable kernel owns authenticated attachments, refs, PTYs, and
 its coarse execution journal.
 
@@ -346,7 +346,7 @@ Consumer scope remains host-specific and must be documented explicitly:
 | `history.*` | yes | local host | implemented |
 | `editor.*` | yes | Reedline host | implemented |
 | `completion.*` | yes | local host | implemented |
-| `aliases`, `env`, `init` | yes | shared bootstrap; init is interactive-only | implemented with surface-specific init |
+| `aliases`, `env`, `init` | yes | shared bootstrap; init is profile-enforced interactive-only | implemented with surface-specific init |
 | `adapters.*`, `plugins.*` | yes | shared host bootstrap | implemented |
 | `reef.*` | yes | shared host bootstrap/resolver | implemented |
 | `render.width` | yes | CLI/REPL rendering and paging | implemented locally |

@@ -81,11 +81,43 @@ fn embedded_fd_is_private_trust_without_a_public_listener() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let runtime = temp.path().join("runtime");
+    let config_root = temp.path().join("config");
+    let config_dir = config_root.join("shoal");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let init = temp.path().join("interactive-init.shoal");
+    std::fs::write(&init, "env.FROM_PRIVATE_INIT = 'yes'\n").unwrap();
+    std::fs::write(
+        config_dir.join("shoal.toml"),
+        format!(
+            "[init]\nfiles = [{}]\n",
+            serde_json::to_string(init.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
     let expected_socket = runtime.join("shoal/default.sock");
     let (mut child, mut private, stderr_path) =
-        spawn_embedded_kernel(temp.path(), &state, &runtime, "single");
+        spawn_embedded_kernel(temp.path(), &state, &runtime, Some(&config_root), "single");
     let mut private_reader = BufReader::new(private.try_clone().unwrap());
     attach_embedded(&mut private, &mut private_reader, 1, "embedded");
+
+    write_frame(
+        &mut private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "exec".into(),
+            params: serde_json::json!({
+                "src":"env.FROM_PRIVATE_INIT",
+                "position":"value"
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut private_reader).result.unwrap()["value"],
+        serde_json::json!({"$":"str","v":"yes"}),
+        "the trusted private interactive profile must run configured init files"
+    );
 
     assert!(
         !expected_socket.exists(),
@@ -102,7 +134,7 @@ fn embedded_fd_is_private_trust_without_a_public_listener() {
         &mut private,
         &Request {
             jsonrpc: JSONRPC.into(),
-            id: 2.into(),
+            id: 3.into(),
             method: "parse".into(),
             params: serde_json::json!({"src":"1 + 2"}),
         },
@@ -132,9 +164,9 @@ fn two_private_embedded_kernels_can_share_state_without_contending_on_a_socket()
         let label_a = format!("stress-{round}-a");
         let label_b = format!("stress-{round}-b");
         let (mut child_a, mut private_a, stderr_a) =
-            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, &label_a);
+            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, None, &label_a);
         let (mut child_b, mut private_b, stderr_b) =
-            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, &label_b);
+            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, None, &label_b);
         await_embedded_ready(&mut child_a, &private_a, &stderr_a);
         await_embedded_ready(&mut child_b, &private_b, &stderr_b);
         let mut reader_a = BufReader::new(private_a.try_clone().unwrap());
@@ -213,7 +245,7 @@ fn private_embedded_kernel_coexists_with_a_durable_public_kernel() {
     for round in 0..10_u64 {
         let label = format!("coexist-{round}");
         let (mut embedded_child, mut private, embedded_stderr) =
-            spawn_embedded_kernel(temp.path(), &state, &runtime, &label);
+            spawn_embedded_kernel(temp.path(), &state, &runtime, None, &label);
         let mut private_reader = BufReader::new(private.try_clone().unwrap());
         attach_embedded(&mut private, &mut private_reader, 10 + round, "human");
         assert_ne!(public_child.id(), embedded_child.id());
@@ -283,10 +315,11 @@ fn spawn_embedded_kernel(
     dir: &Path,
     state: &Path,
     runtime: &Path,
+    config_root: Option<&Path>,
     label: &str,
 ) -> (Child, UnixStream, PathBuf) {
     let (mut child, private, stderr_path) =
-        spawn_embedded_kernel_unready(dir, state, runtime, label);
+        spawn_embedded_kernel_unready(dir, state, runtime, config_root, label);
     await_embedded_ready(&mut child, &private, &stderr_path);
     (child, private, stderr_path)
 }
@@ -295,6 +328,7 @@ fn spawn_embedded_kernel_unready(
     dir: &Path,
     state: &Path,
     runtime: &Path,
+    config_root: Option<&Path>,
     label: &str,
 ) -> (Child, UnixStream, PathBuf) {
     const EMBEDDED_FD: i32 = 3;
@@ -316,6 +350,9 @@ fn spawn_embedded_kernel_unready(
         .env_remove("SHOAL_SOCKET")
         .stdout(Stdio::null())
         .stderr(stderr_file);
+    if let Some(config_root) = config_root {
+        command.env("XDG_CONFIG_HOME", config_root);
+    }
     // SAFETY: only descriptor syscalls run between fork and exec. `dup2`
     // clears close-on-exec unless source and destination are already equal;
     // the explicit fcntl covers that edge case too.

@@ -103,9 +103,10 @@ The evaluator lock serializes evaluation and session mutation. Transcript/value 
 lock. The language event bus is cached separately so publishing `user.*` events does not wait behind
 a long-running evaluation.
 
-Creation uses the shared host bootstrap: layered config, aliases/environment, init, adapters,
-WebAssembly plugins, Reef inputs, jump frecency, the evaluator journal, and the `user.*` event
-forwarder. Local terminal UI remains deliberately outside the durable kernel.
+Creation uses the shared host bootstrap: layered config, aliases/environment, adapters, WebAssembly
+plugins, Reef inputs, jump frecency, the evaluator journal, and the `user.*` event forwarder. Init
+files run only for an inherited private-human TTY profile; durable/headless agent Sessions skip them.
+Local terminal UI remains deliberately outside the kernel.
 
 ## RPC surface
 

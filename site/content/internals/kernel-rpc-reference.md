@@ -149,9 +149,10 @@ Result fields:
 | `security_epoch` | attachment security contract revision |
 
 Creation applies the shared host bootstrap at the kernel process cwd: config snapshot,
-aliases/environment, adapters, WebAssembly plugins, Reef inputs, and init files. It then installs the
+aliases/environment, adapters, WebAssembly plugins, and Reef inputs. It then installs the
 authenticated kernel policy, default jump history, an optional second journal handle onto the same
-state directory, and the `user.*` language-to-wire event bridge.
+state directory, and the `user.*` language-to-wire event bridge. Init files run only when an
+inherited private-human TTY selects the interactive profile; public/bearer/headless Sessions cannot.
 
 ### `session.env`
 

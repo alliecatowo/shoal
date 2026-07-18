@@ -118,7 +118,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let catalogs = bootstrap_report.adapter_catalogs;
     let adapter_names = completer::scan_adapter_names(&bootstrap_report.adapter_dirs);
     if !protocol_backed {
-        bootstrap.run_init(&mut evaluator)?;
+        bootstrap.run_init(&mut evaluator, shoal_host::Surface::Interactive)?;
     }
 
     let interrupts = InterruptState::install(&evaluator, protocol.interrupt_handle())?;

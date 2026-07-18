@@ -151,17 +151,20 @@ Regression work belongs in collision, concurrency, audit-failure, and live-revoc
 `profile` and `caps` remain descriptive attach metadata: principal Leash policy and explicit handler
 checks are the authorization boundary.
 
-### High: the local shell and kernel are divergent composition roots
+### Resolved: shared evaluator composition with enforced surface profiles
 
-**Evidence:** the CLI loads layered config, aliases/env, config snapshot, init files, bundled and extra
-adapters, prompt, and user Reef scope. Kernel session creation installs journal/frecency/event
-forwarding but not those features.
+**Resolution:** `shoal-host::SessionBootstrap` applies layered config, aliases/environment, config
+snapshot, bundled/configured adapters, WebAssembly plugins, Reef inputs, echo, and configured policy
+to noninteractive, standalone-interactive, private-kernel, and durable-kernel evaluators.
 
-**Risk:** documentation and tests can claim a universal language feature that agents cannot use—or
-agents can observe defaults different from humans.
+`Surface` makes deliberate differences data. Init files run only for `Interactive`; the API itself
+no-ops for other profiles. Only an inherited private-human transport with a real TTY may select that
+profile, so the default private REPL gets init while public/bearer/MCP agent Sessions cannot execute
+terminal startup code. Prompt/editor/history UI remains correctly owned by the CLI.
 
-**Direction:** extract a host-neutral evaluator builder with explicit profiles, then make deliberate
-differences data rather than copy/pasted setup.
+**Proof:** host tests apply the same env, aliases, and configured adapter directories across all
+profiles and pin the init omission. Real daemon tests prove private interactive init execution and
+durable public-kernel omission of a configured malformed init file.
 
 ### High: policy and OS containment have sharp trust assumptions
 
