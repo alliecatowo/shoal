@@ -11,9 +11,10 @@ mod seatbelt;
 
 pub use effects::{Effect, Estimates, Plan, Reversibility};
 pub use enforce::{
-    EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy, SandboxPolicy, SpawnPreflight,
-    apply_landlock, apply_landlock_policy, apply_macos_sandbox, apply_macos_sandbox_policy,
-    apply_sandbox, apply_sandbox_policy, landlock_abi, preflight_spawn,
+    EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy, ProcessLimits, SandboxPolicy,
+    SpawnPreflight, apply_landlock, apply_landlock_policy, apply_macos_sandbox,
+    apply_macos_sandbox_policy, apply_process_limits, apply_sandbox, apply_sandbox_policy,
+    landlock_abi, preflight_spawn,
 };
 pub use policy::{
     AutoApply, OpaqueMode, POLICY_MAX_ASSIGNMENTS, POLICY_MAX_BYTES, POLICY_MAX_GRANT_BYTES,
@@ -337,6 +338,8 @@ opaque = "ask"
         assert!(p.spawn_hash.is_none());
         assert!(!p.hermetic);
         assert!(p.fs.read.is_empty());
+        assert!(!p.filesystem_requested);
+        assert!(p.process_limits.is_empty());
     }
 
     #[test]
@@ -402,6 +405,32 @@ opaque = "ask"
     }
 
     #[test]
+    fn resource_only_policy_lowers_without_claiming_filesystem_scope() {
+        let policy = Policy::from_toml(
+            "[principal.agent]\nprocess_cpu_seconds=7\nprocess_memory_bytes=67108864\n",
+        )
+        .unwrap();
+        let sandbox = policy
+            .sandbox_for("agent")
+            .expect("resource ceilings require a child launcher");
+        assert!(!sandbox.filesystem_requested);
+        assert!(sandbox.fs.read.is_empty());
+        assert_eq!(sandbox.net, NetPolicy::Unrestricted);
+        assert_eq!(sandbox.process_limits.cpu_seconds, Some(7));
+        assert_eq!(sandbox.process_limits.memory_bytes, Some(67_108_864));
+        assert!(policy.process_limits_active("agent"));
+    }
+
+    #[test]
+    fn zero_process_limits_are_rejected_at_policy_load() {
+        for field in ["process_cpu_seconds", "process_memory_bytes"] {
+            let error = Policy::from_toml(&format!("[principal.agent]\n{field}=0\n"))
+                .expect_err("a zero hard ceiling is nonsensical");
+            assert!(error.to_string().contains("greater than zero"));
+        }
+    }
+
+    #[test]
     fn hermetic_unresolved_scope_is_preserved_for_fail_closed_spawn() {
         let hermetic = Policy::from_toml(
             "[principal.agent]\nhermetic=true\n\n[principal.agent.fs]\nread=[\"/certainly/missing/shoal/**\"]\n",
@@ -428,7 +457,7 @@ opaque = "ask"
         )
         .unwrap();
         assert!(policy.hermetic_active("agent"));
-        assert!(policy.filesystem_scoping_active("agent"));
+        assert!(!policy.filesystem_scoping_active("agent"));
         assert!(policy.network_scoping_active("agent"));
         assert!(policy.spawn_pinning_active("agent"));
         assert!(!Policy::permissive("human").hermetic_active("human"));

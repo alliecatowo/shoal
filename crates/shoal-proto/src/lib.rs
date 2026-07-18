@@ -637,6 +637,10 @@ pub struct EnforcementPreview {
     pub network_enforceable: bool,
     pub spawn_pin_requested: bool,
     pub spawn_pin_atomic: bool,
+    #[serde(default)]
+    pub process_limits_requested: bool,
+    #[serde(default)]
+    pub process_limits_enforceable: bool,
     pub hermetic: bool,
     pub spawn_disposition: String,
     #[serde(default)]

@@ -4332,7 +4332,8 @@ fn attach_and_plan_share_dimension_level_enforcement_truth() {
     let who = principal();
     let policy = Policy::from_toml(&format!(
         "[principal.\"{who}\"]\nhermetic=true\nopaque='allow'\nauto_apply='in-grant'\n\
-         net_connect=[\"example.com:443\"]\nproc_spawn=[\"cat\"]\n\n\
+         net_connect=[\"example.com:443\"]\nproc_spawn=[\"cat\"]\n\
+         process_cpu_seconds=7\nprocess_memory_bytes=67108864\n\n\
          [principal.\"{who}\".fs]\nread=[\"/usr/**\"]\n"
     ))
     .unwrap();
@@ -4355,6 +4356,8 @@ fn attach_and_plan_share_dimension_level_enforcement_truth() {
     assert_eq!(enforcement["network_enforceable"], false);
     assert_eq!(enforcement["spawn_pin_requested"], true);
     assert_eq!(enforcement["spawn_pin_atomic"], false);
+    assert_eq!(enforcement["process_limits_requested"], true);
+    assert_eq!(enforcement["process_limits_enforceable"], true);
     assert_eq!(enforcement["hermetic"], true);
     assert_eq!(enforcement["spawn_disposition"], "refuse-unmet-hermetic");
     assert!(

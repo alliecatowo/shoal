@@ -211,6 +211,8 @@ secret_use = ["github-token"]
 session_write = true
 journal_read = true
 time = true
+process_cpu_seconds = 300
+process_memory_bytes = 1073741824
 auto_apply = "reversible"
 opaque = "ask"
 hermetic = false
@@ -239,6 +241,8 @@ TOML accepts the nested `[...fs]` form above. Dotted fields such as `fs.read = [
 | `session_write` | boolean | Session mutation effect. |
 | `journal_read` | boolean | Declared journal-read effect. |
 | `time` | boolean | Wall-clock access effect. |
+| `process_cpu_seconds` | positive integer | Hard CPU-time ceiling inherited by each spawned process. |
+| `process_memory_bytes` | positive integer | Hard virtual-address-space ceiling inherited by each spawned process. |
 | `auto_apply` | `never`, `in-grant`, `reversible` | Whether an otherwise allowed plan runs without approval. |
 | `opaque` | `deny`, `ask`, `allow` | Treatment of unanalyzable effects. |
 | `hermetic` | boolean | Ask spawn layer to fail rather than degrade requested sandbox dimensions. |
@@ -416,7 +420,8 @@ behavior across target macOS releases.
 `hermetic = true` asks the spawn layer to refuse rather than proceed when the concrete requested sandbox cannot be fully applied. This is safer than best-effort for supported dimensions, but it is not currently a general hermetic build environment:
 
 - network grants are not lowered into an enforced network sandbox;
-- time, process tree, CPU/memory, device, and IPC isolation are not comprehensive;
+- CPU/address-space ceilings are per process, not aggregate process-tree or per-principal budgets;
+- time, descendant escape, device, and IPC isolation are not comprehensive;
 - Reef's tool hermeticity and Leash's OS sandbox are related but different layers.
 
 Test fail-closed behavior for every effect dimension your workload depends on.
@@ -489,7 +494,13 @@ Remaining high-cost surfaces include:
 - journal/CAS disk growth until garbage collection;
 - CPU/memory consumed by evaluated source or child processes.
 
-Connections, retained principal Sessions, active tasks, PTYs (per Session/principal/global), subscriptions, plan/source bytes, transcripts, stream cursors, frames, and event queues have explicit bounds. There is still no general per-principal rate, memory, CPU, or descendant-process-tree meter. Use OS service controls (cgroups/launchd limits/container quotas where appropriate), supervise the daemon, and keep hostile code outside a shared kernel process.
+Leash can apply `process_cpu_seconds` (`RLIMIT_CPU`) and `process_memory_bytes` (`RLIMIT_AS`) in the
+child-only launcher. Capture, bounded provider probes, and PTY programs all pass through that
+launcher, and descendants inherit the ceilings. Accounting remains per process: a forked tree gets a
+ceiling on each member, not one aggregate CPU/memory pool, and a deliberately detached descendant is
+not owned as a Shoal task.
+
+Connections, retained principal Sessions, active tasks, PTYs (per Session/principal/global), subscriptions, plan/source bytes, transcripts, stream cursors, frames, and event queues have explicit bounds. There is still no general per-principal rate, aggregate memory/CPU, or descendant-process-tree meter. Use OS service controls (cgroups/launchd limits/container quotas where appropriate), supervise the daemon, and keep hostile code outside a shared kernel process.
 
 `task.await` no longer holds a connection worker indefinitely: it defaults to 30 seconds and has a
 60-second server ceiling. A timed-out wait leaves the underlying task running for later poll,
@@ -503,7 +514,7 @@ the existing cooperative/process-group escalation path and is not a transaction 
 
 Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:
 
-1. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
+1. add aggregate descendant-tree CPU/memory/process enforcement while preserving per-dimension truth;
 2. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
 3. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
 

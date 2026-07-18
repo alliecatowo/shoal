@@ -594,9 +594,14 @@ pub fn run_bounded(
             "bounded execution requires argv[0]",
         ));
     }
-    let sandbox_requested = spec.sandbox.is_some();
+    let filesystem_sandbox_requested = spec.sandbox.as_ref().is_some_and(|policy| {
+        policy.filesystem_requested
+            || !policy.fs.read.is_empty()
+            || !policy.fs.write.is_empty()
+            || !policy.fs.delete.is_empty()
+    });
     let enforcement = sandbox::apply(&mut spec)?;
-    if sandbox_requested
+    if filesystem_sandbox_requested
         && !enforcement
             .as_ref()
             .is_some_and(|status| status.filesystem_enforced)
@@ -663,6 +668,8 @@ fn hard_landlock_status(spawn_exec_enforced: bool) -> shoal_leash::EnforcementSt
         filesystem_enforced: true,
         spawn_exec_enforced,
         network_enforced: false,
+        cpu_limit_enforced: false,
+        memory_limit_enforced: false,
     }
 }
 
@@ -692,6 +699,7 @@ fn sandbox_spec(
         helper,
         &sandbox,
         shoal_leash::NetPolicy::Unrestricted,
+        shoal_leash::ProcessLimits::default(),
         program,
         &spec.argv,
     );

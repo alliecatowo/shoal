@@ -3,7 +3,7 @@
 //! [`crate::SandboxPolicy`] for one child spawn.
 
 use crate::effects::{Effect, Plan, Reversibility};
-use crate::enforce::{FsSandbox, NetPolicy, SandboxPolicy};
+use crate::enforce::{FsSandbox, NetPolicy, ProcessLimits, SandboxPolicy};
 use glob::Pattern;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -70,6 +70,14 @@ pub struct PrincipalPolicy {
     pub journal_read: bool,
     #[serde(default)]
     pub time: bool,
+    /// Hard CPU-time ceiling inherited by each spawned process. Accounting is
+    /// per process, not aggregate across a descendant tree.
+    #[serde(default)]
+    pub process_cpu_seconds: Option<u64>,
+    /// Hard virtual-address-space ceiling inherited by each spawned process.
+    /// Accounting is per process, not an aggregate principal memory budget.
+    #[serde(default)]
+    pub process_memory_bytes: Option<u64>,
     #[serde(default)]
     pub auto_apply: AutoApply,
     #[serde(default)]
@@ -174,7 +182,7 @@ impl Policy {
         self.fail_closed
             || self
                 .principal(principal)
-                .is_some_and(|p| !p.is_fs_unrestricted())
+                .is_some_and(PrincipalPolicy::has_fs_scope)
     }
 
     /// Whether a network destination/listener allowlist is configured. Leash
@@ -191,6 +199,12 @@ impl Policy {
     /// guarantees rather than best-effort constraints.
     pub fn hermetic_active(&self, principal: &str) -> bool {
         self.fail_closed || self.principal(principal).is_some_and(|p| p.hermetic)
+    }
+
+    /// Whether this principal requests any inherited per-process ceiling.
+    pub fn process_limits_active(&self, principal: &str) -> bool {
+        self.principal(principal)
+            .is_some_and(|p| p.process_cpu_seconds.is_some() || p.process_memory_bytes.is_some())
     }
 
     pub fn evaluate_effect(&self, principal: &str, effect: &Effect) -> Verdict {
@@ -328,9 +342,9 @@ impl Policy {
     }
 
     /// Resolve the concrete OS [`SandboxPolicy`] for `principal`'s next child
-    /// spawn, or `None` when the principal is unknown, its filesystem grants
-    /// are unrestricted, or it declares no filesystem scope at all. `None`
-    /// means "run the child without OS confinement" — the plan-layer verdict
+    /// spawn, or `None` when the principal is unknown and requests neither a
+    /// usable filesystem scope nor process ceilings. `None` means "run the
+    /// child without an enforcement launcher" — the plan-layer verdict
     /// ([`Policy::evaluate_plan`]) remains the authority in that case, and the
     /// default-permissive policy therefore never wraps a spawn (zero
     /// regression). See [`PrincipalPolicy::to_sandbox_policy`].
@@ -341,6 +355,14 @@ impl Policy {
 }
 
 impl PrincipalPolicy {
+    /// Whether the principal declares a non-no-op filesystem scope. Empty
+    /// grant lists mean no OS filesystem request (semantic effect evaluation
+    /// may still deny filesystem effects); all-root grants are unrestricted.
+    pub fn has_fs_scope(&self) -> bool {
+        (!self.fs_read.is_empty() || !self.fs_write.is_empty() || !self.fs_delete.is_empty())
+            && !self.is_fs_unrestricted()
+    }
+
     /// True when every filesystem dimension grants the root subtree (`/**`),
     /// i.e. an OS sandbox built from this principal would confine nothing.
     pub fn is_fs_unrestricted(&self) -> bool {
@@ -349,9 +371,9 @@ impl PrincipalPolicy {
             && grants_include_root(&self.fs_delete)
     }
 
-    /// Lower this principal's filesystem scopes into a concrete
-    /// [`SandboxPolicy`] for one child spawn, or `None` when there is nothing
-    /// to confine to.
+    /// Lower this principal's filesystem scopes and inherited process ceilings
+    /// into a concrete [`SandboxPolicy`] for one child spawn, or `None` when
+    /// there is nothing to enforce.
     ///
     /// `None` is returned when the grants are unrestricted (root subtree — a
     /// no-op sandbox), or when a non-hermetic scope has no existing root. A
@@ -367,13 +389,30 @@ impl PrincipalPolicy {
     /// the evaluator refuses that hermetic request before spawn because the OS
     /// backends cannot express it. `hermetic` is carried through unchanged.
     pub fn to_sandbox_policy(&self) -> Option<SandboxPolicy> {
-        if self.is_fs_unrestricted() {
+        let filesystem_requested = self.has_fs_scope();
+        let process_limits = ProcessLimits {
+            cpu_seconds: self.process_cpu_seconds,
+            memory_bytes: self.process_memory_bytes,
+        };
+        if !filesystem_requested && process_limits.is_empty() {
             return None;
         }
-        let read = grant_roots(&self.fs_read);
-        let write = grant_roots(&self.fs_write);
-        let delete = grant_roots(&self.fs_delete);
-        if read.is_empty() && write.is_empty() && delete.is_empty() && !self.hermetic {
+        let (read, write, delete) = if filesystem_requested {
+            (
+                grant_roots(&self.fs_read),
+                grant_roots(&self.fs_write),
+                grant_roots(&self.fs_delete),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        if filesystem_requested
+            && read.is_empty()
+            && write.is_empty()
+            && delete.is_empty()
+            && !self.hermetic
+            && process_limits.is_empty()
+        {
             return None;
         }
         Some(SandboxPolicy {
@@ -382,12 +421,18 @@ impl PrincipalPolicy {
                 write,
                 delete,
             },
-            net: if self.hermetic && self.net_connect.is_empty() && self.net_listen.is_empty() {
+            filesystem_requested,
+            net: if filesystem_requested
+                && self.hermetic
+                && self.net_connect.is_empty()
+                && self.net_listen.is_empty()
+            {
                 NetPolicy::Deny
             } else {
                 NetPolicy::Unrestricted
             },
             spawn_hash: None,
+            process_limits,
             hermetic: self.hermetic,
         })
     }
@@ -636,6 +681,16 @@ fn validate_policy_doc(doc: &PolicyDoc) -> Result<(), PolicyParseError> {
             return Err(PolicyParseError::new(format!(
                 "principal {name:?} has {} net_listen grants; maximum is {POLICY_MAX_GRANTS_PER_KIND}",
                 policy.net_listen.len()
+            )));
+        }
+        if policy.process_cpu_seconds == Some(0) {
+            return Err(PolicyParseError::new(format!(
+                "principal {name:?} process_cpu_seconds must be greater than zero"
+            )));
+        }
+        if policy.process_memory_bytes == Some(0) {
+            return Err(PolicyParseError::new(format!(
+                "principal {name:?} process_memory_bytes must be greater than zero"
             )));
         }
     }

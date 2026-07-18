@@ -102,7 +102,7 @@ and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/sh
 
 Policy is keyed by principal. Each principal can grant path globs, executable names/hashes, network
 destinations, environment names, secrets, session/journal/time access, an opaque mode, hermetic
-intent, and an automatic-apply rule.
+intent, inherited per-process CPU/address-space ceilings, and an automatic-apply rule.
 
 
 Denial dominates approval, which dominates allow. Unknown principals deny at this evaluator. Local
@@ -228,8 +228,8 @@ accDescr: Shows the components and relationships described in Lowering grants to
   Sandbox --> Other["other platform: advisory"]
 ```
 
-The concrete request records filesystem scopes, a coarse network policy, optional spawn hash, and a
-`hermetic` flag. A hermetic request must fail the spawn if any requested dimension cannot be
+The concrete request records filesystem scopes, a coarse network policy, inherited per-process
+ceilings, an optional spawn hash, and a `hermetic` flag. A hermetic request must fail the spawn if any requested dimension cannot be
 enforced; non-hermetic execution uses the strongest available backend and returns an
 `EnforcementStatus` describing what actually happened.
 
@@ -242,6 +242,7 @@ enforced; non-hermetic execution uses the strongest available backend and return
 | executable identity | preflight BLAKE3 check; no exec-time pin |
 | coarse network deny | Landlock ABI 4+ TCP bind/connect denial; Seatbelt deny-by-default |
 | hostname/port allowlist | plan/policy gate only; no OS backend |
+| child CPU/address space | inherited `RLIMIT_CPU`/`RLIMIT_AS`; per process, not aggregate tree |
 | unsupported OS | advisory policy, no strong OS sandbox |
 
 The spawn hash has a documented time-of-check/time-of-use gap: the path is hashed before `exec`, so

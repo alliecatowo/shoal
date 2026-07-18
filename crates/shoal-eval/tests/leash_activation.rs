@@ -133,6 +133,24 @@ fn no_leash_policy_is_the_unconfined_baseline() {
 }
 
 #[test]
+fn resource_only_policy_reaches_the_real_evaluator_spawn() {
+    ensure_sandbox_helper();
+    let d = tempfile::tempdir().unwrap();
+    let policy =
+        Policy::from_toml("[principal.agent]\nopaque='allow'\nprocess_cpu_seconds=7\n").unwrap();
+    let mut ev = Evaluator::new(d.path().to_path_buf());
+    ev.set_leash_policy(policy, "agent");
+    let out = ev
+        .eval_program(&parse("/bin/sh -c 'ulimit -t'"))
+        .expect("resource-only Leash policy must execute through its launcher");
+    let Value::Outcome(outcome) = out else {
+        panic!("expected outcome");
+    };
+    assert!(outcome.ok);
+    assert_eq!(String::from_utf8_lossy(&outcome.stdout).trim(), "7");
+}
+
+#[test]
 fn scoped_policy_blocks_a_denied_sibling_through_the_eval_spawn_path() {
     if shoal_leash::landlock_abi().is_none() {
         eprintln!("Landlock unavailable; skipping the OS-enforcement assertion");

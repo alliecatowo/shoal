@@ -209,13 +209,14 @@ One `PrincipalPolicy` holds:
 | `env_read`, `env_write` | name or `*` list |
 | `secret_use`/`secrets` | name or `*` list |
 | `session_write`, `journal_read`, `time` | booleans |
+| `process_cpu_seconds`, `process_memory_bytes` | positive integer per-process ceilings |
 | `auto_apply` | `never`, `in-grant`, or `reversible` |
 | `opaque` | `deny`, `ask`, or `allow` |
 | `hermetic` | require requested OS enforcement or refuse spawn |
 
 The TOML loader flattens dotted/nested `fs`, `env`, `secret`, and `proc` namespaces into serde field
-names before deserializing. Unknown fields are not globally described as denied by serde here; policy
-schema tests should pin typo behavior.
+names before deserializing. Principal and top-level documents deny unknown fields, so authority typos
+fail policy loading rather than silently disappearing.
 
 An unknown principal returns `Deny` for semantic effect and plan evaluation.
 
@@ -368,10 +369,12 @@ spawns with such an allowlist are refused.
 |---|---|
 | `available_tier` | strongest plausible platform backend |
 | `active_tier` | backend actually activated for this child |
-| `enforced` | any concrete sandbox active |
+| `enforced` | any concrete child OS control active |
 | `filesystem_enforced` | filesystem grants active |
 | `spawn_exec_enforced` | executable pin checked/enforced for this spawn |
 | `network_enforced` | network restriction active |
+| `cpu_limit_enforced` | inherited per-process CPU ceiling configured |
+| `memory_limit_enforced` | inherited per-process address-space ceiling configured |
 | `landlock_abi` | detected Linux ABI when any |
 | `detail` | human-readable caveats |
 
@@ -380,6 +383,10 @@ Tier detection alone returns `enforced = false`; availability is not activation.
 Linux uses Landlock with hard-requirement compatibility. macOS generates and activates a deny-by-
 default Seatbelt profile. Other platforms report advisory/degraded status. The exec wrapper performs
 enforcement in a child helper, never by irreversibly restricting the parent shell.
+
+The same child helper applies optional `RLIMIT_CPU` and `RLIMIT_AS` ceilings before exec. These
+limits are inherited but independently accounted per process; they are not cgroup-style aggregate
+task-tree or principal budgets and do not prevent a descendant from leaving Shoal's process group.
 
 ## Linux Landlock mapping
 

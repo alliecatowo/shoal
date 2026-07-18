@@ -279,20 +279,21 @@ Before resolution/spawn, `sandbox::apply` consumes the optional sandbox request.
 program, verifies an optional executable-content pin, and may rewrite argv through the sibling
 `shoal-sandbox-exec` helper.
 
-| Platform/path | Filesystem enforcement | Network enforcement |
-|---|---|---|
-| Linux with Landlock ABI/helper | applied, tier A | TCP deny with ABI 4+ when requested |
-| macOS helper/Seatbelt | applied, reported tier C | deny-by-default when requested |
-| unsupported host | child may run unconfined with honest degraded status | not enforced |
-| any host with `hermetic` and unmet request | spawn fails closed | spawn fails closed |
+| Platform/path | Filesystem enforcement | Network enforcement | Process ceilings |
+|---|---|---|---|
+| Linux with Landlock ABI/helper | applied, tier A | TCP deny with ABI 4+ when requested | `RLIMIT_CPU` / `RLIMIT_AS` |
+| macOS helper/Seatbelt | applied, reported tier C | deny-by-default when requested | `RLIMIT_CPU` / `RLIMIT_AS` |
+| unsupported sandbox backend | child may run unconfined with honest degraded status | not enforced | Unix launcher still applies requested ceilings |
+| any host with `hermetic` and unmet request | spawn fails closed | spawn fails closed | spawn fails closed |
 
 `net = deny` is coarse: it does not express destination allowlists. A hermetic request rejects
 execution when filesystem or requested network enforcement cannot be fully applied.
 
 The helper is searched beside the current executable or its parent. Missing helper can fail a path
-that otherwise has an enforcement mechanism. Wrapped argv encodes read/write/delete grants, then
-`--deny-net` when requested, read/write/delete grants, then `--`, resolved program, and original
-arguments after argv zero.
+that otherwise has an enforcement mechanism. Wrapped argv encodes `--deny-net`, `--cpu-seconds`, and
+`--memory-bytes` when requested, then read/write/delete grants, `--`, the resolved program, and
+original arguments after argv zero. CPU and virtual-address-space ceilings are inherited but
+independently accounted per process, not as an aggregate descendant-tree or principal budget.
 
 Executable pinning hashes before exec. There is a documented TOCTOU window between hash verification
 and the kernel executing the path; the status must not claim atomic verified execution.
@@ -345,7 +346,8 @@ through every execution host.
 - Spill flush establishes kernel-page-cache acceptance, not power-loss durability (`fsync` is not
   performed). The journal/CAS adoption path owns its own durability contract.
 - Sandbox pin verification has a TOCTOU gap.
-- Network policy has no enforcing backend in the current spawn wrapper.
+- Coarse network denial has platform backends; hostname/port allowlists remain semantic-only.
+- Process CPU/address-space ceilings are per process, not aggregate tree or principal quotas.
 - Nonhermetic sandbox requests can degrade to an unconfined child, though status is honest.
 - `StreamingChild::wait` closes undrained pipes; callers wanting all bytes must drain both concurrently
   before waiting.

@@ -276,12 +276,13 @@ failure without restart. `profile`/`--cap` values are echoed metadata, not enfor
 | filesystem sandbox | Implemented on supported Linux/macOS paths | enforcement tier reports actual backend result |
 | process hash gate | Implemented preflight | content is checked before exec; TOCTOU remains |
 | coarse network denial | Implemented, platform-limited | Landlock ABI 4+ TCP bind/connect denial; Seatbelt deny-default |
+| inherited process ceilings | Implemented, non-aggregate | policy-driven `RLIMIT_CPU`/`RLIMIT_AS` applied by the child launcher across capture/provider/PTY spawns; each descendant inherits its own per-process ceiling |
 | hostname/port network allowlist | Not implemented | grants remain planning/policy only; hermetic opaque spawn refuses |
 | malformed local policy handling | Implemented fail closed | only a genuinely missing convenience file selects the permissive default; present invalid authority quarantines to deny-all |
 | child authority inheritance | Implemented unified constructor | production sites carry principal/policy/Reef/fs/cancellation; future sites are inventory-guarded |
 | secret rendering | Implemented | generic render is redacted; review every new serialization/stdin path |
 | cap-request honesty | Implemented | response uses the same enforcement truth as attach |
-| enforcement preview | Implemented | attach and plan share typed filesystem/network/spawn/hermetic dimensions; activation remains child-local |
+| enforcement preview | Implemented | attach and plan share typed filesystem/network/spawn/process-limit/hermetic dimensions; activation remains child-local |
 
 
 No documentation should collapse these layers into the sentence “Leash sandboxes commands.” State

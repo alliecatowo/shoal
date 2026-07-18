@@ -10,7 +10,7 @@
 
 use crate::ExecSpec;
 use crate::which::resolve_program;
-use shoal_leash::{EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy};
+use shoal_leash::{EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy, ProcessLimits};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,14 +24,20 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
     let Some(policy) = spec.sandbox.take() else {
         return Ok(None);
     };
-    if policy.hermetic
-        && policy.fs.read.is_empty()
-        && policy.fs.write.is_empty()
-        && policy.fs.delete.is_empty()
-    {
+    let fs_has_roots =
+        !policy.fs.read.is_empty() || !policy.fs.write.is_empty() || !policy.fs.delete.is_empty();
+    let filesystem_requested = policy.filesystem_requested || fs_has_roots;
+    if policy.hermetic && filesystem_requested && !fs_has_roots {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "hermetic filesystem scope resolved to no usable roots",
+        ));
+    }
+    if policy.process_limits.cpu_seconds == Some(0) || policy.process_limits.memory_bytes == Some(0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process CPU and memory limits must be greater than zero",
         ));
     }
     if policy.hermetic && policy.spawn_hash.is_some() {
@@ -45,13 +51,16 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
         verify_pin(&program, pin)?;
     }
 
-    let linux_backend = cfg!(target_os = "linux")
+    let os_confinement_requested = fs_has_roots || policy.net == NetPolicy::Deny;
+    let linux_backend = os_confinement_requested
+        && cfg!(target_os = "linux")
         && shoal_leash::landlock_abi().is_some_and(|abi| policy.net != NetPolicy::Deny || abi >= 4);
     let mut status = if linux_backend {
         spec.argv = wrap(
             sandbox_helper()?,
             &policy.fs,
             policy.net,
+            policy.process_limits,
             program,
             &spec.argv,
         );
@@ -68,15 +77,18 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
                 }
             ),
             landlock_abi: shoal_leash::landlock_abi(),
-            filesystem_enforced: true,
+            filesystem_enforced: fs_has_roots,
             spawn_exec_enforced: policy.spawn_hash.is_some(),
             network_enforced: policy.net == NetPolicy::Deny,
+            cpu_limit_enforced: policy.process_limits.cpu_seconds.is_some(),
+            memory_limit_enforced: policy.process_limits.memory_bytes.is_some(),
         }
-    } else if cfg!(target_os = "macos") {
+    } else if os_confinement_requested && cfg!(target_os = "macos") {
         spec.argv = wrap(
             sandbox_helper()?,
             &policy.fs,
             policy.net,
+            policy.process_limits,
             program,
             &spec.argv,
         );
@@ -93,16 +105,40 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
                 }
             ),
             landlock_abi: None,
-            filesystem_enforced: true,
+            filesystem_enforced: fs_has_roots,
             spawn_exec_enforced: policy.spawn_hash.is_some(),
             network_enforced: policy.net == NetPolicy::Deny,
+            cpu_limit_enforced: policy.process_limits.cpu_seconds.is_some(),
+            memory_limit_enforced: policy.process_limits.memory_bytes.is_some(),
         }
     } else {
         let mut degraded = EnforcementStatus::detect();
-        degraded.detail = format!(
-            "{}; sandbox was requested but not applied — child runs WITHOUT OS confinement",
-            degraded.detail
-        );
+        if !policy.process_limits.is_empty() {
+            spec.argv = wrap(
+                sandbox_helper()?,
+                &FsSandbox::default(),
+                NetPolicy::Unrestricted,
+                policy.process_limits,
+                program,
+                &spec.argv,
+            );
+            degraded.enforced = true;
+            degraded.cpu_limit_enforced = policy.process_limits.cpu_seconds.is_some();
+            degraded.memory_limit_enforced = policy.process_limits.memory_bytes.is_some();
+            degraded
+                .detail
+                .push_str("; inherited per-process resource ceilings configured in child launcher");
+        }
+        degraded.spawn_exec_enforced = policy.spawn_hash.is_some();
+        if os_confinement_requested {
+            degraded.detail.push_str(
+                "; requested filesystem/network sandbox was not applied — child runs without that OS confinement",
+            );
+        } else if filesystem_requested {
+            degraded.detail.push_str(
+                "; requested filesystem scope resolved to no usable roots and was not applied",
+            );
+        }
         degraded
     };
 
@@ -113,8 +149,12 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
     }
 
     if policy.hermetic {
+        let fs_ok = !filesystem_requested || status.filesystem_enforced;
         let net_ok = policy.net != NetPolicy::Deny || status.network_enforced;
-        if !status.enforced || !net_ok {
+        let cpu_ok = policy.process_limits.cpu_seconds.is_none() || status.cpu_limit_enforced;
+        let memory_ok =
+            policy.process_limits.memory_bytes.is_none() || status.memory_limit_enforced;
+        if !fs_ok || !net_ok || !cpu_ok || !memory_ok {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
@@ -175,12 +215,21 @@ pub(crate) fn wrap(
     helper: PathBuf,
     fs: &FsSandbox,
     net: NetPolicy,
+    process_limits: ProcessLimits,
     program: PathBuf,
     argv: &[OsString],
 ) -> Vec<OsString> {
     let mut out = vec![helper.into_os_string()];
     if net == NetPolicy::Deny {
         out.push("--deny-net".into());
+    }
+    if let Some(seconds) = process_limits.cpu_seconds {
+        out.push("--cpu-seconds".into());
+        out.push(seconds.to_string().into());
+    }
+    if let Some(bytes) = process_limits.memory_bytes {
+        out.push("--memory-bytes".into());
+        out.push(bytes.to_string().into());
     }
     for path in &fs.read {
         out.push("--read".into());

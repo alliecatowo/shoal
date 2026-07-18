@@ -26,6 +26,8 @@ pub struct EnforcementStatus {
     pub filesystem_enforced: bool,
     pub spawn_exec_enforced: bool,
     pub network_enforced: bool,
+    pub cpu_limit_enforced: bool,
+    pub memory_limit_enforced: bool,
 }
 
 impl EnforcementStatus {
@@ -60,6 +62,8 @@ impl EnforcementStatus {
             filesystem_enforced: false,
             spawn_exec_enforced: false,
             network_enforced: false,
+            cpu_limit_enforced: false,
+            memory_limit_enforced: false,
         }
     }
 }
@@ -84,9 +88,27 @@ pub enum NetPolicy {
     Deny,
 }
 
+/// Inherited per-process ceilings applied immediately before the sandbox
+/// launcher executes the requested program. These are deliberately named
+/// per-process limits: descendants inherit them, but CPU time and address
+/// space are accounted independently for each process rather than as one
+/// aggregate task-tree or principal budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessLimits {
+    pub cpu_seconds: Option<u64>,
+    pub memory_bytes: Option<u64>,
+}
+
+impl ProcessLimits {
+    pub fn is_empty(self) -> bool {
+        self.cpu_seconds.is_none() && self.memory_bytes.is_none()
+    }
+}
+
 /// A concrete, resolved enforcement request for one child spawn: filesystem
-/// scopes, a coarse network policy, an optional pinned spawn hash (site/content/internals/language-conformance-contract.md
-/// content-hash pinning), and a `hermetic` intent flag.
+/// scopes, a coarse network policy, optional inherited process ceilings, an
+/// optional pinned spawn hash (site/content/internals/language-conformance-contract.md content-hash pinning), and a
+/// `hermetic` intent flag.
 ///
 /// `hermetic: true` means the caller wants a hard guarantee: the consumer
 /// (`shoal-exec::run`/`spawn_capture`) must refuse to spawn rather than run
@@ -97,8 +119,14 @@ pub enum NetPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct SandboxPolicy {
     pub fs: FsSandbox,
+    /// Whether the originating policy requested filesystem confinement. This
+    /// remains true when every configured root was unresolved, allowing a
+    /// hermetic request to fail closed without confusing it with a
+    /// resource-only policy.
+    pub filesystem_requested: bool,
     pub net: NetPolicy,
     pub spawn_hash: Option<String>,
+    pub process_limits: ProcessLimits,
     pub hermetic: bool,
 }
 
@@ -191,6 +219,8 @@ pub fn apply_landlock_policy(
         filesystem_enforced: true,
         spawn_exec_enforced: false,
         network_enforced: net == NetPolicy::Deny,
+        cpu_limit_enforced: false,
+        memory_limit_enforced: false,
     })
 }
 #[cfg(not(target_os = "linux"))]
@@ -287,6 +317,8 @@ pub fn apply_macos_sandbox_policy(
         filesystem_enforced: true,
         spawn_exec_enforced: false,
         network_enforced: net == NetPolicy::Deny,
+        cpu_limit_enforced: false,
+        memory_limit_enforced: false,
     })
 }
 #[cfg(target_os = "macos")]
@@ -341,5 +373,41 @@ pub fn apply_sandbox_policy(
     {
         let _ = (grants, net);
         Err("no OS sandbox backend for this platform".into())
+    }
+}
+
+/// Apply the requested inherited per-process ceilings to the current process.
+/// This is called by the child-only launcher immediately before `exec`, never
+/// by the long-lived shell or kernel process.
+pub fn apply_process_limits(limits: ProcessLimits) -> Result<(), String> {
+    if let Some(seconds) = limits.cpu_seconds {
+        set_limit(libc::RLIMIT_CPU, seconds, "CPU seconds")?;
+    }
+    if let Some(bytes) = limits.memory_bytes {
+        set_limit(libc::RLIMIT_AS, bytes, "address-space bytes")?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type RlimitResource = libc::c_int;
+
+fn set_limit(resource: RlimitResource, value: u64, label: &str) -> Result<(), String> {
+    let value = libc::rlim_t::try_from(value)
+        .map_err(|_| format!("{label} limit {value} is not representable on this host"))?;
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    let result = unsafe { libc::setrlimit(resource, &limit) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "setrlimit({label}) failed: {}",
+            std::io::Error::last_os_error()
+        ))
     }
 }

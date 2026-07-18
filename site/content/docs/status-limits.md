@@ -8,13 +8,13 @@ template = "docs/page.html"
 eyebrow = "Project status"
 group = "Project"
 audience = "Evaluators, adopters, operators, and contributors"
-status = "Snapshot: 2026-07-16"
+status = "Snapshot: 2026-07-18"
 toc = true
 +++
 
 Shoal is a substantial, working preview—not a production-hardened login shell or multi-tenant agent sandbox. The language, structured shell, adapters, Reef resolver, journal/undo, kernel, MCP tools/resources/events, PTYs, LSP, prompt, and configuration system all execute real code today. The current security model still requires a fully trusted local kernel socket, and several protocol/operational contracts need hardening before consequential unattended deployment.
 
-This page is dated because status prose goes stale. It was checked against the source tree and the 1,310-case conformance corpus on **2026-07-16**.
+This page is dated because status prose goes stale. It was checked against the source tree and the 1,331-case conformance corpus on **2026-07-18**.
 
 ## Readiness in one table
 
@@ -49,8 +49,8 @@ The documentation uses these labels:
 The language contract lives in `spec/cases/*.toml`:
 
 ```text
-1,310 cases across 77 files
-1,306 passed
+1,331 cases
+1,327 passed
 0 failed
 4 skipped
 ```
@@ -175,7 +175,7 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 | PTY output | Current rendered grid, no raw ANSI or durable scrollback stream. | Use ordinary exec for audit capture. |
 | Resource/session lifetime | Plans/tasks/PTys/transcript refs disappear on kernel restart. | Reconcile journal/artifacts and recreate. |
 | Event retention | Only journal/transcript durable; other channels retain 1,024. | Detect gaps and reconcile authoritative state. |
-| Partial quotas | Connections, retained Sessions, active tasks, PTYs, subscriptions, transcript/cursor retention, plans, and frame sizes are bounded; CPU, memory, and descendant process trees are not comprehensively metered. | Apply OS service/cgroup limits for hostile workloads. |
+| Partial quotas | Connections, retained Sessions, active tasks, PTYs, subscriptions, transcript/cursor retention, plans, and frame sizes are bounded. Leash can add inherited per-process CPU/address-space ceilings; aggregate CPU, memory, and descendant trees are not comprehensively metered. | Apply OS service/cgroup limits for hostile workloads. |
 
 ## Token and policy limitations
 
@@ -184,7 +184,7 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 - CLI and kernel share nonempty `SHOAL_TOKEN_STORE`; kernel `--token-store` has highest precedence, then the environment, then `<state-dir>/tokens.json`. Relative overrides can still diverge across startup directories.
 - The default no-`--policy` durable kernel gives tokenless public clients the restricted `agent:mcp` identity; the private embedded-human REPL remains a distinct trusted surface.
 - Leash effect analysis describes understood behavior; arbitrary native programs can do more unless an OS boundary prevents it.
-- Filesystem sandboxing can be active on Linux Landlock/macOS Seatbelt. Network enforcement is absent; spawn hash checking has a pre-exec TOCTOU window.
+- Filesystem sandboxing can be active on Linux Landlock/macOS Seatbelt. Coarse network denial is active on Landlock ABI 4+ and Seatbelt, while hostname/port allowlists remain semantic-only; spawn hash checking has a pre-exec TOCTOU window.
 - `caps_enforced` is a useful but coarse bool: inspect individual dimensions and nested propagation.
 - `hermetic=true` is not full container/build hermeticity.
 
