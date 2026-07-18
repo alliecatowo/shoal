@@ -45,6 +45,7 @@ pub struct FsEntryIdentity {
 
 impl FsEntryIdentity {
     #[must_use]
+    #[allow(clippy::unnecessary_cast)]
     pub fn from_metadata(metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {
@@ -52,7 +53,7 @@ impl FsEntryIdentity {
             Self {
                 device: metadata.dev(),
                 inode: metadata.ino(),
-                file_type: metadata.mode() & libc::S_IFMT,
+                file_type: metadata.mode() & libc::S_IFMT as u32,
             }
         }
         #[cfg(not(unix))]
@@ -67,7 +68,7 @@ impl FsEntryIdentity {
     pub(crate) fn matches_stat(&self, stat: &libc::stat) -> bool {
         self.device == stat.st_dev as u64
             && self.inode == stat.st_ino as u64
-            && self.file_type == (stat.st_mode as u32 & libc::S_IFMT)
+            && self.file_type == (stat.st_mode as u32 & libc::S_IFMT as u32)
     }
 }
 
