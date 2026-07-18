@@ -121,7 +121,8 @@ Plan refs use a full caller/content-bound digest plus a unique object suffix, so
 identical repeated plans cannot overwrite one another. Public tokenless clients are restricted and
 cannot assert local-human presence.
 
-**Remaining design.** Centralize method attachment classes so new handlers cannot regress; the
+**Remaining design.** Method attachment classes are centralized in the dispatcher and checked
+against the routed method inventory, so a new stateful route is unreachable until classified. The
 optional same-UID peer-credential and mandatory-bearer modes are implemented, while configurable
 UID allowlists/separate listener roles remain. Continue to evolve approver routing,
 expiration/reason metadata and cross-principal journal grants without weakening the existing

@@ -6,6 +6,67 @@
 //! a thin router over the method name.
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentClass {
+    /// Establishes or replaces attachment authority.
+    Attach,
+    /// Safe before attachment; an existing bearer is still revalidated.
+    Public,
+    /// Must have a current healthy attachment before handler dispatch.
+    Required,
+    /// Preserve method-not-found independently of attachment state.
+    Unknown,
+}
+
+const ATTACHMENT_REQUIRED_METHODS: &[&str] = &[
+    "session.env",
+    "session.reef",
+    "session.snapshot",
+    "kernel.status",
+    "kernel.shutdown",
+    "auth.token.list",
+    "auth.token.create",
+    "auth.token.revoke",
+    "exec",
+    "value.get",
+    "stream.pull",
+    "stream.close",
+    "task.list",
+    "task.get",
+    "task.await",
+    "task.cancel",
+    "task.suspend",
+    "task.resume",
+    "pty.open",
+    "pty.send",
+    "pty.read",
+    "pty.resize",
+    "pty.close",
+    "pty.list",
+    "plan.get",
+    "plan.list",
+    "plan.apply",
+    "cap.request",
+    "journal.query",
+    "events.read",
+    "events.publish",
+    "events.subscribe",
+    "events.unsubscribe",
+    "blob.get",
+    "explain",
+];
+
+fn attachment_class(method: &str) -> AttachmentClass {
+    match method {
+        "session.attach" => AttachmentClass::Attach,
+        "parse" | "complete" => AttachmentClass::Public,
+        method if ATTACHMENT_REQUIRED_METHODS.contains(&method) => AttachmentClass::Required,
+        #[cfg(test)]
+        "test.panic_evaluator" => AttachmentClass::Required,
+        _ => AttachmentClass::Unknown,
+    }
+}
+
 impl Kernel {
     pub(crate) fn dispatch(
         self: &Arc<Self>,
@@ -20,6 +81,14 @@ impl Kernel {
         let method = request.method;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || -> Result<Json, RpcError> {
+                let attachment_class = attachment_class(&method);
+                if attachment_class == AttachmentClass::Unknown {
+                    return Err(RpcError {
+                        code: METHOD_NOT_FOUND,
+                        message: "method not found".into(),
+                        data: None,
+                    });
+                }
                 // Reattachment is always available as the recovery path. All
                 // other requests, including pure parse/complete calls, must
                 // revalidate the authority of an established attachment.
@@ -30,6 +99,9 @@ impl Kernel {
                     self.events.remove_conn(client);
                     *attached = None;
                     return Err(error);
+                }
+                if attachment_class == AttachmentClass::Required && attached.is_none() {
+                    return Err(not_attached());
                 }
                 // `parse` and `complete` are session-independent, and
                 // `session.attach` must remain available so this connection
@@ -89,11 +161,7 @@ impl Kernel {
                         let _evaluator = attachment.session.lock_evaluator()?;
                         panic!("injected evaluator panic")
                     }
-                    _ => Err(RpcError {
-                        code: METHOD_NOT_FOUND,
-                        message: "method not found".into(),
-                        data: None,
-                    }),
+                    _ => unreachable!("classified RPC method missing from dispatch router"),
                 }
             },
         ));
@@ -161,5 +229,80 @@ impl Kernel {
                 data: Some(json!({"reauthenticate": true})),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(method: &str) -> Request {
+        Request {
+            jsonrpc: JSONRPC.into(),
+            id: json!(1),
+            method: method.into(),
+            params: Json::Null,
+        }
+    }
+
+    #[test]
+    fn every_stateful_route_rejects_before_parameter_decoding() {
+        let kernel = Kernel::new();
+        for &method in ATTACHMENT_REQUIRED_METHODS {
+            let mut attached = None;
+            let response = kernel.dispatch(
+                request(method),
+                1,
+                &mut attached,
+                None,
+                ConnectionTrust::Public,
+            );
+            assert_eq!(
+                response
+                    .error
+                    .unwrap_or_else(|| panic!("{method} succeeded unattached"))
+                    .code,
+                NOT_ATTACHED,
+                "{method} must hit the central attachment boundary before decoding null params"
+            );
+        }
+    }
+
+    #[test]
+    fn route_and_attachment_classification_cannot_drift_silently() {
+        let source = include_str!("dispatch.rs");
+        let router = source
+            .split("match method.as_str()")
+            .nth(1)
+            .expect("dispatch router")
+            .split("_ => unreachable!")
+            .next()
+            .expect("router terminator");
+        let routed = router
+            .lines()
+            .filter(|line| line.contains("=>"))
+            .filter_map(|line| {
+                line.trim_start()
+                    .strip_prefix('"')
+                    .and_then(|line| line.split('"').next())
+            })
+            .collect::<Vec<_>>();
+        for method in &routed {
+            assert_ne!(
+                attachment_class(method),
+                AttachmentClass::Unknown,
+                "routed method {method} has no explicit attachment class"
+            );
+        }
+        for &method in ATTACHMENT_REQUIRED_METHODS {
+            assert!(
+                routed.contains(&method),
+                "classified method {method} is no longer routed"
+            );
+        }
+        assert_eq!(
+            attachment_class("not.a.real.method"),
+            AttachmentClass::Unknown
+        );
     }
 }

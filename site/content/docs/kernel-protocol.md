@@ -45,6 +45,11 @@ Wire rules:
 - subscription notifications have no `id`;
 - multiple requests may share a connection, but clients must demultiplex responses by `id` because event notifications can interleave.
 
+The dispatcher classifies every routed method before entering a handler. Only `session.attach`,
+`parse`, and `complete` are reachable without an attachment; every stateful method returns
+`NOT_ATTACHED` before decoding its parameters. Unknown names remain `METHOD_NOT_FOUND` regardless
+of attachment state.
+
 Request:
 
 ```json

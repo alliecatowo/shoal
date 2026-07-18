@@ -244,6 +244,7 @@ new direct child construction. Future child factories must extend that explicit 
 | Control | Status | Reality |
 |---|---|---|
 | kernel socket transport admission | Implemented, opt-in hardening | socket `0600`; optional mandatory bearer and same-effective-UID peer credential gate |
+| RPC attachment admission | Implemented centralized classification | every routed stateful method rejects before parameter decode; only attach/parse/complete are pre-attachment surfaces |
 | persisted bearer tokens | Implemented live lifecycle | fd-locked fresh validation; attached requests revalidate and fail closed on revoke/expiry/store error |
 | token profile/cap strings | Informational | returned in attach metadata; no Leash/handler authorization consumes them |
 | named-session ownership | Implemented principal-private identity | registry keys are `(principal, visible Session name)`; equal visible names do not share evaluators or quotas |
