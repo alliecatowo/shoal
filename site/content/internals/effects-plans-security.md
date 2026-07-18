@@ -33,7 +33,7 @@ Plans contain concrete effects from a closed enum:
 | `NetConnect`, `NetListen` | outbound host/port or inbound port |
 | `EnvRead`, `EnvWrite` | session/process environment names |
 | `SecretUse` | named secret access |
-| `SessionWrite` | mutation of session state |
+| `SessionWrite` | mutation of bindings, modules, tasks, channels, handlers, or other session state |
 | `JournalRead` | durable history access |
 | `Time` | clock observation |
 | `Opaque` | behavior cannot be bounded by the static derivation |
@@ -74,12 +74,15 @@ vanishing from the plan.
 
 Derivation is intentionally conservative and fail-closed. The AST walk is structurally exhaustive —
 a match over every statement and expression node with **no wildcard arm**, so a new syntax form
-cannot be added without classifying its effects. Concretely the walk covers: `use` (module `FsRead`
-plus `Opaque` for the module body), persistent `env.NAME = …` (`EnvWrite`), command redirects
+cannot be added without classifying its effects. Concretely the walk covers: `use` (`SessionWrite`
+for installed exports, module `FsRead`, plus `Opaque` for the module body), binding/function/alias
+declarations and assignment (`SessionWrite`), persistent `env.NAME = …` (`EnvWrite`), command redirects
 (`>`/`>>` → `FsWrite`, `< file` → `FsRead`), the method sinks `.save`/`.append` and the path reads
 `.read`/`.lines`/…, `.feed` (an **external** spawn of the fed command, matching the runtime's
 `run_argv` path rather than builtin dispatch), the effectful builtins `run`/`open`/`save` and the
-bodies of `spawn`/`parallel`/lambda arguments, and generic external commands (a concrete `ProcSpawn`
+bodies of `spawn`/`parallel`/lambda arguments, task registration from `spawn` and background commands,
+channel publish/subscription and stream sinks, event-handler registration, task lifecycle controls,
+and generic external commands (a concrete `ProcSpawn`
 with a resolved binary hash, consistent with adapter spawns). A call that cannot be statically
 expanded — a session-stored closure, or any unrecognized name — becomes an approval-requiring
 `Opaque` effect; an empty effect set is emitted only for forms that are provably effect-free

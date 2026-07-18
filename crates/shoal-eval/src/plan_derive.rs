@@ -17,6 +17,12 @@ use attribution::{cmd_arg_str_literal, str_literal};
 type Functions = std::collections::HashMap<String, Block>;
 type Aliases = std::collections::HashMap<String, CmdCall>;
 
+fn plan_background_registration(call: &CmdCall, out: &mut Vec<Effect>) {
+    if call.background {
+        push_effect(out, Effect::SessionWrite);
+    }
+}
+
 impl Evaluator {
     /// Derive a conservative, concrete plan without spawning or mutating.
     pub fn plan_program(&mut self, program: &Program) -> VResult<Plan> {
@@ -59,8 +65,10 @@ impl Evaluator {
                 push_effect(out, Effect::Opaque);
                 Ok(())
             }
-            Expr::Block { block, .. } | Expr::Spawn { body: block, .. } => {
-                self.plan_block(block, functions, aliases, out, depth)
+            Expr::Block { block, .. } => self.plan_block(block, functions, aliases, out, depth),
+            Expr::Spawn { body, .. } => {
+                push_effect(out, Effect::SessionWrite);
+                self.plan_block(body, functions, aliases, out, depth)
             }
             Expr::If {
                 cond, then, r#else, ..
@@ -142,7 +150,8 @@ impl Evaluator {
                     "now" | "today" => push_effect(out, Effect::Time),
                     // Higher-order builtins: their closure bodies are already
                     // planned above via the Lambda arm; `assert` is pure.
-                    "parallel" | "retry" | "on" | "assert" => {}
+                    "on" => push_effect(out, Effect::SessionWrite),
+                    "parallel" | "retry" | "assert" => {}
                     other => {
                         if let Some(body) = functions.get(other) {
                             // A function declared in this program: expand it.

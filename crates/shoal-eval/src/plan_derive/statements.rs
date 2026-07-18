@@ -14,7 +14,11 @@ impl Evaluator {
     ) -> VResult<()> {
         match stmt {
             Stmt::Expr { expr, .. } => self.plan_expr(expr, functions, aliases, out, depth),
-            Stmt::Let { init, .. } => self.plan_expr(init, functions, aliases, out, depth),
+            Stmt::Let { init, .. } => {
+                self.plan_expr(init, functions, aliases, out, depth)?;
+                push_effect(out, Effect::SessionWrite);
+                Ok(())
+            }
             Stmt::Assign { target, value, .. } => {
                 self.plan_expr(value, functions, aliases, out, depth)?;
                 if let Expr::Field { recv, name, .. } = target
@@ -28,10 +32,15 @@ impl Evaluator {
                     );
                     Ok(())
                 } else {
-                    self.plan_expr(target, functions, aliases, out, depth)
+                    self.plan_expr(target, functions, aliases, out, depth)?;
+                    push_effect(out, Effect::SessionWrite);
+                    Ok(())
                 }
             }
             Stmt::Use { path, .. } => {
+                // Successful imports install the module's exported bindings
+                // into the live session in addition to evaluating its code.
+                push_effect(out, Effect::SessionWrite);
                 push_effect(
                     out,
                     Effect::FsRead {
@@ -54,11 +63,11 @@ impl Evaluator {
                 self.plan_expr(cond, functions, aliases, out, depth)?;
                 self.plan_block(body, functions, aliases, out, depth)
             }
-            Stmt::Fn { .. }
-            | Stmt::Alias { .. }
-            | Stmt::Return { value: None, .. }
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. } => Ok(()),
+            Stmt::Fn { .. } | Stmt::Alias { .. } => {
+                push_effect(out, Effect::SessionWrite);
+                Ok(())
+            }
+            Stmt::Return { value: None, .. } | Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
         }
     }
 

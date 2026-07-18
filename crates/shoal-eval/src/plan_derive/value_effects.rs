@@ -26,6 +26,17 @@ impl Evaluator {
         args: &Args,
         out: &mut Vec<Effect>,
     ) {
+        // Session-owned event/task mutations. `emit` and `events` are unique
+        // to channel handles; `into` is the stream-to-channel sink; lifecycle
+        // controls are unique to task handles. `take` is shared by ordinary
+        // collections, so only the direct channel-constructor shape is marked.
+        if matches!(
+            name,
+            "emit" | "events" | "into" | "cancel" | "suspend" | "resume"
+        ) || (name == "take" && is_channel_constructor(recv))
+        {
+            push_effect(out, Effect::SessionWrite);
+        }
         if matches!(recv, Expr::Var { name: ns, .. } if ns == "secret")
             && self.exec.shell.env.get("secret").is_none()
             && name == "get"
@@ -100,4 +111,8 @@ impl Evaluator {
         }
         true
     }
+}
+
+fn is_channel_constructor(expr: &Expr) -> bool {
+    matches!(expr, Expr::FnCall { name, .. } if name == "channel")
 }

@@ -20,11 +20,13 @@ impl Evaluator {
             ));
         }
         if let Some(target) = aliases.get(&call.head) {
+            plan_background_registration(call, out);
             self.plan_command_inputs(call, functions, aliases, out, depth)?;
             self.plan_redirects(call, out);
             return self.plan_call(target, functions, aliases, out, depth + 1);
         }
         if let Some(body) = functions.get(&call.head) {
+            plan_background_registration(call, out);
             self.plan_command_inputs(call, functions, aliases, out, depth)?;
             self.plan_redirects(call, out);
             return self.plan_block(body, functions, aliases, out, depth + 1);
@@ -45,8 +47,7 @@ impl Evaluator {
             _ => {}
         }
 
-        // Runtime resolves builtin help before every effectful surface. Keep
-        // plans in lockstep: even a normally destructive builtin with extra
+        // Runtime resolves builtin help before effects: even a destructive builtin with extra
         // operands, a redirect, or `&` has no effects when help was requested.
         if matches!(
             resolution.source,
@@ -56,13 +57,23 @@ impl Evaluator {
             return Ok(());
         }
 
+        plan_background_registration(call, out);
         self.plan_command_inputs(call, functions, aliases, out, depth)?;
         self.plan_redirects(call, out);
+        self.plan_resolved_call(call, resolution.source, out)
+    }
 
-        if self.plan_intercepted_head(call, resolution.source, out) {
+    /// Heads intercepted before ordinary builtin/adapter dispatch continue here.
+    fn plan_resolved_call(
+        &mut self,
+        call: &CmdCall,
+        source: CommandSource,
+        out: &mut Vec<Effect>,
+    ) -> VResult<()> {
+        if self.plan_intercepted_head(call, source, out) {
             return Ok(());
         }
-        if resolution.source == CommandSource::Script {
+        if source == CommandSource::Script {
             push_effect(
                 out,
                 Effect::FsRead {
@@ -72,20 +83,20 @@ impl Evaluator {
             push_effect(out, Effect::Opaque);
             return Ok(());
         }
-        if resolution.source == CommandSource::StructuredBuiltin {
+        if source == CommandSource::StructuredBuiltin {
             for effect in self.builtin_effects(call)? {
                 push_effect(out, effect);
             }
             return Ok(());
         }
-        if resolution.source == CommandSource::SpecialBuiltin {
+        if source == CommandSource::SpecialBuiltin {
             self.plan_special_builtin(&call.head, out);
             return Ok(());
         }
-        self.plan_extension_or_external(call, resolution.source, out)
+        self.plan_extension_or_external(call, source, out)
     }
 
-    /// Heads intercepted before ordinary builtin/adapter dispatch.
+    /// Classify heads whose runtime meaning precedes ordinary dispatch.
     fn plan_intercepted_head(
         &self,
         call: &CmdCall,

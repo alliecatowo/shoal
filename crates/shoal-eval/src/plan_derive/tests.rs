@@ -689,6 +689,7 @@ fn effectful_forms_are_never_silently_empty() {
         "parallel(() => \"x\".save(\"p\"))",
         "http.get(\"https://example.com\")",
         "sh { echo hi }",
+        "let x = [1, 2, 3]",
     ] {
         let effects = effects_at(dir.path(), src);
         assert!(
@@ -696,13 +697,7 @@ fn effectful_forms_are_never_silently_empty() {
             "effectful form `{src}` derived no effects"
         );
     }
-    for src in [
-        "1 + 2",
-        "let x = [1, 2, 3]",
-        "\"a\".upper()",
-        "{a: 1, b: 2}",
-        "path(\"f\")",
-    ] {
+    for src in ["1 + 2", "\"a\".upper()", "{a: 1, b: 2}", "path(\"f\")"] {
         let effects = effects_at(dir.path(), src);
         assert!(
             effects.is_empty(),
@@ -1045,4 +1040,47 @@ fn stream_sources_are_canonical_in_process_constructors_in_runtime_and_plans() {
         .eval_program(&shoal_syntax::parse("every(1h)").unwrap())
         .unwrap();
     assert!(matches!(runtime, Value::Stream(_)));
+}
+
+#[test]
+fn session_mutations_are_never_planned_as_pure() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        ("binding declaration", "let x = 1"),
+        ("mutable binding assignment", "var x = 1\nx = 2"),
+        ("function declaration", "fn f() { 1 }"),
+        ("channel publish", "channel(\"audit\").emit(1)"),
+        ("channel subscription", "channel(\"audit\").events()"),
+        (
+            "channel blocking take",
+            "channel(\"audit\").take(timeout: 1ms)",
+        ),
+        (
+            "stream channel sink",
+            "[1, 2].stream().into(channel(\"audit\"))",
+        ),
+        (
+            "event handler registration",
+            "on(channel(\"audit\"), event => null)",
+        ),
+        ("spawn registration", "spawn { 1 }"),
+        ("background registration", "^sleep 1ms &"),
+        ("task cancellation", "task_value.cancel()"),
+        ("task suspension", "task_value.suspend()"),
+        ("task resumption", "task_value.resume()"),
+    ];
+
+    for (label, source) in cases {
+        let effects = effects_at(dir.path(), source);
+        assert!(
+            effects.contains(&Effect::SessionWrite),
+            "{label} was planned as pure: {effects:?}"
+        );
+    }
+
+    let ordinary_take = effects_at(dir.path(), "[1, 2, 3].take(1)");
+    assert!(
+        !ordinary_take.contains(&Effect::SessionWrite),
+        "ordinary collection take was confused with channel subscription"
+    );
 }
