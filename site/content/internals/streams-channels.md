@@ -302,6 +302,10 @@ re-auditing if time budgets become strict RPC cancellation contracts.
 | `.feed(command)` | pumps serialized items into bounded child stdin | command outcome |
 | other collection method | collect bounded stream, redispatch on list | method-dependent |
 
+`stream/cas.rs` owns the finite source for lazy CAS-backed bytes. It opens the loader only on first
+pull, decodes incrementally on newline boundaries, strips a preceding CR, and caps one logical line
+at 1 MiB so an unframed blob cannot recreate a full-content allocation inside one stream item.
+
 Despite two names, stream `.save` and `.append` both open with create+append. They open once through
 the `Fs` port (`CallCtx::fs().open_append`, HR-C2) — a fake can observe or deny the write — rather
 than `std::fs::OpenOptions` directly; the write still bypasses the journal undo model, and consults

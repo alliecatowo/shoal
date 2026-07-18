@@ -171,9 +171,11 @@ The standard implementation lives in `shoal-eval` so the value leaf does not dep
 
 ### `BytesLoad`
 
-Lazy CAS-backed bytes retain a small preview, true length/hash, and a thread-safe loader. Operations
-that require full content call `BytesLoad::load`; length/render can stay cheap. The concrete journal
-CAS adapter lives above `shoal-value` to preserve the leaf boundary.
+Lazy CAS-backed bytes retain a small preview, true length/hash, and a thread-safe loader. Explicit
+resident operations call `BytesLoad::load`; line streaming and filesystem sinks call
+`BytesLoad::open` and remain bounded-memory. Other resident method fallback preflights a 16 MiB
+wall. Length/render stay metadata-only. The concrete journal CAS adapter lives above `shoal-value`
+to preserve the leaf boundary.
 
 ### `ConfigPort`
 

@@ -7,8 +7,14 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let normalized = shoal_value::value_to_json(&shoal_value::json_to_value(&json));
-    let renormalized = shoal_value::value_to_json(&shoal_value::json_to_value(&normalized));
+    let Ok(normalized) = shoal_value::value_to_json(&shoal_value::json_to_value(&json)) else {
+        return;
+    };
+    let Ok(renormalized) =
+        shoal_value::value_to_json(&shoal_value::json_to_value(&normalized))
+    else {
+        return;
+    };
     assert_eq!(renormalized, normalized);
     let _ = serde_json::to_vec(&normalized).unwrap();
 

@@ -15,6 +15,7 @@
 //! The lazy combinator stages themselves (`Map`/`Filter`/`Scan`/…) live in
 //! [`ops`], split out for size.
 
+mod cas;
 mod ops;
 mod tee;
 

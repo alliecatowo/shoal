@@ -80,6 +80,17 @@ pub trait Fs: Send + Sync {
             "this Fs adapter does not mediate streamed appends (open_append)",
         ))
     }
+    /// Open a file for buffered, incremental replacement, creating it if
+    /// absent and truncating it first. This is the overwrite counterpart to
+    /// [`open_append`](Fs::open_append), used when a lazy blob must be copied
+    /// without first materializing it in memory.
+    fn open_write(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate streamed writes (open_write)",
+        ))
+    }
     /// Create a file if absent, updating its mtime otherwise — the `touch`
     /// builtin's `OpenOptions::new().create(true).append(true).open`.
     fn touch(&self, path: &Path) -> io::Result<()>;
@@ -188,6 +199,15 @@ impl Fs for StdFs {
             fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .open(path)?,
+        ))
+    }
+    fn open_write(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        Ok(Box::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
                 .open(path)?,
         ))
     }
@@ -590,8 +610,9 @@ pub trait SecretPort: Send + Sync {
 /// Loads the full content behind a lazy, CAS-backed [`crate::Value::CasBytes`]
 /// (site/content/internals/language-conformance-contract.md disk-spill). A value produced when a command's captured output
 /// overflowed the RAM cap holds one of these plus a bounded preview; methods
-/// that need the whole bytes (`.str()`, `.save`, indexing, …) call [`load`]
-/// on demand, while `.len` and `render` stay cheap and never load.
+/// that explicitly request resident bytes call [`load`] on demand. Incremental
+/// consumers (`.stream()`, `.save()`, `.append()`, stream feed) call [`open`],
+/// while `.len` and `render` stay cheap and never load.
 ///
 /// The trait lives here so `shoal-value` keeps no dependency on `shoal-journal`;
 /// the concrete adapter (over `shoal_journal::Cas`) lives in `shoal-eval`. It is

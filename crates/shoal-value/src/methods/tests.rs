@@ -787,6 +787,22 @@ mod cas_bytes_chokepoint {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct OpenOnlyLoader {
+        opens: Arc<AtomicUsize>,
+        data: Vec<u8>,
+    }
+
+    impl BytesLoad for OpenOnlyLoader {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            panic!("incremental CAS path called full load")
+        }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(self.data.clone())))
+        }
+    }
+
     fn probe() -> (Value, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
@@ -819,12 +835,61 @@ mod cas_bytes_chokepoint {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Existing behavior preserved: a bare `.json()` METHOD call on a
-    /// CasBytes value still fully materializes (unlike the nested case),
-    /// because it falls through `dispatch`'s `_ =>` arm to a resolved
-    /// `Value::Bytes` before `value_to_json` is ever consulted.
     #[test]
-    fn bare_json_method_still_fully_materializes() {
+    fn oversized_implicit_materialization_is_rejected_without_loading() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let value = Value::CasBytes(Arc::new(CasBytesVal {
+            hash: "declared-large".into(),
+            len: (materialize::EAGER_STRING_MAX_BYTES + 1) as u64,
+            preview: Arc::new(b"preview".to_vec()),
+            truncated: true,
+            loader: Arc::new(test_support::CountingLoader {
+                calls: calls.clone(),
+                data: b"small fake backing".to_vec(),
+            }),
+        }));
+        assert_eq!(
+            call(value.clone(), "json", vec![]).unwrap_err().code,
+            "cas_materialization_limit"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            call(value, "load", vec![]).unwrap(),
+            Value::Bytes(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cas_save_and_append_copy_from_reader_without_full_load() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let value = Value::CasBytes(Arc::new(CasBytesVal {
+            hash: "streaming-save".into(),
+            len: 6,
+            preview: Arc::new(b"abc".to_vec()),
+            truncated: true,
+            loader: Arc::new(OpenOnlyLoader {
+                opens: opens.clone(),
+                data: b"abc123".to_vec(),
+            }),
+        }));
+        let path = std::env::temp_dir().join(format!(
+            "shoal-cas-save-{}-{}",
+            std::process::id(),
+            opens.as_ref() as *const AtomicUsize as usize
+        ));
+        call(value.clone(), "save", vec![Value::Path(path.clone())]).unwrap();
+        call(value, "append", vec![Value::Path(path.clone())]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc123abc123");
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A small bare `.json()` method call preserves full-fidelity behavior
+    /// within the eager wall; the oversized counterpart above proves the same
+    /// fallback is rejected before loading.
+    #[test]
+    fn bare_json_method_materializes_once_within_the_wall() {
         let (v, calls) = probe();
         let out = call(v, "json", vec![]).unwrap();
         assert_eq!(out, Value::Str("\"hello world\"".into()));

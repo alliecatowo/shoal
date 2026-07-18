@@ -216,6 +216,12 @@ concatenation, `join`, Unicode case conversion, and literal/regex replacement st
 `string_materialization_limit`; replacement capture expansion is written directly into the bounded
 destination rather than creating an unchecked intermediate.
 
+Lazy CAS-backed bytes keep metadata operations allocation-free. `.stream()` reads logical lines on
+demand with a 1 MiB per-line wall, and `.save()`/`.append()` copy through reader/writer ports.
+Implicit resident methods refuse a declared blob above 16 MiB with `cas_materialization_limit`;
+`.load()`/`.bytes()` are the explicit full-allocation escape hatch. Oversized stream lines raise
+`stream_line_limit`.
+
 Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,
 `binding_value_limit`, or `binding_aggregate_limit`. Runtime handles such as closures, tasks, and
 streams receive a conservative fixed charge here and remain subject to their own subsystem quotas;

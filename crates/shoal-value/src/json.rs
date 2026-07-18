@@ -68,16 +68,13 @@ pub fn value_to_json(v: &Value) -> VResult<serde_json::Value> {
         Value::DateTime(z) => json!(z.to_string()),
         Value::Time(t) => json!(render::render_time(t)),
         Value::Bytes(b) => json!(String::from_utf8_lossy(b)),
-        // A CAS-backed bytes value reached here is, by construction, either a
-        // bare top-level `resolve()`-first call (`json.stringify`/
-        // `yaml.stringify`/`toml.stringify` handed the value directly) or
-        // NESTED inside a record/table/list field. Either way this is the
-        // single, deliberate, bounded answer (see
+        // A CAS-backed bytes value reached here may be bare or nested inside a
+        // record/table/list field. This is the single, deliberate, bounded
+        // answer for direct encoders (see
         // `CasBytesVal::json_preview`'s doc comment): metadata + the resident
-        // preview, never a CAS load. A bare `.json()` METHOD call never
-        // reaches this arm at all — `methods::dispatch`'s CasBytes fallback
-        // fully materializes and converts to `Value::Bytes` first, so that
-        // call site's full-fidelity behavior is unchanged.
+        // preview, never a CAS load. A bare `.json()` METHOD call resolves
+        // through method dispatch only when the declared blob length fits its
+        // eager wall; larger blobs fail before opening.
         Value::CasBytes(c) => c.json_preview(),
         Value::List(xs) => {
             serde_json::Value::Array(xs.iter().map(value_to_json).collect::<VResult<Vec<_>>>()?)

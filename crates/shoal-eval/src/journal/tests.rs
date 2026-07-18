@@ -987,9 +987,20 @@ fn value_capture_over_cap_spills_to_cas_ref_backed() {
         block.len()
     );
 
+    let expected = vec![0u8; 200_000];
+
+    // Incremental language surfaces use the CAS reader instead of first
+    // resolving the full blob. This unframed-but-sub-line-limit capture yields
+    // one logical line, and `.save` copies the exact bytes to the Fs sink.
+    let streamed = run_journaled(&mut ev, "x.stdout.stream().collect()").unwrap();
+    assert!(matches!(streamed, Value::List(lines) if
+        matches!(lines.as_slice(), [Value::Str(line)] if line.as_bytes() == expected)));
+    let saved_path = dir.path().join("spilled-output.bin");
+    run_journaled(&mut ev, "x.stdout.save(path(\"spilled-output.bin\"))").unwrap();
+    assert_eq!(std::fs::read(saved_path).unwrap(), expected);
+
     // The CAS blob exists and its blake3 matches (Cas::read re-hashes and
     // verifies the content against `hash` before returning it).
-    let expected = vec![0u8; 200_000];
     let cas = ev.session.journal.as_ref().unwrap().cas();
     assert_eq!(
         cas.read(&hash).unwrap(),

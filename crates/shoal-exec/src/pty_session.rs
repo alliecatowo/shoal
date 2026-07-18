@@ -804,12 +804,15 @@ mod tests {
     /// re-read with no new output is not.
     #[test]
     fn changed_bit_tracks_new_output() {
-        let mut session = PtySession::open(spec(&["cat"], 80, 24)).expect("open cat");
-        session.send(b"abc\r").expect("send");
+        // Keep the child alive but emit exactly once. Using an interactive
+        // `cat` here races the terminal driver's input echo against `cat`'s
+        // own output, so a second phase may legitimately arrive after the
+        // first snapshot on loaded/macOS runners.
+        let mut session = PtySession::open(spec(&["sh", "-c", "printf abc; sleep 5"], 80, 24))
+            .expect("open one-shot output");
         let first = read_until(&mut session, "abc", Duration::from_secs(5));
         assert!(first.changed, "first sighting of new output is a change");
-        // No new input; the next read sees an unchanged screen.
-        thread::sleep(Duration::from_millis(80));
+        // The child emits nothing else; the next read sees the same grid.
         let second = session.read_screen().expect("read rendered screen");
         assert!(!second.changed, "no new output ⇒ not changed");
         session.close();

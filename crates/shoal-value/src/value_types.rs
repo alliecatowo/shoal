@@ -13,8 +13,9 @@ use crate::ports::BytesLoad;
 /// bounded [`preview`](CasBytesVal::preview) is resident, and the full content
 /// is loaded from the CAS on demand via [`loader`](CasBytesVal::loader).
 ///
-/// `.len` and `render` answer from the metadata alone (never loading); methods
-/// that need the whole bytes materialize them through [`CasBytesVal::resolve`].
+/// `.len` and `render` answer from metadata alone (never loading). Line streams
+/// and filesystem sinks use [`CasBytesVal::open`]; explicit `.load()`/`.bytes()`
+/// and size-admitted resident methods use [`CasBytesVal::resolve`].
 /// A small (sub-cap) capture is a plain [`Value::Bytes`] and never becomes one
 /// of these — there is zero change to the common, fully-resident path.
 ///
@@ -35,13 +36,13 @@ use crate::ports::BytesLoad;
 ///   unconditionally there — a value the caller never asked to see in full
 ///   could silently pull up to the full spill cap (~1 GiB) into memory just
 ///   because it happened to be a field of something being serialized. That
-///   was the main risk this audit flagged; `json_preview` fixes it by
+///   was the first risk this audit flagged; `json_preview` fixes it by
 ///   answering from the resident preview + metadata only, exactly like
-///   `render()` does, never touching the CAS. A bare top-level `.json()` on
-///   the bytes themselves is unaffected: `methods::dispatch`'s CasBytes
-///   fallback already fully materializes (and converts to `Value::Bytes`)
-///   *before* `value_to_json` is ever reached, so that call site keeps its
-///   existing, deliberate full-load behavior.
+///   `render()` does, never touching the CAS. A later audit pass also bounded
+///   bare method fallback: top-level `.json()` and other resident operations
+///   resolve only blobs within the eager byte wall. `.stream()` and filesystem
+///   sinks read incrementally, while `.load()`/`.bytes()` remain the explicit
+///   full-load escape hatch.
 ///
 /// Everywhere else this type's awareness turned out to already be correct and
 /// singular, not scattered: `ops.rs`'s arithmetic/comparison/`contains` tables
@@ -110,23 +111,26 @@ impl CasBytesVal {
     /// The metadata-only answer for a method name, when one exists — never
     /// loads from the CAS. The single chokepoint for the cheap-answer table
     /// (`len`/`count`/`is_empty`/`ref`); `None` means the caller needs the
-    /// actual bytes (`methods::dispatch` then either loads explicitly for
-    /// `load`/`bytes`, or fully materializes and re-dispatches as a plain
-    /// `Value::Bytes` for anything else).
-    pub fn cheap_method(&self, name: &str) -> Option<Value> {
-        match name {
-            "len" | "count" => Some(Value::Int(self.len as i64)),
+    /// actual bytes or an incremental reader.
+    pub fn cheap_method(&self, name: &str) -> VResult<Option<Value>> {
+        Ok(match name {
+            "len" | "count" => Some(Value::Int(i64::try_from(self.len).map_err(|_| {
+                ErrorVal::new(
+                    "collection_length_overflow",
+                    "CAS-backed byte length exceeds the language integer limit",
+                )
+            })?)),
             "is_empty" => Some(Value::Bool(self.len == 0)),
             "ref" => Some(Value::Str(self.reference())),
             _ => None,
-        }
+        })
     }
 
     /// The bounded, lazy JSON representation used when this value is
     /// encountered NESTED inside a larger value being JSON-encoded (see the
     /// struct doc's "Central CAS-bytes chokepoint" section for why this exists and why it's safe
-    /// relative to the bare top-level `.json()` method, which fully
-    /// materializes through a different, deliberate call site). Never loads
+    /// relative to a bare top-level `.json()` method, which may materialize
+    /// only within the eager byte wall). Never loads
     /// from the CAS: just the recoverable ref, the true length, the
     /// truncation flag, and the already-resident preview — the same
     /// information `render()` shows, shaped as JSON instead of a display
@@ -536,15 +540,18 @@ mod tests {
     fn cheap_method_never_loads() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
-        assert_eq!(c.cheap_method("len"), Some(Value::Int(11)));
-        assert_eq!(c.cheap_method("count"), Some(Value::Int(11)));
-        assert_eq!(c.cheap_method("is_empty"), Some(Value::Bool(false)));
+        assert_eq!(c.cheap_method("len").unwrap(), Some(Value::Int(11)));
+        assert_eq!(c.cheap_method("count").unwrap(), Some(Value::Int(11)));
         assert_eq!(
-            c.cheap_method("ref"),
+            c.cheap_method("is_empty").unwrap(),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            c.cheap_method("ref").unwrap(),
             Some(Value::Str("val:blake3:deadbeefcafef00d".into()))
         );
         // A name outside the cheap table defers to the caller.
-        assert_eq!(c.cheap_method("upper"), None);
+        assert_eq!(c.cheap_method("upper").unwrap(), None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -556,7 +563,19 @@ mod tests {
     fn empty_cas_bytes_is_empty() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = test_support::cas_bytes(b"", b"", calls.clone());
-        assert_eq!(c.cheap_method("is_empty"), Some(Value::Bool(true)));
+        assert_eq!(c.cheap_method("is_empty").unwrap(), Some(Value::Bool(true)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cas_length_does_not_wrap_outside_the_language_integer_domain() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut c = test_support::cas_bytes(b"", b"", calls.clone());
+        c.len = u64::MAX;
+        assert_eq!(
+            c.cheap_method("len").unwrap_err().code,
+            "collection_length_overflow"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -579,9 +598,9 @@ mod tests {
         );
     }
 
-    /// `resolve()` — the deliberate full-materialize chokepoint used by the
-    /// bare top-level `.json()`/`.load`/`.bytes`/`.feed` call sites — loads
-    /// exactly once and returns the true full content, not just the preview.
+    /// `resolve()` — the deliberate full-materialize chokepoint used by
+    /// `.load()`/`.bytes()` and size-admitted resident methods — loads exactly
+    /// once and returns the true full content, not just the preview.
     #[test]
     fn resolve_loads_full_content_once() {
         let calls = Arc::new(AtomicUsize::new(0));

@@ -81,7 +81,7 @@ If the callback errors, the method errors. The receiver is cloned for the callba
 value.json() -> str
 ```
 
-Returns compact JSON from Shoal's generic value encoder. This is a representation helper, not a stable protocol schema for tasks, streams, errors, or outcomes. Secrets remain redacted. A content-addressed bytes value used as the top-level receiver is fully loaded; the same value nested inside another record/table becomes a bounded preview/ref object.
+Returns compact JSON from Shoal's generic value encoder. This is a representation helper, not a stable protocol schema for tasks, streams, errors, or outcomes. Secrets remain redacted. A content-addressed bytes value used as the top-level receiver is loaded only within the 16 MiB eager wall; a larger one raises `cas_materialization_limit`. The same value nested inside another record/table becomes a bounded preview/ref object without loading.
 
 ### `save` and `append`
 
@@ -501,8 +501,14 @@ Large command capture may spill into the journal CAS and retain only a resident 
 | `len`, `count` | true total length from metadata, no load |
 | `is_empty` | metadata-only |
 | `ref` | `val:blake3:HASH`, no load |
-| `load`, `bytes` | load and return resident bytes |
-| any other bytes method | load full content, then dispatch |
+| `load`, `bytes` | explicitly load and return resident bytes |
+| `stream` | lazily decode logical lines; one line may be at most 1 MiB |
+| `save`, `append` | copy incrementally through the CAS reader and filesystem port |
+| any other bytes method | load only when declared length is at most 16 MiB, then dispatch |
+
+An implicit resident operation above the wall raises `cas_materialization_limit` before opening the
+blob. An oversized unframed line raises `stream_line_limit`. `.load()` and `.bytes()` remain the
+deliberate escape hatch when the caller truly wants the full allocation.
 
 Writing the short ref as a string value in the same journal-aware evaluator can resolve it for subsequent methods. Unknown/unavailable refs raise `not_found` or `io_error`.
 

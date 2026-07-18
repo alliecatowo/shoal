@@ -61,22 +61,38 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
     // metadata-only answer calls it instead of hand-rolling this match, so it
     // can't silently drift out of sync with `json_preview`'s equivalent
     // metadata-only answer for a NESTED occurrence (`crate::json`).
-    // `.load`/`.bytes` materialize to a resident `bytes`; anything else
-    // materializes the full content once and re-dispatches through the normal
-    // `bytes` path, so no per-method arm has to know about CAS backing. This
-    // is the one call site where a full CAS load of a bare (non-nested)
-    // CasBytes value is deliberate and expected — see `crate::json`'s doc
-    // comment on why the nested case (a CasBytes buried in a record/table
-    // field) does NOT take this path.
+    // `.load`/`.bytes` are explicit full-materialization operations. `.stream`
+    // and filesystem sinks stay incremental; every other fallback preflights
+    // the blob length before loading and redispatching.
     if let Value::CasBytes(c) = &recv {
-        if let Some(v) = c.cheap_method(name) {
+        if let Some(v) = c.cheap_method(name)? {
             return Ok(v);
         }
         match name {
             "load" | "bytes" => {
                 return c.resolve().map(|b| Value::Bytes(std::sync::Arc::new(b)));
             }
+            "stream" => {
+                no_args(&args)?;
+                return Ok(Value::Stream(StreamVal::from_cas_lines(c.clone())));
+            }
+            "save" | "append" => {
+                return path::save_cas(ctx, c.clone(), arg(&args, 0)?, name == "append");
+            }
             _ => {
+                if c.len > materialize::EAGER_STRING_MAX_BYTES as u64 {
+                    return Err(ErrorVal::new(
+                        "cas_materialization_limit",
+                        format!(
+                            "method .{name} would materialize {} bytes (limit {})",
+                            c.len,
+                            materialize::EAGER_STRING_MAX_BYTES
+                        ),
+                    )
+                    .with_hint(
+                        "use `.stream()`/`.save(path)` for incremental access or `.load()` for an explicit full load",
+                    ));
+                }
                 let full = c.resolve()?;
                 return dispatch(ctx, Value::Bytes(std::sync::Arc::new(full)), name, args);
             }
