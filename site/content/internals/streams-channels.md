@@ -137,9 +137,9 @@ handlers. One evaluator admits at most 64 live subscriber queues.
 
 | Source | Producer | Buffer | Overflow contract | Item shape |
 |---|---|---:|---|---|
-| `every(duration)` | one sleeping thread | `sync_channel(1)` | drop tick silently | `DateTime` |
-| `watch(path/glob)` | `notify` watcher thread | `sync_channel(64)` | count loss and owe one gap summary | event or gap record |
-| `tail(path)` | `notify` + `Fs` reads | `sync_channel(64)` | count and report dropped lines | string or gap record |
+| `every(duration)` | one timer thread | `sync_channel(1)` | drop tick silently | `DateTime` |
+| `watch(path/glob)` | injected watch port + worker | raw 256 + consumer 64 | count loss at either bound and owe one gap summary | event or gap record |
+| `tail(path)` | injected watch port + `Fs` reads | raw 256 + consumer 64 | raw loss triggers a catch-up read; consumer loss is counted | string or gap record |
 | `channel(name).events()` | session EventBus | 256 deliveries and 256 KiB per subscriber | discard oldest queued deliveries, insert exact gap before newest | event or gap record |
 | finite value `.stream()` | caller pull | no producer buffer | exact | element |
 
@@ -153,15 +153,16 @@ ring.
 
 ## Timer state machine
 
-`every` rejects a zero interval, starts one thread, sleeps the interval, and tries to place the
-current zoned datetime into a one-slot channel.
+`every` rejects a zero interval, starts one thread, waits until the interval deadline while polling
+for teardown, and tries to place the current zoned datetime into a one-slot channel.
 
 
 The buffered tick is the earliest undelivered one, not a replacement with the latest missed tick.
 Ticks carry timestamps, so a slow consumer can observe one stale tick before current ones resume.
 
-The source uses `thread::sleep` and `Zoned::now` directly, not evaluator `Clock` or cancellation.
-Dropping the stream stops it only after the current sleep ends and the next send observes disconnect.
+The source uses short `park_timeout` waits and `Zoned::now` directly rather than evaluator `Clock`.
+It checks its stop flag at most every 25 ms, so dropping an idle long-interval stream releases the
+worker promptly instead of waiting for the interval.
 
 ## Watch source
 
@@ -175,8 +176,10 @@ Only create, modify, and remove `notify` event families are projected. Each item
 { path: Path, kind: "created" | "modified" | "removed", ts: DateTime }
 ```
 
-The root existence check and notify watcher use direct path/OS APIs; event production itself is not
-fully virtualized by the evaluator's `Fs` port.
+The root existence check uses injected `Fs`; registration uses injected `WatchPort`. The default
+port alone calls `notify`, truncates one raw event to 256 paths, and uses a 256-slot callback queue.
+Raw loss is saturating-counted and reported after older queued events, then projected into the same
+explicit watch-overflow summary as consumer-buffer loss.
 
 
 An overflow summary retains the rescan-compatible watch fields and adds the common gap fields:

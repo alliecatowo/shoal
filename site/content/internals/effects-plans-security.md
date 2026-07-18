@@ -148,18 +148,17 @@ permissions or durable ids.
 
 ## Ports
 
-The evaluator holds ports for filesystem, execution, clock, opener, secrets, configuration, and
-CAS-byte loading. Default ports perform real host actions; tests can inject deterministic fakes.
-This is an improving-but-incomplete seam. Every **write** effect the language exposes now crosses
-the `Fs` port (the ledger below is the proof); the residue is a set of read-only `Path::exists`,
-`is_dir`, `is_file`, and `canonicalize` *observations* and OS watcher setup that still call the
-filesystem directly. See the filesystem-boundary ledger in the evaluator-state chapter.
+The evaluator holds ports for filesystem I/O, filesystem event registration, execution, clock,
+opener, secrets, configuration, and CAS-byte loading. Default ports perform real host actions;
+tests can inject deterministic fakes. Language-visible filesystem reads, probes, navigation, and
+writes cross `Fs`; watch and tail registration cross `WatchPort`. The standard adapters are the
+explicit ambient-authority boundary, as inventoried below.
 
 ### In-process filesystem-effect ledger (HR-C3, 2026-07-16)
 
-Inventory of every `std::fs`/`OpenOptions` use in `shoal-value` and in `shoal-eval`'s value/method
-paths. Each site is either **routed** through the `Fs` port or an **exempt** read-only observation
-with a stated reason. Kept exact; a new effectful filesystem call adds a row.
+Inventory of language-visible filesystem operations in `shoal-value` and `shoal-eval`. Ordinary
+filesystem I/O/probes cross `Fs`; event registration crosses the narrower `WatchPort`. Standard
+adapters are the explicit ambient boundary. A new operation adds a routed row and a denial test.
 
 **Routed write/read effects** — mediated by the `Fs` port, so a fake can observe or deny them and a
 sandbox can enforce them:
@@ -175,21 +174,9 @@ sandbox can enforce them:
 | `shoal-eval` `frecency.rs` dir-jump store load/save | read / write / rename | `self.fs.*` |
 | `shoal-eval` `journal.rs` undo snapshot + restore | read | `self.fs.read` |
 | `shoal-eval` `reef_builtins.rs` manifest read | stat / read | `self.fs.is_file` / `.read_to_string` |
-
-**Exempt read-only observations** — non-mutating existence/type/canonicalization probes that still
-call `Path::*` directly. They neither write, delete, nor spawn, so they are not the "in-process
-write that escapes plan/approval/sandbox" the C-findings target; several already read from
-port-fetched `Metadata`. Routing them through an `Fs` stat/exists/canonicalize method is a read-side
-follow-up, not part of lane C's write-effect mandate:
-
-| Site | Call | Why exempt |
-|---|---|---|
-| `builtins.rs` `root.is_dir()` (ls), `dest.is_dir()` (cp/mv) | `Path::is_dir` | type probe guarding a *ported* `fs.read_dir`/`fs.copy`/`fs.rename` |
-| `command.rs::cd` `joined.canonicalize()` | `Path::canonicalize` | cwd resolution; `cd` is a session-state change, not an `FsWrite` |
-| `modules.rs` module resolution | `Path::is_file` / `canonicalize` | read-only discovery; the module read/exec is planned as `FsRead` (HR-A1) |
-| `script.rs` `resolved.exists()` | `Path::exists` | dispatch probe before `run_script_file` (itself a read) |
-| `streams.rs` watch/tail `root.exists()` / `path.exists()` | `Path::exists` | source-existence guard; the source read uses `self.fs.open_read` |
-| `journal.rs` undo target `is_file`/`exists`/`is_dir` | `Path::*` | read-only guards choosing the undo inverse; the mutation is ported |
+| `shoal-eval` module/script/navigation/plan resolution | stat / canonicalize | `self.host.fs.*` |
+| `shoal-eval` `streams.rs` watch/tail existence and tail reads | stat / seekable reads | `self.host.fs.*` |
+| `shoal-eval` `WatchPort` | watch registration / event delivery | injected `Arc<dyn WatchPort>`; `StdWatchPort` owns `notify` |
 
 The `Fs` port also mediates the `CallCtx::fs()` seam value methods reach through. `CallCtx::fs()` is
 required: an embedding must explicitly return either `StdFs` (real host authority) or an injected
@@ -199,11 +186,11 @@ Production hosts currently leave the evaluator on `StdFs`; this seam is not itse
 in-process sandbox.
 
 Child evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and `on` inherit
-the parent's Leash policy/principal, all ports (including `ConfigPort`), Reef state, event bus, and
-cancellation through the single `ChildContext` constructor (HR-B1–B6); cross-route propagation is
-pinned by `child_context_propagation.rs`. Destructuring makes omission of an already-captured field
-a compile error. Adding a new `Evaluator` field still requires an explicit inheritance audit because
-Rust cannot infer that the separate `ChildContext` must grow with it.
+the parent's Leash policy/principal, all ports (including `ConfigPort` and `WatchPort`), Reef state,
+event bus, and cancellation through the single `ChildContext` constructor (HR-B1–B6); cross-route
+propagation is pinned by `child_context_propagation.rs`. Destructuring makes omission of an
+already-captured field a compile error. Adding a new `Evaluator` field still requires an explicit
+inheritance audit because Rust cannot infer that the separate `ChildContext` must grow with it.
 
 ```mermaid
 flowchart LR

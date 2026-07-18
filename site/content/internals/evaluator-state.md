@@ -86,6 +86,7 @@ later evaluations on the same instance.
 | `oldpwd` | directory left by last navigation | exact `PathBuf` used by `cd -` |
 | `dir_stack` | directories beneath current cwd | backing state for `pushd`, `popd`, and `dirs` |
 | `fs` | filesystem port | `Arc<dyn Fs>`, defaults to `StdFs` |
+| `watch` | filesystem event-registration port | `Arc<dyn WatchPort>`, defaults to bounded `StdWatchPort` |
 | `exec` | process execution port | `Arc<dyn Exec>`, defaults to `StdExec` |
 | `clock` | wall/monotonic time port | `Arc<dyn Clock>`, defaults to `StdClock` |
 | `opener` | desktop opener port | `Arc<dyn Opener>`, defaults to `StdOpener` |
@@ -332,28 +333,13 @@ snapshot is readable in every route (including `spawn`, which formerly dropped t
 parent cancellation reaches the synchronous `parallel`/`.shl` children through the inherited token.
 This closes 2026-07-16 audit finding B (HR-B1–B7).
 
-## Filesystem-port boundary is incomplete
+## Filesystem and watcher port boundaries
 
-Injected `Fs` covers every language-visible **write** and many reads, but production evaluation still
-mixes it with direct host `Path` read-only *observations*. Value/stream method saves are no longer
-here — path `.save`/`.append` and stream `.save` route through `CallCtx::fs()` (HR-C1/HR-C2). What
-remains is existence/type/canonicalization probing:
-
-| Direct host-path site | Bypassed behavior | Kind |
-|---|---|---|
-| `builtins.rs` `Path::is_dir` | `ls` root and `cp`/`mv` destination branching | read-only probe |
-| `command.rs::cd_target` | directory checks/canonicalization | read-only probe |
-| `frecency.rs` | candidate existence/canonicalization | read-only probe |
-| `modules.rs` | module candidate `is_file` and canonicalization | read-only probe |
-| `script.rs` | script `exists` checks | read-only probe |
-| `streams.rs` | watch/tail existence checks and watch rooting | read-only probe |
-
-These are non-mutating: a fake or policy-aware `Fs` may provide file bytes while direct host metadata
-disagrees about existence, but no *write* escapes the port any longer. Port tests prove the covered
-calls; the full inventory (routed vs. exempt) lives in the HR-C3 ledger in
-[`effects-plans-security.md`](@/internals/effects-plans-security.md). Centralizing path metadata,
-canonicalization, and watcher setup behind capabilities is the remaining read-side step toward a
-fully hexagonal filesystem boundary.
+Filesystem reads, metadata/type/existence probes, canonicalization, directory operations, and
+mutations use the injected `Fs`. Watch/tail registration uses the separately injected `WatchPort`;
+its standard adapter alone owns `notify` and a bounded raw-event queue. Denial and structural tests
+pin both routes. The full inventory lives in the HR-C3 ledger in
+[`effects-plans-security.md`](@/internals/effects-plans-security.md).
 
 ## Cancellation and error spans
 

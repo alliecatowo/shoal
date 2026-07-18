@@ -109,6 +109,7 @@ impl Drop for NativeWorkerLease {
 #[derive(Clone)]
 pub(crate) struct HostServices {
     pub(crate) fs: Arc<dyn Fs>,
+    pub(crate) watch: Arc<dyn WatchPort>,
     pub(crate) exec: Arc<dyn Exec>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) opener: Arc<dyn Opener>,
@@ -126,6 +127,7 @@ impl Default for HostServices {
     fn default() -> Self {
         Self {
             fs: Arc::new(StdFs),
+            watch: Arc::new(StdWatchPort),
             exec: Arc::new(StdExec),
             clock: Arc::new(StdClock),
             opener: Arc::new(StdOpener),

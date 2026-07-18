@@ -426,14 +426,15 @@ arguments, closures/module functions, and return values. Parameters perform the 
 coercions and then validate tags recursively; returns check exactly. The conformance matrix covers
 both surfaces, nested containers, invalid schemas, optionals, and failures with annotation spans.
 
-### P2.5 Complete effectful capability ports
+### P2.5 Complete effectful capability ports — implemented core
 
-Inventory direct `std::fs`, path metadata/canonicalization/existence, `OpenOptions`, and watcher calls
-inside evaluator/value effect paths. Extend `Fs` or introduce narrower traits for metadata, atomic
-write/append, and watch. Keep pure parsing/rendering code free of host traits.
+Language-visible reads, path metadata/canonicalization/existence, directory operations, and writes
+now cross `Fs`; watcher registration crosses `WatchPort`. The default watcher bounds its raw callback
+queue and reports loss explicitly. Structural and denial tests prohibit reacquiring ambient watcher
+authority in stream semantics.
 
-**Exit.** A denied or fake filesystem capability observes `.save`, `.append`, watch, canonicalization,
-and all builtins. A repository lint/check prevents new ambient filesystem calls in restricted modules.
+**Exit met.** Denied/fake capabilities observe `.save`, `.append`, watch/tail registration,
+canonicalization, and builtins. The source audit guards restricted production modules.
 
 ### P2.6 Resolution and registry consolidation — implemented core
 

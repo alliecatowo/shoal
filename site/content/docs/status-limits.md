@@ -255,7 +255,7 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 - Hermetic mode removes ambient PATH tail; it does not sandbox filesystem/network/environment/syscalls.
 - Provider availability and install commands depend on host managers; offline/missing providers remain honest resolution errors.
 - Hash pins protect selected content identity at resolution, but runtime spawn pinning remains preflight/TOCTOU-prone.
-- Child evaluators inherit policy, principal, Reef/config inputs, filesystem port, and cancellation
+- Child evaluators inherit policy, principal, Reef/config inputs, filesystem/watch ports, and cancellation
   through the audited child-context constructor; divergence is a security regression.
 - Windows provider/path semantics are deferred.
 

@@ -119,7 +119,7 @@ The audit's overwriting 16-hex identity is fixed: stored plans now use a full di
 ### Evolve the unified child execution context
 
 All production child-evaluator routes now build through one explicit context carrying identity,
-policy, Reef, filesystem port, echo behavior, and cancellation, with an inventory test preventing
+policy, Reef, filesystem/watch ports, echo behavior, and cancellation, with an inventory test preventing
 direct construction. Remaining evolution should add/clarify:
 
 - explicit deadline/task lineage across every nested worker;

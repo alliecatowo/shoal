@@ -18,12 +18,10 @@
 //!
 //! These sources are timing/IO-dependent, so they are unit-tested here and in
 //! `tests/streams.rs` rather than in the host-safe conformance corpus.
-//! `watch`/`tail` use the `notify` crate (inotify on Linux, FSEvents/kqueue on
-//! macOS — cross-platform, mac first-class), never a poll loop in language
-//! space.
+//! The default injected watch port uses `notify` (inotify on Linux,
+//! FSEvents/kqueue on macOS), never a poll loop in language space.
 
-use crate::{ChildKind, Evaluator};
-use notify::{EventKind, RecursiveMode, Watcher};
+use crate::{ChildKind, Evaluator, WatchKind, WatchPoll, WatchSubscription};
 use shoal_exec::CancelToken;
 use shoal_value::{
     ErrorVal, Fs, Pull, Record, StreamGap, StreamGapReason, StreamVal, VResult, Value,
@@ -32,7 +30,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 /// Consumer-facing buffer cap for `watch` and `tail` (site/content/internals/streams-channels.md —
@@ -205,60 +203,55 @@ impl Evaluator {
             ));
         }
         let (tx, rx) = sync_channel::<VResult<Value>>(SOURCE_BUF);
-        let mode = if recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        };
         let lease = acquire_stream_pump()?;
+        let mut subscription = self
+            .host
+            .watch
+            .subscribe(&root, recursive)
+            .map_err(|error| ErrorVal::new("io_error", format!("watch: {error}")))?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         std::thread::Builder::new()
             .name("shoal-stream-watch".into())
             .spawn(move || {
                 let _lease = lease;
-                // notify pushes raw events onto its own channel; we translate + filter
-                // and forward. Keeping `watcher` alive in this scope keeps the OS watch
-                // open; both drop together when the loop ends.
-                let (raw_tx, raw_rx) = channel();
-                let mut watcher = match notify::recommended_watcher(move |res| {
-                    let _ = raw_tx.send(res);
-                }) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        let _ = tx.send(Err(ErrorVal::new("io_error", format!("watch: {e}"))));
-                        return;
-                    }
-                };
-                if let Err(e) = watcher.watch(&root, mode) {
-                    let _ = tx.send(Err(ErrorVal::new("io_error", format!("watch: {e}"))));
-                    return;
-                }
                 // Coalesce state: `true` when at least one event was dropped on a
                 // full buffer and the consumer is owed the documented coalescing summary event.
                 let mut coalesce_owed = 0u64;
                 while !worker_stop.load(Ordering::SeqCst) {
-                    let res = match raw_rx.recv_timeout(PUMP_POLL) {
-                        Ok(result) => result,
-                        Err(RecvTimeoutError::Timeout) => continue,
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    };
-                    let event = match res {
-                        Ok(ev) => ev,
-                        Err(e) => {
+                    let event = match subscription.poll(PUMP_POLL) {
+                        WatchPoll::Event(event) => event,
+                        WatchPoll::Overflow(dropped) => {
+                            coalesce_owed = coalesce_owed.saturating_add(dropped);
+                            if !flush_coalesced(&tx, &mut coalesce_owed, &root) {
+                                break;
+                            }
+                            continue;
+                        }
+                        WatchPoll::Error(error) => {
                             // Errors are rare and must not be lost: a blocking
                             // send here is bounded by the consumer's next pull
                             // (and fails immediately if the consumer is gone).
                             if tx
-                                .send(Err(ErrorVal::new("io_error", format!("watch: {e}"))))
+                                .send(Err(ErrorVal::new("io_error", format!("watch: {error}"))))
                                 .is_err()
                             {
                                 break;
                             }
                             continue;
                         }
+                        WatchPoll::Timeout => {
+                            // A full consumer buffer can defer the gap marker. Retry on
+                            // idle polls so the marker is eventually visible even when no
+                            // later filesystem event arrives to drive another flush.
+                            if !flush_coalesced(&tx, &mut coalesce_owed, &root) {
+                                break;
+                            }
+                            continue;
+                        }
+                        WatchPoll::Closed => break,
                     };
-                    let Some(kind) = event_kind(&event.kind) else {
+                    let Some(kind) = event_kind(event.kind) else {
                         continue;
                     };
                     let mut consumer_gone = false;
@@ -312,13 +305,18 @@ impl Evaluator {
         // filesystem effect; the `Arc` clone rides into the producer thread.
         let fs = self.host.fs.clone();
         let lease = acquire_stream_pump()?;
+        let subscription = self
+            .host
+            .watch
+            .subscribe(&path, false)
+            .map_err(|error| ErrorVal::new("io_error", format!("tail: {error}")))?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         std::thread::Builder::new()
             .name("shoal-stream-tail".into())
             .spawn(move || {
                 let _lease = lease;
-                tail_loop(&fs, &path, from_start, &tx, &worker_stop);
+                tail_loop(&fs, subscription, &path, from_start, &tx, &worker_stop);
             })
             .map_err(|error| {
                 ErrorVal::new("io_error", format!("spawn tail stream worker: {error}"))
@@ -415,14 +413,14 @@ fn send_to_buffer(
     }
 }
 
-/// Map a `notify` event kind onto shoal's closed `kind` enum, dropping
+/// Map a watch-port event kind onto shoal's closed `kind` enum, dropping
 /// access/other events that carry no create/modify/remove meaning.
-fn event_kind(kind: &EventKind) -> Option<&'static str> {
+fn event_kind(kind: WatchKind) -> Option<&'static str> {
     match kind {
-        EventKind::Create(_) => Some("created"),
-        EventKind::Modify(_) => Some("modified"),
-        EventKind::Remove(_) => Some("removed"),
-        _ => None,
+        WatchKind::Created => Some("created"),
+        WatchKind::Modified => Some("modified"),
+        WatchKind::Removed => Some("removed"),
+        WatchKind::Other => None,
     }
 }
 
@@ -460,6 +458,7 @@ fn glob_prefix(pattern: &str) -> PathBuf {
 /// lines as they land. Exits when the consumer drops `tx`.
 fn tail_loop(
     fs: &Arc<dyn Fs>,
+    mut subscription: Box<dyn WatchSubscription>,
     path: &Path,
     from_start: bool,
     tx: &SyncSender<VResult<Value>>,
@@ -481,34 +480,16 @@ fn tail_loop(
     // single `{dropped: n}` marker element once room appears (site/content/internals/streams-channels.md).
     let mut dropped: u64 = 0;
 
-    let (raw_tx, raw_rx) = channel();
-    let mut watcher = match notify::recommended_watcher(move |res| {
-        let _ = raw_tx.send(res);
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            let _ = tx.send(Err(ErrorVal::new("io_error", format!("tail: {e}"))));
-            return;
-        }
-    };
-    if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
-        let _ = tx.send(Err(ErrorVal::new("io_error", format!("tail: {e}"))));
-        return;
-    }
-
     // Read whatever is already available past `pos` (the from_start backlog, or
     // any bytes written between open and the first event).
     if !read_new_lines(fs, path, &mut pos, tx, &mut dropped) {
         return;
     }
     while !stop.load(Ordering::SeqCst) {
-        let res = match raw_rx.recv_timeout(PUMP_POLL) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        match res {
-            Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
+        match subscription.poll(PUMP_POLL) {
+            WatchPoll::Event(event)
+                if matches!(event.kind, WatchKind::Modified | WatchKind::Created) =>
+            {
                 // Truncation/rotation: file shrank → restart from its new EOF.
                 if let Ok(meta) = fs.metadata(path)
                     && meta.len() < pos
@@ -519,10 +500,16 @@ fn tail_loop(
                     break;
                 }
             }
-            Ok(_) => {}
-            Err(e) => {
+            WatchPoll::Overflow(_) => {
+                if !read_new_lines(fs, path, &mut pos, tx, &mut dropped) {
+                    break;
+                }
+            }
+            WatchPoll::Event(_) | WatchPoll::Timeout => {}
+            WatchPoll::Closed => break,
+            WatchPoll::Error(error) => {
                 if tx
-                    .send(Err(ErrorVal::new("io_error", format!("tail: {e}"))))
+                    .send(Err(ErrorVal::new("io_error", format!("tail: {error}"))))
                     .is_err()
                 {
                     break;
@@ -530,7 +517,6 @@ fn tail_loop(
             }
         }
     }
-    drop(watcher);
 }
 
 /// Read complete lines from `path` starting at `*pos`, advancing `*pos` to just
@@ -640,6 +626,20 @@ fn send_coalescing(
     }
 }
 
+fn flush_coalesced(tx: &SyncSender<VResult<Value>>, owed: &mut u64, root: &Path) -> bool {
+    if *owed == 0 {
+        return true;
+    }
+    match tx.try_send(Ok(coalesced_event(root, *owed))) {
+        Ok(()) => {
+            *owed = 0;
+            true
+        }
+        Err(TrySendError::Full(_)) => true,
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
 /// The `coalesced: true` summary event (site/content/internals/streams-channels.md) owed after a `watch` overflow.
 fn coalesced_event(root: &Path, dropped: u64) -> Value {
     let mut r = StreamGap::new(StreamGapReason::WatchOverflow, dropped).into_record();
@@ -653,6 +653,7 @@ fn coalesced_event(root: &Path, dropped: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WatchPort;
     use shoal_value::{CallCtx, Upstream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -663,6 +664,21 @@ mod tests {
 
     struct IdleSource {
         dropped: Arc<AtomicBool>,
+    }
+
+    struct DenyWatch {
+        calls: AtomicUsize,
+    }
+
+    impl WatchPort for DenyWatch {
+        fn subscribe(
+            &self,
+            _path: &Path,
+            _recursive: bool,
+        ) -> Result<Box<dyn WatchSubscription>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("watch capability denied".into())
+        }
     }
 
     impl Upstream for IdleSource {
@@ -803,5 +819,54 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         drop(buffered);
         wait_until(|| dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watch_and_tail_registration_use_the_injected_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.log");
+        std::fs::write(&file, b"").unwrap();
+        let watch = Arc::new(DenyWatch {
+            calls: AtomicUsize::new(0),
+        });
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_watch_port(watch.clone());
+
+        let watch_error = evaluator
+            .source_watch(&Value::Path(dir.path().to_path_buf()), true)
+            .unwrap_err();
+        assert_eq!(watch_error.code, "io_error");
+        assert!(watch_error.msg.contains("watch capability denied"));
+
+        let tail_error = evaluator
+            .source_tail(&Value::Path(file), false)
+            .unwrap_err();
+        assert_eq!(tail_error.code, "io_error");
+        assert!(tail_error.msg.contains("watch capability denied"));
+        assert_eq!(watch.calls.load(Ordering::SeqCst), 2);
+
+        let source = include_str!("streams.rs");
+        assert!(!source.contains(&["notify::", "recommended_watcher"].concat()));
+        assert!(!source.contains(&["watcher", ".watch("].concat()));
+    }
+
+    #[test]
+    fn deferred_watch_gap_survives_a_full_consumer_buffer() {
+        let (tx, rx) = sync_channel(1);
+        tx.try_send(Ok(Value::Int(7))).unwrap();
+        let root = Path::new("/watched");
+        let mut owed = 3;
+
+        assert!(flush_coalesced(&tx, &mut owed, root));
+        assert_eq!(owed, 3, "a full buffer must retain the overflow debt");
+        assert_eq!(rx.recv().unwrap().unwrap(), Value::Int(7));
+
+        assert!(flush_coalesced(&tx, &mut owed, root));
+        assert_eq!(owed, 0);
+        let Value::Record(gap) = rx.recv().unwrap().unwrap() else {
+            panic!("expected a watch gap record");
+        };
+        assert_eq!(gap.get("marker"), Some(&Value::Str("stream_gap".into())));
+        assert_eq!(gap.get("dropped"), Some(&Value::Int(3)));
     }
 }

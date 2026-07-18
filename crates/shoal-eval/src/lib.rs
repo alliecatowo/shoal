@@ -34,11 +34,15 @@ mod source;
 mod stmt;
 mod streams;
 mod wasm;
+mod watch_port;
 
 pub use channels::{EventBus, EventForwarder};
 pub(crate) use child_context::ChildKind;
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
+pub use watch_port::{
+    StdWatchPort, WatchEvent, WatchKind, WatchPoll, WatchPort, WatchSubscription,
+};
 // Job-control surface (site/content/internals/language-conformance-contract.md) the interactive host (the REPL) drives. Re-
 // exported through the evaluator — which the REPL already depends on — so `fg`/
 // `bg` and the shell's signal setup need no new `shoal` -> `shoal-exec` Cargo
@@ -193,6 +197,12 @@ impl Evaluator {
     /// call inherit the adapter.
     pub fn set_fs(&mut self, fs: Arc<dyn Fs>) {
         Arc::make_mut(&mut self.host).fs = fs;
+    }
+
+    /// Install the filesystem-watch registration capability. Child evaluators
+    /// inherit it with the rest of the immutable host-service snapshot.
+    pub fn set_watch_port(&mut self, watch: Arc<dyn WatchPort>) {
+        Arc::make_mut(&mut self.host).watch = watch;
     }
 
     /// Install a custom [`Exec`] adapter (spawn seam). Default: [`StdExec`].

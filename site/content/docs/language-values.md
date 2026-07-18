@@ -240,7 +240,7 @@ p.abs()
 "more".append(p)
 ```
 
-Language-visible file reads, probes, navigation, watchers, and mutations go through the evaluator's host filesystem port, which supports embedding and denial tests. The production host currently installs `StdFs`, so this seam is not itself an in-process sandbox. Mutation participates in journaling/undo only where the host installs those facilities and the operation has a recorded inverse.
+Language-visible file reads, probes, navigation, and mutations go through the evaluator's `Fs`; watcher registration goes through `WatchPort`. Both support embedding and denial tests. Production installs `StdFs` and bounded `StdWatchPort`, so these seams are not themselves an in-process sandbox. Mutation participates in journaling/undo only where the host installs those facilities and the operation has a recorded inverse.
 
 ## Interactive picking
 

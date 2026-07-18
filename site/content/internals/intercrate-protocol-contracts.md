@@ -134,22 +134,21 @@ creation/removal, file removal, rename, copy, hardlink, and symlink. The standar
 to `std::fs`. `open_append`'s trait default fails closed (`ErrorKind::Unsupported`) so an adapter
 that mediates effects must implement it rather than let a streamed append escape.
 
-Every filesystem **write** the language exposes now crosses `Fs`: path/value `.save`/`.append` route
-through `CallCtx::fs().write`/`.append` and stream `.save`/`.append` through `CallCtx::fs().open_append`
-(HR-C1/HR-C2). The `Fs` port does **not** yet cover every read-only filesystem *observation*: direct
-`Path::exists/is_dir/is_file/canonicalize` calls remain around module/frecency discovery, script
-dispatch, stream sources, and cp/ls/cd guards. The in-process filesystem-effect ledger in
-[`effects-plans-security.md`](@/internals/effects-plans-security.md) inventories every site (routed
-vs. exempt). The architectural contract is the desired single boundary; the observation residue means
-it must not yet be described as fully hexagonal.
+Every language-visible filesystem read, probe, navigation, and write crosses `Fs`: path/value
+`.save`/`.append` route through `CallCtx::fs().write`/`.append`, stream sinks use
+`CallCtx::fs().open_append`, and module/script/frecency/builtin/path operations use metadata,
+canonicalization, enumeration, and read methods on the same injected adapter. Filesystem event
+registration crosses the evaluator-owned `WatchPort`; its standard adapter is the only owner of
+`notify`. The in-process ledger in
+[`effects-plans-security.md`](@/internals/effects-plans-security.md) inventories the boundary.
 
 `CallCtx` (the eval↔methods bridge) exposes `fs() -> &dyn Fs` so value methods reach the same port;
 it is compile-required, and a host must explicitly return `StdFs` or its injected port in its
 `CallCtx` impl for value-method writes to consult that port.
 
 Adding an effectful filesystem operation should extend `Fs` and its fakes unless there is a
-documented host-only reason. A repair needs a port-spy test proving the operation crosses the port,
-not merely a successful temp-directory test.
+documented host-only reason; event registration extends `WatchPort`. A repair needs a port-spy test
+proving the operation crosses the port, not merely a successful temp-directory test.
 
 ### `Clock`
 
