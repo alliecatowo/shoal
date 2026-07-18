@@ -437,7 +437,7 @@ impl Evaluator {
         match v {
             Value::List(xs) => Ok(xs),
             Value::Table(rs) => Ok(rs.into_iter().map(Value::Record).collect()),
-            Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
+            Value::Range(r) => r.materialize(),
             // Iterating a glob VALUE expands its matches (site/content/internals/language-conformance-contract.md): `for f in
             // glob("*.rs")` walks the sorted `list<path>`. (Passing a glob as a
             // command argument still expands at the callee — that is unchanged.)

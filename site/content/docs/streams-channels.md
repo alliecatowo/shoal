@@ -126,7 +126,7 @@ let filtered = watch(path("./src")).where(.kind == "modified")
 filtered.take(10).render()
 ```
 
-`flat_map` is sequential, not concurrent: an endless returned substream prevents later outer items from being pulled. `distinct` uses equality-compatible hash buckets, but the exact set of every distinct value seen can still grow without bound. Prefer `dedupe` or a bounded window when long-lived cardinality is unknown.
+`flat_map` is sequential, not concurrent: an endless returned substream prevents later outer items from being pulled. Compact range results are pulled lazily instead of first expanding into a queue. `distinct` uses equality-compatible hash buckets and preserves exact membership up to its caller/default 4,096-identity and 16 MiB walls; reaching either raises `stream_distinct_limit`. Prefer `dedupe` when only adjacent duplicate suppression is required.
 
 ## Sinks
 

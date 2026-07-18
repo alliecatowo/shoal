@@ -53,8 +53,8 @@ pub use stream::{
 };
 pub use task::{TaskShared, TaskVal};
 pub use value_types::{
-    CasBytesVal, ClosureVal, GlobVal, RangeVal, RegexVal, SecretVal, TimeVal, parse_duration,
-    parse_size, parse_time,
+    CasBytesVal, ClosureVal, GlobVal, RANGE_MATERIALIZATION_MAX_VALUES, RangeVal, RegexVal,
+    SecretVal, TimeVal, parse_duration, parse_size, parse_time,
 };
 
 use indexmap::IndexMap;
@@ -204,7 +204,8 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
         }
         // table / record / list-of-records (and any other list) → compact JSON.
         Value::Record(_) | Value::Table(_) | Value::List(_) => {
-            Ok(serde_json::to_vec(&value_to_json(v)).unwrap_or_default())
+            serde_json::to_vec(&value_to_json(v)?)
+                .map_err(|error| ErrorVal::new("custom", error.to_string()))
         }
         // outcome → its structured `.out` re-encoded per the rules above when
         // one exists, else its raw stdout bytes (site/content/internals/values-streams-execution.md:

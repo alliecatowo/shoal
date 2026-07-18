@@ -2,7 +2,7 @@
 //! `stream/mod.rs` for size. Each wraps an inner [`Upstream`] and is
 //! itself an [`Upstream`], so a chain composes by nesting.
 
-use super::{CallCtx, Pull, Upstream, VResult, Value};
+use super::{CallCtx, Pull, StreamVal, Upstream, VResult, Value};
 use crate::{ErrorVal, OpaqueHandling, RetainedLimits, retained_size};
 use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -94,7 +94,15 @@ impl Upstream for FlatMapSequential {
                         Value::Table(rows) => {
                             self.queue.extend(rows.into_iter().map(Value::Record));
                         }
-                        Value::Range(rg) => self.queue.extend(rg.iter().map(Value::Int)),
+                        Value::Range(rg) => {
+                            self.sub = Some(
+                                StreamVal::from_iter(
+                                    "int",
+                                    rg.iter().map(|value| Ok(Value::Int(value))),
+                                )
+                                .take_upstream()?,
+                            );
+                        }
                         other => {
                             return Err(super::ErrorVal::type_error(format!(
                                 "flat_map expects each result to be a stream or list, found {}",

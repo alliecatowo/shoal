@@ -9,7 +9,7 @@ pub(crate) fn seq(v: Value) -> VResult<Vec<Value>> {
     match v {
         Value::List(x) => Ok(x),
         Value::Table(x) => Ok(x.into_iter().map(Value::Record).collect()),
-        Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
+        Value::Range(r) => r.materialize(),
         // Streams are intercepted at the top of `dispatch` and driven with `ctx`;
         // a stream nested inside another collection is materialized by the
         // stream sink path, not here — reaching this arm means a raw stream was
@@ -35,20 +35,30 @@ pub(crate) fn cmp(a: &Value, b: &Value) -> VResult<Ordering> {
 }
 
 pub(crate) fn len(v: Value) -> VResult<Value> {
-    Ok(Value::Int(match v {
+    if let Value::Range(range) = v {
+        return i64::try_from(range.len()).map(Value::Int).map_err(|_| {
+            ErrorVal::new(
+                "range_length_overflow",
+                "range length exceeds the language integer limit",
+            )
+        });
+    }
+    let len = match v {
         Value::Str(s) => s.chars().count(),
         Value::Bytes(b) => b.len(),
         Value::List(x) => x.len(),
         Value::Table(x) => x.len(),
         Value::Record(x) => x.len(),
-        Value::Range(r) => r.len(),
         v => {
             return Err(ErrorVal::type_error(format!(
                 ".len unsupported on {}",
                 v.type_name()
             )));
         }
-    } as i64))
+    };
+    i64::try_from(len)
+        .map(Value::Int)
+        .map_err(|_| ErrorVal::new("collection_length_overflow", "collection is too large"))
 }
 
 /// `.first()`/`.last()` return a single element; `.first(n)`/`.last(n)` return
@@ -76,7 +86,7 @@ pub(crate) fn first_last(v: Value, args: &CallArgs, first: bool) -> VResult<Valu
 
 pub(crate) fn collect(v: Value) -> VResult<Value> {
     match v {
-        Value::Range(r) => Ok(Value::List(r.iter().map(Value::Int).collect())),
+        Value::Range(r) => r.materialize().map(Value::List),
         x @ Value::List(_) | x @ Value::Table(_) => Ok(x),
         v => Err(ErrorVal::type_error(format!(
             "cannot collect {}",
@@ -91,7 +101,12 @@ pub(crate) fn to_stream(v: Value) -> VResult<Value> {
     let items: Vec<Value> = match v {
         Value::List(x) => x,
         Value::Table(x) => x.into_iter().map(Value::Record).collect(),
-        Value::Range(r) => r.iter().map(Value::Int).collect(),
+        Value::Range(r) => {
+            return Ok(Value::Stream(StreamVal::from_iter(
+                "int",
+                r.iter().map(|value| Ok(Value::Int(value))),
+            )));
+        }
         Value::Str(s) => s.lines().map(|l| Value::Str(l.to_string())).collect(),
         Value::Bytes(b) => String::from_utf8_lossy(&b)
             .lines()
@@ -359,25 +374,7 @@ pub(crate) fn get(v: Value, key: &Value, default: Value) -> VResult<Value> {
             .and_then(|i| x.get(i).cloned())
             .map(Value::Record)
             .unwrap_or(default)),
-        (Value::Range(r), Value::Int(i)) => {
-            let last = if r.inclusive {
-                r.end
-            } else {
-                r.end.saturating_sub(1)
-            };
-            let candidate = if *i >= 0 {
-                i128::from(r.start) + i128::from(*i)
-            } else {
-                i128::from(last) + i128::from(*i) + 1
-            };
-            Ok(
-                if candidate >= i128::from(r.start) && candidate <= i128::from(last) {
-                    Value::Int(candidate as i64)
-                } else {
-                    default
-                },
-            )
-        }
+        (Value::Range(r), Value::Int(i)) => Ok(r.value_at(*i).map(Value::Int).unwrap_or(default)),
         _ => Err(ErrorVal::type_error(
             "get expects record+str or list/table/range+int",
         )),

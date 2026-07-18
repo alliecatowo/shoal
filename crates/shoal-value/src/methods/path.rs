@@ -74,7 +74,7 @@ pub(crate) fn save(ctx: &mut dyn CallCtx, v: Value, path: &Value, append: bool) 
     let bytes = match &v {
         Value::Bytes(b) => (**b).clone(),
         Value::Str(s) => s.as_bytes().to_vec(),
-        _ => serde_json::to_vec(&value_to_json(&v))
+        _ => serde_json::to_vec(&value_to_json(&v)?)
             .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
     };
     // Route through the injected `Fs` port instead of `std::fs::OpenOptions`

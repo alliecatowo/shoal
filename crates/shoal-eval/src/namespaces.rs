@@ -87,7 +87,7 @@ fn json_ns(method: &str, args: CallArgs) -> VResult<Value> {
                 .ok_or_else(|| ErrorVal::arg_error("json.stringify expects a value"))?;
             let pretty =
                 named_bool(&args, "pretty") || matches!(args.pos.get(1), Some(Value::Bool(true)));
-            let j = value_to_json(v);
+            let j = value_to_json(v)?;
             let out = if pretty {
                 serde_json::to_string_pretty(&j)
             } else {
@@ -113,7 +113,7 @@ fn yaml_ns(method: &str, args: CallArgs) -> VResult<Value> {
                 .pos
                 .first()
                 .ok_or_else(|| ErrorVal::arg_error("yaml.stringify expects a value"))?;
-            serde_norway::to_string(&value_to_json(v))
+            serde_norway::to_string(&value_to_json(v)?)
                 .map(Value::Str)
                 .map_err(|e| ErrorVal::new("custom", format!("yaml.stringify: {e}")))
         }
@@ -134,7 +134,7 @@ fn toml_ns(method: &str, args: CallArgs) -> VResult<Value> {
                 .pos
                 .first()
                 .ok_or_else(|| ErrorVal::arg_error("toml.stringify expects a value"))?;
-            toml::to_string(&value_to_json(v))
+            toml::to_string(&value_to_json(v)?)
                 .map(Value::Str)
                 .map_err(|e| {
                     ErrorVal::new(

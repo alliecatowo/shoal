@@ -541,7 +541,7 @@ Strict bracket indexing and forgiving `.get()` deliberately remain different ope
 
 ## Range methods
 
-Ranges share eager collection transforms and materialize integers when needed. `1..5` yields 1,2,3,4; `1..=5` includes 5. They support iteration, length, collect, transforms, aggregations, finite stream conversion, and non-materializing `.get(index, default = null)` with negative indexes.
+Ranges are compact. `1..5` yields 1,2,3,4; `1..=5` includes 5. Eager collection transforms, JSON conversion, and `collect` may materialize at most 16,384 integers and otherwise raise `range_materialization_limit`. `.stream()` and range expansions returned from stream `flat_map` iterate lazily, so use `.take(n)` before collecting a much larger range. Length and `.get(index, default = null)` remain non-materializing; an exact length outside Shoal's signed integer domain raises `range_length_overflow`.
 
 ## Glob fields and methods
 

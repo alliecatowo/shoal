@@ -140,7 +140,7 @@ fn value_line_bytes(v: &Value) -> VResult<Vec<u8>> {
     Ok(match v {
         Value::Str(s) => s.as_bytes().to_vec(),
         Value::Bytes(b) => (**b).clone(),
-        _ => serde_json::to_vec(&value_to_json(v))
+        _ => serde_json::to_vec(&value_to_json(v)?)
             .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
     })
 }

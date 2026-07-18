@@ -192,30 +192,92 @@ pub struct RangeVal {
     pub inclusive: bool,
 }
 
-impl RangeVal {
-    pub fn iter(&self) -> impl Iterator<Item = i64> + Send + use<> {
-        let (start, end, inclusive) = (self.start, self.end, self.inclusive);
-        let last = if inclusive {
-            end
+/// Maximum number of scalar values a compact range may expand into at one
+/// eager materialization boundary. Lazy iteration/streaming remains available
+/// for larger ranges.
+pub const RANGE_MATERIALIZATION_MAX_VALUES: usize = 16_384;
+
+pub struct RangeIter {
+    next: Option<i64>,
+    end: i64,
+    inclusive: bool,
+}
+
+impl Iterator for RangeIter {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        let in_range = if self.inclusive {
+            current <= self.end
         } else {
-            end.saturating_sub(1)
+            current < self.end
         };
-        start..=last
+        if !in_range {
+            self.next = None;
+            return None;
+        }
+        self.next = current.checked_add(1);
+        Some(current)
     }
-    pub fn len(&self) -> usize {
-        let last = if self.inclusive {
-            self.end
-        } else {
-            self.end - 1
-        };
-        if last < self.start {
+}
+
+impl RangeVal {
+    pub fn iter(&self) -> RangeIter {
+        RangeIter {
+            next: Some(self.start),
+            end: self.end,
+            inclusive: self.inclusive,
+        }
+    }
+    pub fn len(&self) -> u128 {
+        let start = i128::from(self.start);
+        let end = i128::from(self.end);
+        if self.inclusive {
+            if end < start {
+                0
+            } else {
+                (end - start + 1) as u128
+            }
+        } else if end <= start {
             0
         } else {
-            (last - self.start + 1) as usize
+            (end - start) as u128
         }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+    pub fn materialization_len(&self) -> VResult<usize> {
+        let len = self.len();
+        if len > RANGE_MATERIALIZATION_MAX_VALUES as u128 {
+            return Err(ErrorVal::new(
+                "range_materialization_limit",
+                format!(
+                    "range has {len} values; eager materialization is limited to {RANGE_MATERIALIZATION_MAX_VALUES}"
+                ),
+            )
+            .with_hint("iterate lazily with `.stream()`, then use `.take(n)` when a list is required"));
+        }
+        Ok(usize::try_from(len).expect("admitted range length fits usize"))
+    }
+    pub fn materialize(&self) -> VResult<Vec<Value>> {
+        let len = self.materialization_len()?;
+        let mut values = Vec::with_capacity(len);
+        values.extend(self.iter().map(Value::Int));
+        Ok(values)
+    }
+    pub fn value_at(&self, index: i64) -> Option<i64> {
+        let start = i128::from(self.start);
+        let end_exclusive = i128::from(self.end) + i128::from(self.inclusive);
+        let candidate = if index >= 0 {
+            start + i128::from(index)
+        } else {
+            end_exclusive + i128::from(index)
+        };
+        (candidate >= start && candidate < end_exclusive)
+            .then(|| i64::try_from(candidate).ok())
+            .flatten()
     }
     pub fn contains(&self, v: i64) -> bool {
         v >= self.start
@@ -417,6 +479,36 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ranges_are_exact_at_integer_edges_and_bound_eager_expansion() {
+        let empty = RangeVal {
+            start: i64::MIN,
+            end: i64::MIN,
+            inclusive: false,
+        };
+        assert!(empty.is_empty());
+        assert_eq!(empty.iter().next(), None);
+        assert_eq!(empty.value_at(0), None);
+        assert_eq!(empty.value_at(-1), None);
+
+        let full = RangeVal {
+            start: i64::MIN,
+            end: i64::MAX,
+            inclusive: true,
+        };
+        assert_eq!(full.len(), u64::MAX as u128 + 1);
+        assert_eq!(
+            full.iter().take(2).collect::<Vec<_>>(),
+            [i64::MIN, i64::MIN + 1]
+        );
+        assert_eq!(full.value_at(0), Some(i64::MIN));
+        assert_eq!(full.value_at(-1), Some(i64::MAX));
+        assert_eq!(
+            full.materialize().unwrap_err().code,
+            "range_materialization_limit"
+        );
+    }
 
     #[test]
     fn content_ref_encode_decode_roundtrip() {

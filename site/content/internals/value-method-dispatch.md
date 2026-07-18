@@ -95,7 +95,8 @@ outcome rather than only `.out`.
 ## General collection surface
 
 The sequence adapter accepts `List`, `Table`, and `Range`. Tables convert to values containing their
-records; ranges materialize integers. Raw streams are rejected here because stream driving needs
+records; ranges materialize at most 16,384 integers before raising `range_materialization_limit`.
+Raw streams are rejected here because stream driving needs
 context and boundedness rules.
 
 | Method | Contract |
@@ -103,7 +104,7 @@ context and boundedness rules.
 | `len`, `count` | character count for strings; bytes/elements/fields/range length otherwise |
 | `is_empty` | `len == 0` on supported receivers |
 | `first`, `last` | zero args returns value/null; integer arg returns a list slice |
-| `collect` | materializes range; returns list/table unchanged |
+| `collect` | materializes a range up to its 16,384-item wall; returns list/table unchanged |
 | `stream` | finite list/table/range or text lines to a lazy stream |
 | `tee` | split finite sequence into `n` coordinated branches |
 | `map` | call closure once per element, return list |

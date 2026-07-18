@@ -240,7 +240,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "str" => strops::to_str(recv, false),
         "display" => strops::to_str(recv, true),
         "json" => Ok(Value::Str(
-            serde_json::to_string(&value_to_json(&recv))
+            serde_json::to_string(&value_to_json(&recv)?)
                 .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
         )),
         "abs" => num::numeric_unary(recv, f64::abs, i64::checked_abs),

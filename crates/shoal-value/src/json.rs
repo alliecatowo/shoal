@@ -52,9 +52,9 @@ pub fn json_to_value(j: &serde_json::Value) -> Value {
     }
 }
 
-pub fn value_to_json(v: &Value) -> serde_json::Value {
+pub fn value_to_json(v: &Value) -> VResult<serde_json::Value> {
     use serde_json::json;
-    match v {
+    Ok(match v {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => json!(b),
         Value::Int(i) => json!(i),
@@ -79,24 +79,31 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         // fully materializes and converts to `Value::Bytes` first, so that
         // call site's full-fidelity behavior is unchanged.
         Value::CasBytes(c) => c.json_preview(),
-        Value::List(xs) => serde_json::Value::Array(xs.iter().map(value_to_json).collect()),
+        Value::List(xs) => {
+            serde_json::Value::Array(xs.iter().map(value_to_json).collect::<VResult<Vec<_>>>()?)
+        }
         Value::Record(r) => serde_json::Value::Object(
             r.iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect(),
+                .map(|(k, v)| Ok((k.clone(), value_to_json(v)?)))
+                .collect::<VResult<_>>()?,
         ),
         Value::Table(rows) => serde_json::Value::Array(
             rows.iter()
                 .map(|r| {
-                    serde_json::Value::Object(
+                    Ok(serde_json::Value::Object(
                         r.iter()
-                            .map(|(k, v)| (k.clone(), value_to_json(v)))
-                            .collect(),
-                    )
+                            .map(|(k, v)| Ok((k.clone(), value_to_json(v)?)))
+                            .collect::<VResult<_>>()?,
+                    ))
                 })
-                .collect(),
+                .collect::<VResult<Vec<_>>>()?,
         ),
-        Value::Range(r) => serde_json::Value::Array(r.iter().map(|i| json!(i)).collect()),
+        Value::Range(r) => {
+            let len = r.materialization_len()?;
+            let mut values = Vec::with_capacity(len);
+            values.extend(r.iter().map(|value| json!(value)));
+            serde_json::Value::Array(values)
+        }
         Value::Outcome(o) => json!({
             "status": o.status, "ok": o.ok,
             "out": String::from_utf8_lossy(&o.stdout),
@@ -105,7 +112,7 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Error(e) => json!({"code": e.code, "msg": e.msg}),
         Value::Secret(s) => json!(format!("secret({})", s.name)),
         other => json!(render::render_inline(other)),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -128,7 +135,7 @@ mod tests {
         r.insert("out".into(), Value::CasBytes(Arc::new(c)));
         r.insert("status".into(), Value::Int(0));
 
-        let j = value_to_json(&Value::Record(r));
+        let j = value_to_json(&Value::Record(r)).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -148,7 +155,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = test_support::cas_bytes(b"a", b"abcdef", calls.clone());
         let list = Value::List(vec![Value::Int(1), Value::CasBytes(Arc::new(c))]);
-        let j = value_to_json(&list);
+        let j = value_to_json(&list).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(j[1]["$"], "bytes_ref");
         assert_eq!(j[1]["len"], 6);
@@ -163,7 +170,7 @@ mod tests {
     fn bare_value_to_json_on_cas_bytes_is_also_bounded() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
-        let j = value_to_json(&Value::CasBytes(Arc::new(c)));
+        let j = value_to_json(&Value::CasBytes(Arc::new(c))).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(j["$"], "bytes_ref");
         assert_eq!(j["len"], 11);

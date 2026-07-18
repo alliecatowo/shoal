@@ -14,7 +14,7 @@ toc = true
 
 Shoal is a substantial, working preview—not a production-hardened login shell or multi-tenant agent sandbox. The language, structured shell, adapters, Reef resolver, journal/undo, kernel, MCP tools/resources/events, PTYs, LSP, prompt, and configuration system all execute real code today. The current security model still requires a fully trusted local kernel socket, and several protocol/operational contracts need hardening before consequential unattended deployment.
 
-This page is dated because status prose goes stale. It was checked against the source tree and the 1,358-case conformance corpus on **2026-07-18**.
+This page is dated because status prose goes stale. It was checked against the source tree and the 1,362-case conformance corpus on **2026-07-18**.
 
 ## Readiness in one table
 
@@ -49,8 +49,8 @@ The documentation uses these labels:
 The language contract lives in `spec/cases/*.toml`:
 
 ```text
-1,358 cases
-1,354 passed
+1,362 cases
+1,358 passed
 0 failed
 4 skipped
 ```
@@ -201,8 +201,9 @@ Builtin identity has a canonical registry used by evaluator/completion/highlight
 ### Lexical environments are bounded
 
 A session retains at most 4,096 live lexical names and 16 MiB of measured binding state across root,
-block, script, and module scopes. One name is at most 256 UTF-8 bytes; one materialized value is at
-most 1 MiB, depth 64, and 16,384 nodes. Replacing an existing binding is still allowed when the
+block, script, and module scopes. One name is at most 256 UTF-8 bytes; one value admitted to lexical
+state is at most 1 MiB, depth 64, and 16,384 nodes. Separately, eager expansion of a compact range is
+capped at 16,384 integers; larger ranges remain lazily streamable. Replacing an existing binding is still allowed when the
 identity cap is full, and temporary scope charges are reclaimed when that scope is dropped.
 
 Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,

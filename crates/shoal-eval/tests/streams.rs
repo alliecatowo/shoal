@@ -164,6 +164,27 @@ fn flat_map_over_lists() {
         rendered("[1,2,3].stream().flat_map(x => [x, x * 10]).collect()"),
         "[1, 10, 2, 20, 3, 30]"
     );
+    assert_eq!(
+        rendered("[0].stream().flat_map(_ => 1..1000000).take(3).collect()"),
+        "[1, 2, 3]",
+        "compact range expansions must stay lazy inside flat_map"
+    );
+}
+
+#[test]
+fn compact_ranges_bound_eager_materialization_but_stream_lazily() {
+    assert_eq!(
+        run_err("(1..1000000).collect()"),
+        "range_materialization_limit"
+    );
+    assert_eq!(
+        run_err("json.stringify(1..1000000)"),
+        "range_materialization_limit"
+    );
+    assert_eq!(
+        rendered("(1..1000000).stream().take(3).collect()"),
+        "[1, 2, 3]"
+    );
 }
 
 #[test]

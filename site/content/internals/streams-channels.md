@@ -237,7 +237,7 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `map(f)` | one upstream item, returns `f(item)` |
 | `where`/`filter(f)` | loops until `f(item).as_condition()` is true |
 | `scan(init,f)` | stores accumulator, emits every updated accumulator |
-| `flat_map(f)` | drains each returned stream or queued list/table/range before the next outer item; substreams are sequential |
+| `flat_map(f)` | drains each returned stream or moved list/table before the next outer item; compact ranges become lazy child streams; substreams are sequential |
 | `take(n)` | decrements remaining count and ends at zero |
 | `take_until(predicate)` | consumes triggering item and ends without emitting it |
 | `take_until(stream)` | polls signal stream and primary source in 20 ms steps |

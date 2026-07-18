@@ -79,6 +79,16 @@ src = '[1, 2, 3].stream().flat_map(x => [x, x * 10]).collect()'
 value = "[1, 10, 2, 20, 3, 30]"
 
 [[case]]
+name = "large-range-streams-without-eager-materialization"
+src = "(1..1000000).stream().take(3).collect()"
+value = "[1, 2, 3]"
+
+[[case]]
+name = "stream-flat-map-keeps-range-expansions-lazy"
+src = "[0].stream().flat_map(_ => 1..1000000).take(3).collect()"
+value = "[1, 2, 3]"
+
+[[case]]
 name = "stream-flat-map-substreams"
 src = '[1, 2].stream().flat_map(x => [x].stream()).collect()'
 value = "[1, 2]"
