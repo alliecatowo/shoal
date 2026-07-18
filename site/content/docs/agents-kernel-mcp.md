@@ -94,7 +94,8 @@ shoal-kernel \
 Command-line interface:
 
 ```text
-shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store PATH] [--policy FILE] [LIMIT FLAGS]
+shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store PATH] [--policy FILE]
+             [--require-token] [--require-peer-uid] [LIMIT FLAGS]
 ```
 
 | Flag | Default | Meaning |
@@ -104,6 +105,8 @@ shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store 
 | `--state-dir PATH` | XDG-derived | Journal, CAS, default token-store parent, and supporting durable state. |
 | `--token-store PATH` | environment/state-derived | Exact credential authority file. |
 | `--policy FILE` | none | Load a Leash policy instead of the local-human permissive default. |
+| `--require-token` | off | Remove the restricted tokenless fallback from the public listener. |
+| `--require-peer-uid` | off | Admit only peers whose OS-reported UID matches the kernel effective UID. |
 
 Limit flags cover connections, retained sessions, tasks per owner, PTYs per owner/principal/kernel,
 subscriptions per owner, CAS verification starts/window, and frame-read timeout. See the kernel

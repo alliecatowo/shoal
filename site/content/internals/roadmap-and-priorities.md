@@ -121,8 +121,9 @@ Plan refs use a full caller/content-bound digest plus a unique object suffix, so
 identical repeated plans cannot overwrite one another. Public tokenless clients are restricted and
 cannot assert local-human presence.
 
-**Remaining design.** Centralize method attachment classes so new handlers cannot regress; add
-optional peer-credential/mandatory-bearer modes. Continue to evolve approver routing,
+**Remaining design.** Centralize method attachment classes so new handlers cannot regress; the
+optional same-UID peer-credential and mandatory-bearer modes are implemented, while configurable
+UID allowlists/separate listener roles remain. Continue to evolve approver routing,
 expiration/reason metadata and cross-principal journal grants without weakening the existing
 exact-owner default. Journal-output `blob.get` and `journal` event reads/subscriptions share the
 direct query's `JournalRead` gate.

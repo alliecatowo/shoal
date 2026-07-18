@@ -119,6 +119,7 @@ Relative `journal.state_dir` and `SHOAL_SECRET_DIR` values resolve from each pro
 
 ```text
 shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store PATH] [--policy FILE]
+             [--require-token] [--require-peer-uid]
 ```
 
 | Option | Default | Notes |
@@ -128,6 +129,8 @@ shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store 
 | `--state-dir PATH` | XDG state | Journal/CAS and the default token-store parent. |
 | `--token-store PATH` | `SHOAL_TOKEN_STORE`, then `<state-dir>/tokens.json` | Exact credential authority file. |
 | `--policy FILE` | permissive local human | Explicit Leash TOML; load/parse failure is fatal. |
+| `--require-token` | off | Reject every tokenless public attachment. |
+| `--require-peer-uid` | off | Require the OS-reported peer UID to equal the kernel effective UID; unsupported platforms fail startup. |
 
 Example:
 

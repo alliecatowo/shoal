@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const EMBEDDED_READY_FRAME: &[u8] = b"{\"shoal_embedded\":{\"ready\":true,\"protocol\":1}}\n";
-const HELP: &str = "Shoal resident kernel\n\nUsage: shoal-kernel [OPTIONS]\n\nOptions:\n  --session NAME\n  --socket PATH\n  --state-dir PATH\n  --token-store PATH\n  --policy FILE\n  --embedded-fd FD\n  --max-connections N\n  --max-sessions N\n  --max-tasks-per-session N\n  --max-ptys-per-session N\n  --max-ptys-per-principal N\n  --max-ptys-global N\n  --max-subscriptions-per-session N\n  --max-blob-decompressions-per-window N\n  --blob-decompression-window-ms N\n  --frame-read-timeout-ms N\n  -h, --help\n  -V, --version";
+const HELP: &str = "Shoal resident kernel\n\nUsage: shoal-kernel [OPTIONS]\n\nOptions:\n  --session NAME\n  --socket PATH\n  --state-dir PATH\n  --token-store PATH\n  --policy FILE\n  --embedded-fd FD\n  --require-token             Require a bearer on the public socket\n  --require-peer-uid          Require the public peer UID to match this process\n  --max-connections N\n  --max-sessions N\n  --max-tasks-per-session N\n  --max-ptys-per-session N\n  --max-ptys-per-principal N\n  --max-ptys-global N\n  --max-subscriptions-per-session N\n  --max-blob-decompressions-per-window N\n  --blob-decompression-window-ms N\n  --frame-read-timeout-ms N\n  -h, --help\n  -V, --version";
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -48,6 +48,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Kernel::open_with_token_store(&state, &token_store)?
     };
     kernel.configure_limits(limits);
+    kernel.configure_listener_security(args.require_token, args.require_peer_uid);
     if let Some(fd) = args.embedded_fd {
         if args.socket.is_some() {
             return Err("--embedded-fd and --socket are mutually exclusive".into());
@@ -208,6 +209,8 @@ struct Args {
     token_store: Option<PathBuf>,
     policy: Option<PathBuf>,
     embedded_fd: Option<i32>,
+    require_token: bool,
+    require_peer_uid: bool,
     max_connections: Option<usize>,
     max_sessions: Option<usize>,
     max_tasks_per_session: Option<usize>,
@@ -228,6 +231,8 @@ impl Args {
             token_store: None,
             policy: None,
             embedded_fd: None,
+            require_token: false,
+            require_peer_uid: false,
             max_connections: None,
             max_sessions: None,
             max_tasks_per_session: None,
@@ -274,6 +279,8 @@ impl Args {
                         return Err("--embedded-fd may be specified only once".into());
                     }
                 }
+                Some("--require-token") => a.require_token = true,
+                Some("--require-peer-uid") => a.require_peer_uid = true,
                 Some("--max-connections") => {
                     a.max_connections = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
@@ -331,6 +338,11 @@ impl Args {
         }
         if a.embedded_fd.is_some() && a.socket.is_some() {
             return Err("--embedded-fd and --socket are mutually exclusive".into());
+        }
+        if a.embedded_fd.is_some() && (a.require_token || a.require_peer_uid) {
+            return Err(
+                "--require-token and --require-peer-uid apply only to a named public socket".into(),
+            );
         }
         Ok(a)
     }
@@ -469,6 +481,26 @@ mod tests {
             result.unwrap_err(),
             "--embedded-fd and --socket are mutually exclusive"
         );
+    }
+
+    #[test]
+    fn named_listener_security_flags_are_explicit_and_exclude_embedded_mode() {
+        let args = Args::parse(
+            ["--require-token", "--require-peer-uid"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert!(args.require_token);
+        assert!(args.require_peer_uid);
+
+        let error = Args::parse(
+            ["--embedded-fd", "3", "--require-token"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap_err();
+        assert!(error.contains("named public socket"));
     }
 
     #[test]

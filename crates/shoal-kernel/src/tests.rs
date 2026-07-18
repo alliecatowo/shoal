@@ -2,6 +2,7 @@ use super::*;
 
 mod task_control;
 mod token_admin;
+mod transport;
 
 fn serve_embedded_test_stream(kernel: Arc<Kernel>, stream: UnixStream) -> io::Result<()> {
     kernel.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)
@@ -1305,48 +1306,6 @@ fn unix_stream_session_roundtrip() {
     drop(client);
     drop(reader);
     thread.join().unwrap();
-}
-
-#[test]
-fn connection_provenance_controls_local_human_attachment() {
-    let public_kernel = Kernel::new();
-    let (mut public_client, public_server) = UnixStream::pair().unwrap();
-    let mut public_reader = BufReader::new(public_client.try_clone().unwrap());
-    let public_worker_kernel = public_kernel.clone();
-    let public_worker =
-        std::thread::spawn(move || public_worker_kernel.handle_stream(public_server).unwrap());
-    let denied = call(
-        &mut public_client,
-        &mut public_reader,
-        1,
-        "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"raw","tty":true}}),
-    );
-    assert_eq!(denied.error.unwrap().code, AUTH_FAILED);
-    drop(public_client);
-    drop(public_reader);
-    public_worker.join().unwrap();
-
-    let embedded_kernel = Kernel::new();
-    let (mut embedded_client, embedded_server) = UnixStream::pair().unwrap();
-    let mut embedded_reader = BufReader::new(embedded_client.try_clone().unwrap());
-    let worker_kernel = embedded_kernel.clone();
-    let embedded_worker = std::thread::spawn(move || {
-        serve_embedded_test_stream(worker_kernel, embedded_server).unwrap()
-    });
-    let attached = call(
-        &mut embedded_client,
-        &mut embedded_reader,
-        1,
-        "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"shoal-repl","tty":true}}),
-    )
-    .result
-    .expect("inherited endpoint proves embedded human presence");
-    assert_eq!(attached["connection_trust"], "embedded-human");
-    drop(embedded_client);
-    drop(embedded_reader);
-    embedded_worker.join().unwrap();
 }
 
 #[test]

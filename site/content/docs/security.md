@@ -42,10 +42,11 @@ accDescr: Shows the components and relationships described in Threat-model summa
 | Boundary | Current strength |
 | --- | --- |
 | Private socket filesystem permissions | Primary access boundary. Strong against other Unix users when path ownership/modes are correct. |
-| Bearer token | Identifies an opt-in agent principal; does not make socket access token-mandatory. |
+| Bearer token | Identifies an agent principal; `--require-token` makes it mandatory on the public listener. |
+| Peer UID | Optional `--require-peer-uid` pre-worker gate for the kernel effective UID; same-UID peers remain equivalent. |
 | Leash plan policy | Evaluates declared effects and approval rules. Useful, but declarations can be opaque/incomplete. |
 | Linux Landlock / macOS Seatbelt | Real filesystem restriction for child spawns when a concrete sandbox is resolved. |
-| Network restrictions | Policy/advisory only; no OS network enforcement today. |
+| Network restrictions | Coarse deny is enforced by supported Landlock/Seatbelt backends; hostname/port allowlists remain unavailable. |
 | Spawn hash/name allowlist | Pre-exec check with a documented TOCTOU window. |
 | Named session | Principal-private identity namespace; not a hostile-tenant process boundary. |
 | MCP facade | Safer convenience surface, not an authorization proxy around a hostile kernel peer. |
@@ -57,14 +58,15 @@ For the current release:
 1. Run `shoal-kernel` as an unprivileged dedicated user or your own desktop user, never root.
 2. Use the default per-user runtime directory or an explicitly owned `0700` directory.
 3. Verify the socket is `0600` and never bind it inside a broadly shared/mounted directory.
-4. Do not forward the socket over SSH/TCP or mount it into containers with untrusted workloads.
-5. Give mutually untrusted agents separate kernel **processes**, state directories, sockets, and preferably OS users—not merely separate session names.
-6. Configure an explicit Leash policy for every token principal.
-7. Nested evaluators inherit semantic principal/policy context, but they do not create a new OS isolation boundary; isolate the whole kernel process at the OS/service layer for hostile code.
-8. Read `caps_enforced` and the detailed platform limitations; approval is not equivalent to sandboxing.
-9. Treat revocation as immediate: the kernel revalidates bearer authority from the locked store before every request.
-10. Keep journal/state/secret directories private and back them up as sensitive data.
-11. Avoid `format=raw` on untrusted large values without a client-side size limit.
+4. Enable `--require-token` and `--require-peer-uid` for supervised named kernels unless compatibility requires the tokenless restricted principal.
+5. Do not forward the socket over SSH/TCP or mount it into containers with untrusted workloads.
+6. Give mutually untrusted agents separate kernel **processes**, state directories, sockets, and preferably OS users—not merely separate session names.
+7. Configure an explicit Leash policy for every token principal.
+8. Nested evaluators inherit semantic principal/policy context, but they do not create a new OS isolation boundary; isolate the whole kernel process at the OS/service layer for hostile code.
+9. Read `caps_enforced` and the detailed platform limitations; approval is not equivalent to sandboxing.
+10. Treat revocation as immediate: the kernel revalidates bearer authority from the locked store before every request.
+11. Keep journal/state/secret directories private and back them up as sensitive data.
+12. Avoid `format=raw` on untrusted large values without a client-side size limit.
 
 ## Socket access is authentication
 
@@ -81,7 +83,13 @@ This protects against other Unix users when the containing filesystem and owners
 
 The public listener does not accept client-asserted human presence. An attachment with neither bearer nor `local_auth` becomes the restricted `agent:mcp` principal; `local_auth:"local-human"` is rejected on every public/named socket. The only local-human trust root is the server-selected inherited anonymous descriptor used by the default interactive REPL's private, listener-free child kernel. Bearer tokens select explicit machine identities; `supervisor` or `plan.approve` authority is required for cross-principal approval.
 
-The kernel still does not validate `SO_PEERCRED`, so socket isolation remains important: a same-UID process can reach the restricted public surface and attempt any operation its effective principal/policy permits, and a stolen bearer remains a credential. Socket possession alone no longer upgrades a client to local human.
+Named kernels can be hardened with `--require-peer-uid`, which compares the OS-reported peer UID
+against the kernel's effective UID (`SO_PEERCRED` on Linux, `getpeereid` on supported BSD/macOS
+targets) before allocating a connection worker. `--require-token` rejects every tokenless public
+attachment. These are opt-in so existing local agent integrations remain compatible; unsupported
+peer-credential platforms fail startup when the flag is requested. A same-UID process can still
+reach a peer-bound socket, and a stolen bearer remains a credential. Socket possession alone never
+upgrades a client to local human.
 
 ## State-directory sensitivity
 
@@ -488,9 +496,8 @@ Connections, retained principal Sessions, active tasks, PTYs (per Session/princi
 
 Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:
 
-1. add optional peer-credential binding beyond the current public machine-only attach contract;
-2. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
-3. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
-4. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
+1. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
+2. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
+3. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
 
 Track implementation status in [Current status and limits](@/docs/status-limits.md) and [Roadmap](@/docs/roadmap.md).

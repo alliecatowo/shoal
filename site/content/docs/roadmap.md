@@ -138,10 +138,14 @@ Acceptance:
 
 ### Socket identity and mandatory authentication
 
-Add deployable modes:
+Deployable named-listener modes now implemented:
 
-- verify Unix peer UID (`SO_PEERCRED`/platform equivalent) against owner/allowlist;
-- `--require-token` to reject tokenless attach;
+- `--require-peer-uid` verifies the Unix peer UID (`SO_PEERCRED`/`getpeereid`) against the kernel effective UID before worker allocation;
+- `--require-token` rejects tokenless public attachment;
+
+Remaining transport designs:
+
+- configurable peer-UID allowlists beyond the exact kernel UID;
 - optional separate human and agent sockets;
 - refuse insecure socket directory ownership/modes rather than relying only on file mode;
 - rotate/revoke connection authorization intentionally.

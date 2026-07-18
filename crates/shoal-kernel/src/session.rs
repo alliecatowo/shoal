@@ -447,6 +447,19 @@ impl Kernel {
                 data: None,
             });
         }
+        if connection_trust == ConnectionTrust::Public
+            && self.require_public_token.load(Ordering::SeqCst)
+            && params.token.is_none()
+        {
+            return Err(RpcError {
+                code: AUTH_FAILED,
+                message: "this public kernel requires a bearer token".into(),
+                data: Some(json!({
+                    "auth_mode": "bearer-required",
+                    "connection_trust": connection_trust.as_str(),
+                })),
+            });
+        }
         if let Some(token) = params.token.as_deref()
             && !shoal_auth::bearer_is_canonical(token)
         {

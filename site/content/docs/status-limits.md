@@ -151,9 +151,9 @@ The first deep-audit P0s are now closed in code and covered by adversarial tests
 - evaluator Sessions and their refs/tasks/PTYS/quotas are keyed by principal plus visible Session name.
 
 These changes do not make one kernel process a hard multi-tenant boundary. Same-process principals
-still share global resources and persisted state files, public transport has no `SO_PEERCRED`
-binding, and arbitrary native code is only constrained along dimensions the OS backend actually
-enforces. Bearers are revalidated against the durable store before every attached request. Use
+still share global resources and persisted state files; peer-UID and mandatory-bearer binding are
+available but opt-in, and arbitrary native code is only constrained along dimensions the OS backend
+actually enforces. Bearers are revalidated against the durable store before every attached request. Use
 separate OS users/processes/state roots for mutually hostile tenants.
 
 Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
@@ -321,12 +321,11 @@ Practical guidance:
 
 At minimum:
 
-1. decide whether public deployments need mandatory bearer mode and/or peer-credential binding;
-2. add live token revocation/reload;
-3. close remaining raw/blob resource-exhaustion gaps and add CPU/memory/process-tree controls;
-4. provide stronger network/process enforcement and preserve per-dimension enforcement truth;
-5. continue long-duration task/PTY/subscription/process-tree lifecycle testing;
-6. stabilize/version wire/config/journal contracts;
-7. run adversarial cross-principal and long-duration platform testing.
+1. enable the implemented mandatory-bearer and/or peer-UID modes where the deployment requires them;
+2. close remaining raw/blob resource-exhaustion gaps and add CPU/memory/process-tree controls;
+3. provide stronger network/process enforcement and preserve per-dimension enforcement truth;
+4. continue long-duration task/PTY/subscription/process-tree lifecycle testing;
+5. stabilize/version wire/config/journal contracts;
+6. run adversarial cross-principal and long-duration platform testing.
 
 The ordered work is in [Roadmap](@/docs/roadmap.md). For practical current deployment, use [Security](@/docs/security.md), [Agent workflows](@/docs/mcp-workflows.md), and [Troubleshooting](@/docs/troubleshooting.md).

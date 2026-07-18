@@ -14,7 +14,7 @@ toc = true
 
 `shoal-kernel` serves JSON-RPC 2.0 over a Unix-domain socket. Each request or response is one compact JSON object followed by a newline. The API is useful for native clients that need methods not exposed by MCP, but it is a lower-level and less protected boundary: clients own framing, attachment, notification demultiplexing, resource limits, and reconnect behavior.
 
-> **Security boundary:** every stateful method, including `journal.query` and `cap.request`, requires an attachment and enforces its owner/approver rules. Tokenless public attachment becomes restricted `agent:mcp`; a public client cannot assert local-human authority. Keep the socket in a private `0700` directory with mode `0600` anyway: same-process resource sharing, credential theft, missing peer-credential binding, and incomplete OS enforcement still make arbitrary forwarding unsafe. See [Security and trust boundaries](@/docs/security.md).
+> **Security boundary:** every stateful method, including `journal.query` and `cap.request`, requires an attachment and enforces its owner/approver rules. Tokenless public attachment becomes restricted `agent:mcp`; a public client cannot assert local-human authority. Named kernels can require bearers and same-effective-UID OS peer credentials with `--require-token --require-peer-uid`. Keep the socket in a private `0700` directory with mode `0600` anyway: same-UID processes, credential theft, shared-process resources, and incomplete OS enforcement still make arbitrary forwarding unsafe. See [Security and trust boundaries](@/docs/security.md).
 
 ## Transport
 

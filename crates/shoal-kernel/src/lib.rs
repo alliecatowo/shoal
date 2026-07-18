@@ -11,6 +11,7 @@ mod handlers_stream;
 mod handlers_task;
 mod handlers_value;
 mod lifecycle;
+mod peer;
 mod session;
 mod state;
 mod wire;
@@ -66,6 +67,10 @@ pub struct Kernel {
     /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
     ptys: Arc<PtyRegistry>,
     auth: Option<Mutex<TokenStore>>,
+    /// Hardened named-listener modes. These never upgrade a connection to
+    /// human trust; they only narrow which public clients may attach.
+    require_public_token: AtomicBool,
+    require_peer_uid: AtomicBool,
     shutdown_requested: AtomicBool,
     started_at: Instant,
     events: Arc<EventBus>,
@@ -171,6 +176,8 @@ impl Kernel {
             )),
             events: Arc::new(EventBus::default()),
             auth: None,
+            require_public_token: AtomicBool::new(false),
+            require_peer_uid: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -251,6 +258,8 @@ impl Kernel {
             )),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(token_store)?)),
+            require_public_token: AtomicBool::new(false),
+            require_peer_uid: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -286,6 +295,8 @@ impl Kernel {
             )),
             events: Arc::new(EventBus::default()),
             auth: None,
+            require_public_token: AtomicBool::new(false),
+            require_peer_uid: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -314,6 +325,16 @@ impl Kernel {
             .store(limits.blob_decompression_window_ms, Ordering::Relaxed);
     }
 
+    /// Narrow the named public listener without changing the inherited
+    /// private-human transport. Peer UID mode admits only clients whose
+    /// kernel-reported effective UID matches this process's effective UID.
+    pub fn configure_listener_security(&self, require_token: bool, require_peer_uid: bool) {
+        self.require_public_token
+            .store(require_token, Ordering::SeqCst);
+        self.require_peer_uid
+            .store(require_peer_uid, Ordering::SeqCst);
+    }
+
     fn reserve_blob_decompression(&self, session: &Session) -> Result<(), RpcError> {
         session.reserve_blob_decompression(
             self.max_blob_decompressions_per_window
@@ -338,6 +359,12 @@ impl Kernel {
         stop: Arc<AtomicBool>,
     ) -> io::Result<()> {
         let path = path.as_ref();
+        if self.require_peer_uid.load(Ordering::SeqCst) && !peer::supported() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "--require-peer-uid is not supported on this platform",
+            ));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -359,6 +386,12 @@ impl Kernel {
                     // on every platform, instead of racing the client's next
                     // write and getting a transient `WouldBlock` misread as EOF.
                     stream.set_nonblocking(false)?;
+                    if kernel.require_peer_uid.load(Ordering::SeqCst)
+                        && let Err(error) = peer::require_matching_effective_uid(&stream)
+                    {
+                        eprintln!("shoal-kernel: rejected public peer: {error}");
+                        continue;
+                    }
                     let slot = match kernel.reserve_connection_slot() {
                         Ok(slot) => slot,
                         Err(()) => {

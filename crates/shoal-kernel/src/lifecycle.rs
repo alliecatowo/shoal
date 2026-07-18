@@ -23,6 +23,8 @@ impl Kernel {
                 "connection_trust": attachment.connection_trust.as_str(),
                 "raw_local_human": attachment.connection_trust == ConnectionTrust::EmbeddedHuman,
                 "bearer_establishes_human_presence": false,
+                "public_token_required": self.require_public_token.load(Ordering::SeqCst),
+                "public_peer_uid_required": self.require_peer_uid.load(Ordering::SeqCst),
                 "machine_admin_credential_required": attachment.connection_trust == ConnectionTrust::Public,
             },
             "shutdown_requested": self.shutdown_requested.load(Ordering::SeqCst),
