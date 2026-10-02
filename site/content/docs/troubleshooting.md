@@ -101,6 +101,12 @@ mise run install:clean
 verifies that all ten executables and man pages are byte-identical to their
 current source artifacts.
 
+The installer may also report that another installer holds the prefix lock, that it recovered an
+interrupted transaction, or that an uninstall target was replaced after installation. Lock waits
+are bounded (ten seconds by default; override with `SHOAL_INSTALL_LOCK_TIMEOUT_MS`). A replacement
+refusal happens before any managed file is removed. Inspect it first; if removal is intentional,
+run `mise run install:uninstall:force`.
+
 The repository-managed install and verification tasks deliberately build the
 entire release workspace. Do not replace that bootstrap with a package-only
 `cargo build -p shoal --release`: Cargo feature unification can select a
@@ -501,9 +507,13 @@ SHOAL_NO_AUTOSTART=1 shoal-mcp --socket "$SOCKET" --session debug
 
 Doctor uses a different no-XDG fallback (`std::env::temp_dir()/shoal/SESSION.sock`) and ignores `SHOAL_SOCKET`. On macOS especially, it may probe the wrong place. Compare its printed detail with kernel readiness; treat this as a doctor limitation.
 
-### MCP autostarts an insecure/default kernel
+### MCP autostarts a default kernel with no agent grants
 
-Autostart passes only `--socket`, not `--policy`/`--state-dir`. For explicit policy, disable it:
+Autostart passes only `--socket`, not `--policy`/`--state-dir`. The resulting kernel has a permissive
+entry for its unreachable-from-public-sockets private-human identity; tokenless MCP still attaches
+as restricted `agent:mcp` and does not inherit that grant. This is safe-by-default but often too
+limited for useful agent work. For explicit machine-principal grants and state placement, disable
+autostart:
 
 ```bash
 SHOAL_NO_AUTOSTART=1 shoal-mcp ...
@@ -512,6 +522,14 @@ SHOAL_NO_AUTOSTART=1 shoal-mcp ...
 and start/supervise `shoal-kernel --policy ... --state-dir ...` yourself.
 
 ## Authentication and policy
+
+### `shoal-mcp --local-human` is rejected
+
+That option was retired because named/public sockets cannot prove that a human is present. Socket
+ownership or same-UID peer credentials are not a human-presence signal. For agent access, create a
+bearer principal, grant it only the required effects in the kernel's Leash policy, and pass
+`--token`/`SHOAL_TOKEN`. For actual local-human authority, use the ordinary private interactive Shoal
+REPL; do not forward its inherited anonymous descriptor.
 
 ### New token is rejected
 

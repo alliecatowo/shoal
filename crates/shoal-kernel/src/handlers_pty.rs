@@ -70,13 +70,13 @@ impl Kernel {
         // spawn pinning (a non-empty `proc_spawn` allowlist) — otherwise an
         // empty allowlist would default-deny every spawn. `sandbox_for` returns
         // `None` for the permissive human, so the child runs unconfined.
-        if self.policy.spawn_pinning_active(&actor) {
+        if self.authority.policy.spawn_pinning_active(&actor) {
             let bin_hash = shoal_exec::resolve_and_hash_in(&argv, &env, &cwd).unwrap_or_default();
             let effect = Effect::ProcSpawn {
                 bin_hash,
                 argv0: p.cmd.clone(),
             };
-            match self.policy.evaluate_effect(&actor, &effect) {
+            match self.authority.policy.evaluate_effect(&actor, &effect) {
                 Verdict::Allow => {}
                 Verdict::ApprovalRequired => {
                     return Err(RpcError {
@@ -97,11 +97,11 @@ impl Kernel {
                 }
             }
         }
-        let sandbox = self.policy.sandbox_for(&actor);
+        let sandbox = self.authority.policy.sandbox_for(&actor);
 
         let owner = session.key.owner();
         self.reap_terminal_ptys(&owner)?;
-        let active_slot = self.ptys.reserve(&owner)?;
+        let active_slot = self.runtime.ptys.reserve(&owner)?;
 
         let pty_session = shoal_exec::PtySession::open(shoal_exec::PtyOpenSpec {
             argv,
@@ -122,7 +122,7 @@ impl Kernel {
         // `pty.read` still reports `changed:true`).
         let (cols, rows) = pty_session.size();
 
-        let (_, pty_ref) = self.ptys.allocate();
+        let (_, pty_ref) = self.runtime.ptys.allocate();
         let entry = Arc::new(PtyEntry {
             owner,
             cmd: display.clone(),
@@ -133,7 +133,7 @@ impl Kernel {
                 terminal_since: None,
             }),
         });
-        if let Err(error) = self.ptys.insert(pty_ref.clone(), entry.clone()) {
+        if let Err(error) = self.runtime.ptys.insert(pty_ref.clone(), entry.clone()) {
             if let Ok(mut session) = entry.session.lock() {
                 let _ = session.close();
             }
@@ -143,8 +143,8 @@ impl Kernel {
 
         // A single registry-wide sweeper detects self-exited children and
         // releases their leases. Thread count stays constant as PTYs grow.
-        if let Err(error) = self.ptys.ensure_reaper() {
-            let _ = self.ptys.remove(&pty_ref);
+        if let Err(error) = self.runtime.ptys.ensure_reaper() {
+            let _ = self.runtime.ptys.remove(&pty_ref);
             if let Ok(mut session) = entry.session.lock() {
                 let _ = session.close();
             }
@@ -177,7 +177,8 @@ impl Kernel {
             message,
             data: None,
         })?;
-        self.ptys
+        self.runtime
+            .ptys
             .lock_session(&p.pty_id, &entry)?
             .send(&bytes)
             .map_err(|e| RpcError {
@@ -203,7 +204,7 @@ impl Kernel {
         let p: PtyRefParams = decode(params)?;
         let entry = self.pty(&p.pty_id, &owner)?;
         let snap = {
-            let mut session = self.ptys.lock_session(&p.pty_id, &entry)?;
+            let mut session = self.runtime.ptys.lock_session(&p.pty_id, &entry)?;
             match session.read_screen() {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -214,14 +215,17 @@ impl Kernel {
                             data: None,
                         });
                     }
-                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let rpc = self
+                        .runtime
+                        .ptys
+                        .quarantine_entry(&p.pty_id, &entry, "renderer");
                     let _ = session.close();
                     return Err(rpc);
                 }
             }
         };
         if !snap.alive {
-            self.ptys.mark_terminal(&p.pty_id, &entry)?;
+            self.runtime.ptys.mark_terminal(&p.pty_id, &entry)?;
             self.reap_terminal_ptys(&owner)?;
         }
         encode(json!({
@@ -254,10 +258,13 @@ impl Kernel {
         let p: PtyResizeParams = decode(params)?;
         let entry = self.pty(&p.pty_id, &owner)?;
         let snap = {
-            let mut session = self.ptys.lock_session(&p.pty_id, &entry)?;
+            let mut session = self.runtime.ptys.lock_session(&p.pty_id, &entry)?;
             if let Err(error) = session.resize(p.cols, p.rows) {
                 if shoal_exec::PtySession::is_renderer_quarantined_error(&error) {
-                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let rpc = self
+                        .runtime
+                        .ptys
+                        .quarantine_entry(&p.pty_id, &entry, "renderer");
                     let _ = session.close();
                     return Err(rpc);
                 }
@@ -277,14 +284,17 @@ impl Kernel {
                             data: None,
                         });
                     }
-                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let rpc = self
+                        .runtime
+                        .ptys
+                        .quarantine_entry(&p.pty_id, &entry, "renderer");
                     let _ = session.close();
                     return Err(rpc);
                 }
             }
         };
         if !snap.alive {
-            self.ptys.mark_terminal(&p.pty_id, &entry)?;
+            self.runtime.ptys.mark_terminal(&p.pty_id, &entry)?;
             self.reap_terminal_ptys(&owner)?;
         }
         encode(json!({"pty_id": p.pty_id, "cols": snap.cols, "rows": snap.rows}))
@@ -304,8 +314,8 @@ impl Kernel {
         // Ownership check and removal are one registry transaction: exactly
         // one concurrent closer owns teardown, and foreign refs stay opaque.
         let entry = self.take_pty(&p.pty_id, &owner)?;
-        let (status, signal) = self.ptys.lock_session(&p.pty_id, &entry)?.close();
-        self.ptys.mark_terminal(&p.pty_id, &entry)?;
+        let (status, signal) = self.runtime.ptys.lock_session(&p.pty_id, &entry)?.close();
+        self.runtime.ptys.mark_terminal(&p.pty_id, &entry)?;
         encode(json!({
             "pty_id": p.pty_id,
             "closed": true,
@@ -332,20 +342,24 @@ impl Kernel {
         // Snapshot the matching entries (clone the Arcs, drop the registry lock)
         // before touching any per-session lock, so this never holds `ptys` and a
         // `PtyEntry::session` lock at once.
-        let mut entries: Vec<(Ref, Arc<PtyEntry>)> =
-            self.ptys.snapshot_owner(&owner)?.into_iter().collect();
+        let mut entries: Vec<(Ref, Arc<PtyEntry>)> = self
+            .runtime
+            .ptys
+            .snapshot_owner(&owner)?
+            .into_iter()
+            .collect();
         // Stable, ascending order (open order) so the list is deterministic.
         entries.sort_by_key(|(pty_ref, _)| pty_id_num(pty_ref));
         let ptys: Vec<Json> = entries
             .iter()
             .map(|(pty_ref, entry)| -> Result<Json, RpcError> {
-                let mut session = self.ptys.lock_session(pty_ref, entry)?;
+                let mut session = self.runtime.ptys.lock_session(pty_ref, entry)?;
                 let (cols, rows) = session.size();
                 let pid = session.pid();
                 let alive = session.alive();
                 drop(session);
                 if !alive {
-                    self.ptys.mark_terminal(pty_ref, entry)?;
+                    self.runtime.ptys.mark_terminal(pty_ref, entry)?;
                 }
                 Ok(json!({
                     "pty_id": pty_ref,

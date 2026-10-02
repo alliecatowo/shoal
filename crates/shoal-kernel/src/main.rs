@@ -1,16 +1,83 @@
-use shoal_kernel::{ConnectionTrust, Kernel, Limits};
+use shoal_kernel::{BoundSocket, ConnectionTrust, Kernel, Limits};
 use shoal_leash::Policy;
 use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::io::{self, Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const EMBEDDED_READY_FRAME: &[u8] = b"{\"shoal_embedded\":{\"ready\":true,\"protocol\":1}}\n";
-const HELP: &str = "Shoal resident kernel\n\nUsage: shoal-kernel [OPTIONS]\n\nOptions:\n  --session NAME\n  --socket PATH\n  --state-dir PATH\n  --token-store PATH\n  --policy FILE\n  --embedded-fd FD\n  --require-token             Require a bearer on the public socket\n  --require-peer-uid          Require the public peer UID to match this process\n  --max-connections N\n  --max-sessions N\n  --max-tasks-per-session N\n  --max-ptys-per-session N\n  --max-ptys-per-principal N\n  --max-ptys-global N\n  --max-subscriptions-per-session N\n  --max-blob-decompressions-per-window N\n  --blob-decompression-window-ms N\n  --frame-read-timeout-ms N\n  -h, --help\n  -V, --version";
+const HELP: &str = "Shoal resident kernel
+
+Usage:
+  shoal-kernel [OPTIONS]
+
+Options:
+  --session NAME                         Select the default session
+  --socket PATH                          Listen on an explicit Unix socket
+  --state-dir PATH                       Override durable state storage
+  --token-store PATH                     Override the capability-token authority
+  --policy FILE                          Load a sandbox policy
+  --embedded-fd FD                       Serve one inherited connected Unix stream
+  --detach-stderr-after-ready            Close inherited stderr after the readiness announcement
+  --require-token                        Require a bearer on the public socket
+  --require-peer-uid                     Require the public peer UID to match this process
+  --max-connections N                    Bound simultaneous client connections
+  --max-sessions N                       Bound resident sessions
+  --max-tasks-per-session N              Bound tasks owned by one session
+  --max-ptys-per-session N               Bound PTYs owned by one session
+  --max-ptys-per-principal N             Bound PTYs owned by one principal
+  --max-ptys-global N                    Bound all resident PTYs
+  --max-subscriptions-per-session N      Bound event subscriptions per session
+  --max-blob-decompressions-per-window N Bound decompression work in each window
+  --blob-decompression-window-ms N       Set the decompression accounting window
+  --frame-read-timeout-ms N              Bound time spent receiving one request frame
+  -h, --help                             Print this help and exit
+  -V, --version                          Print the version and exit
+
+Output:
+  Announces readiness on stderr. Embedded mode writes one bounded readiness frame to FD.
+
+Errors:
+  Refuses unsafe sockets/descriptors, invalid limits, conflicting transports, and invalid policy/state.
+
+Examples:
+  shoal-kernel --session default --require-peer-uid
+  shoal-kernel --socket /run/user/1000/shoal/ci.sock --require-token
+
+Exit status:
+  0 after an orderly shutdown; 1 for configuration, transport, state, or serving failures.";
+
+/// Canonical parser registry. Help/man parity tests enumerate this table, and
+/// `Args::parse` uses it to reject repeated options before interpretation.
+const PARSER_OPTIONS: &[(&str, bool)] = &[
+    ("--session", true),
+    ("--socket", true),
+    ("--state-dir", true),
+    ("--token-store", true),
+    ("--policy", true),
+    ("--embedded-fd", true),
+    ("--detach-stderr-after-ready", false),
+    ("--launch-guard-fd", true),
+    ("--launch-guard-token-id", true),
+    ("--require-token", false),
+    ("--require-peer-uid", false),
+    ("--max-connections", true),
+    ("--max-sessions", true),
+    ("--max-tasks-per-session", true),
+    ("--max-ptys-per-session", true),
+    ("--max-ptys-per-principal", true),
+    ("--max-ptys-global", true),
+    ("--max-subscriptions-per-session", true),
+    ("--max-blob-decompressions-per-window", true),
+    ("--blob-decompression-window-ms", true),
+    ("--frame-read-timeout-ms", true),
+];
+
+#[cfg(test)]
+const INTERNAL_OPTIONS: &[&str] = &["--launch-guard-fd", "--launch-guard-token-id"];
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -42,13 +109,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .cloned()
         .unwrap_or_else(|| paths.token_store(&state));
-    let kernel = if let Some(path) = args.policy {
-        Kernel::open_with_policy_and_token_store(&state, &token_store, Policy::load(&path)?)?
-    } else {
-        Kernel::open_with_token_store(&state, &token_store)?
-    };
-    kernel.configure_limits(limits);
-    kernel.configure_listener_security(args.require_token, args.require_peer_uid);
+    if let Some((fd, token_id)) = args.launch_guard.as_ref() {
+        await_launch_release(*fd, token_id, &token_store)?;
+    }
+    let mut kernel_builder = Kernel::builder()
+        .durable(&state)
+        .token_store(&token_store)
+        .limits(limits)
+        .listener_security(args.require_token, args.require_peer_uid);
+    if let Some(path) = args.policy.as_ref() {
+        kernel_builder = kernel_builder.policy(Policy::load(path)?);
+    }
+    let kernel = kernel_builder.build()?;
     if let Some(fd) = args.embedded_fd {
         if args.socket.is_some() {
             return Err("--embedded-fd and --socket are mutually exclusive".into());
@@ -84,12 +156,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
-    prepare_socket(&socket)?;
+    let bound = BoundSocket::bind(&socket)?;
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
     eprintln!("shoal-kernel: ready {}", socket.display());
-    kernel.serve_until(&socket, stop)?;
+    if args.detach_stderr_after_ready {
+        detach_stderr()?;
+    }
+    kernel.serve_bound_until(bound, stop)?;
+    Ok(())
+}
+
+fn detach_stderr() -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let null = fs::OpenOptions::new().write(true).open("/dev/null")?;
+    // SAFETY: both descriptors are valid. `dup2` atomically replaces only
+    // this process's stderr; the retained `File` is dropped after duplication.
+    if unsafe { libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -137,68 +224,44 @@ fn validate_embedded_socket(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn prepare_socket(path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket needs parent"))?;
-    secure_socket_dir(parent)?;
-    if path.exists() {
-        if UnixStream::connect(path).is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "kernel already listening",
-            ));
-        }
-        let meta = fs::symlink_metadata(path)?;
-        if !meta.file_type().is_socket() || meta.uid() != unsafe { geteuid() } {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "refusing to remove unowned non-socket path",
-            ));
-        }
-        fs::remove_file(path)?;
+fn await_launch_release(
+    fd: i32,
+    token_id: &str,
+    token_store: &std::path::Path,
+) -> Result<(), String> {
+    if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(format!(
+            "launch guard descriptor {fd} is not an inherited open descriptor"
+        ));
     }
-    Ok(())
-}
-
-/// Make sure the socket's parent directory exists and, when the kernel owns
-/// it, isn't group/world-accessible. The kernel only *tightens* permissions
-/// on a directory it actually has the right to change: one it just created,
-/// or one it already owns. A pre-existing directory owned by someone else
-/// (e.g. a shared `/tmp` when the socket path is `--socket /tmp/x.sock`) is
-/// left untouched — `chmod`ing a shared root-owned directory either fails
-/// `EPERM` as a non-root caller, or, run as root, would strip access from
-/// every other user of that directory. Either way it is never something the
-/// kernel should attempt. The real security boundary is the socket *file*
-/// itself, created `0600` at bind time (see `Kernel::serve_until`) — this is
-/// defense in depth, applied only where the kernel actually has standing to
-/// apply it.
-fn secure_socket_dir(parent: &Path) -> io::Result<()> {
-    let describe = |err: io::Error| {
-        io::Error::new(
-            err.kind(),
-            format!(
-                "cannot secure socket dir {}: {err}; use a socket path inside a directory you \
-                 own, e.g. $XDG_RUNTIME_DIR/shoal/... or /tmp/shoal-<uid>/...",
-                parent.display()
-            ),
-        )
-    };
-    let pre_existing = parent.exists();
-    fs::create_dir_all(parent).map_err(describe)?;
-    let owned_by_us = fs::metadata(parent)
-        .map(|m| m.uid() == unsafe { geteuid() })
-        .unwrap_or(false);
-    if pre_existing && !owned_by_us {
-        // Not ours to chmod: skip. The socket file created inside it is
-        // still 0600, which is the boundary that actually matters.
+    // SAFETY: fcntl proved this inherited descriptor open, and the argument
+    // transfers its ownership to this process exactly once.
+    let mut guard = unsafe { fs::File::from_raw_fd(fd) };
+    let mut release = [0_u8; 1];
+    let result = guard.read_exact(&mut release);
+    if result.is_ok() && release[0] == shoal_mcp_release_byte() {
         return Ok(());
     }
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(describe)
+
+    let reason = match result {
+        Ok(()) => "supervisor sent an invalid release frame".to_string(),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            "launch supervisor exited before lifecycle commit".to_string()
+        }
+        Err(error) => format!("cannot read launch supervisor gate: {error}"),
+    };
+    let cleanup = shoal_auth::TokenStore::open(token_store)
+        .and_then(|mut store| store.revoke(token_id).map(|_| ()))
+        .map_err(|error| format!("cannot revoke unreleased managed authority: {error}"));
+    match cleanup {
+        Ok(()) => Err(reason),
+        Err(cleanup) => Err(format!("{reason}; {cleanup}")),
+    }
 }
 
-unsafe extern "C" {
-    fn geteuid() -> u32;
+const fn shoal_mcp_release_byte() -> u8 {
+    // Kept local so the daemon does not depend on the MCP facade crate.
+    1
 }
 
 #[derive(Debug)]
@@ -209,6 +272,8 @@ struct Args {
     token_store: Option<PathBuf>,
     policy: Option<PathBuf>,
     embedded_fd: Option<i32>,
+    launch_guard: Option<(i32, String)>,
+    detach_stderr_after_ready: bool,
     require_token: bool,
     require_peer_uid: bool,
     max_connections: Option<usize>,
@@ -224,6 +289,7 @@ struct Args {
 }
 impl Args {
     fn parse(mut it: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, String> {
+        let mut seen = std::collections::BTreeSet::new();
         let mut a = Self {
             session: "default".into(),
             socket: None,
@@ -231,6 +297,8 @@ impl Args {
             token_store: None,
             policy: None,
             embedded_fd: None,
+            launch_guard: None,
+            detach_stderr_after_ready: false,
             require_token: false,
             require_peer_uid: false,
             max_connections: None,
@@ -254,7 +322,16 @@ impl Args {
         };
         while let Some(k) = it.next() {
             let missing = || format!("{} requires a value", k.to_string_lossy());
-            match k.to_str() {
+            let key = k
+                .to_str()
+                .ok_or_else(|| format!("unknown non-UTF-8 argument {}", k.to_string_lossy()))?;
+            if !PARSER_OPTIONS.iter().any(|(name, _)| *name == key) {
+                return Err(format!("unknown argument {key}"));
+            }
+            if !seen.insert(key.to_string()) {
+                return Err(format!("{key} may be specified only once"));
+            }
+            match Some(key) {
                 Some("--session") => {
                     a.session = it
                         .next()
@@ -278,6 +355,37 @@ impl Args {
                     if a.embedded_fd.replace(fd).is_some() {
                         return Err("--embedded-fd may be specified only once".into());
                     }
+                }
+                Some("--detach-stderr-after-ready") => a.detach_stderr_after_ready = true,
+                Some("--launch-guard-fd") => {
+                    let fd = it
+                        .next()
+                        .ok_or_else(&missing)?
+                        .to_str()
+                        .and_then(|text| text.parse::<i32>().ok())
+                        .ok_or_else(|| "--launch-guard-fd requires an integer".to_string())?;
+                    if a.launch_guard.replace((fd, String::new())).is_some() {
+                        return Err("--launch-guard-fd may be specified only once".into());
+                    }
+                }
+                Some("--launch-guard-token-id") => {
+                    let id = it
+                        .next()
+                        .ok_or_else(&missing)?
+                        .into_string()
+                        .map_err(|_| "--launch-guard-token-id must be UTF-8")?;
+                    if id.is_empty() || id.len() > 256 {
+                        return Err("--launch-guard-token-id must be 1..=256 bytes".into());
+                    }
+                    let Some((_, current)) = a.launch_guard.as_mut() else {
+                        return Err(
+                            "--launch-guard-token-id requires --launch-guard-fd first".into()
+                        );
+                    };
+                    if !current.is_empty() {
+                        return Err("--launch-guard-token-id may be specified only once".into());
+                    }
+                    *current = id;
                 }
                 Some("--require-token") => a.require_token = true,
                 Some("--require-peer-uid") => a.require_peer_uid = true,
@@ -333,7 +441,7 @@ impl Args {
                             })?,
                     )
                 }
-                _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
+                _ => unreachable!("registry and parser match arms must remain in parity"),
             }
         }
         if a.embedded_fd.is_some() && a.socket.is_some() {
@@ -343,6 +451,15 @@ impl Args {
             return Err(
                 "--require-token and --require-peer-uid apply only to a named public socket".into(),
             );
+        }
+        if a.embedded_fd.is_some() && a.detach_stderr_after_ready {
+            return Err("--detach-stderr-after-ready applies only to a named public socket".into());
+        }
+        if a.launch_guard.as_ref().is_some_and(|(_, id)| id.is_empty()) {
+            return Err("--launch-guard-fd requires --launch-guard-token-id".into());
+        }
+        if a.launch_guard.is_some() && a.embedded_fd.is_some() {
+            return Err("--launch-guard-fd applies only to a named public socket".into());
         }
         Ok(a)
     }
@@ -382,9 +499,84 @@ impl Args {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd as _;
+    use std::path::Path;
 
-    fn we_are_root() -> bool {
-        unsafe { geteuid() == 0 }
+    #[test]
+    fn public_help_and_man_cover_public_options_while_supervisor_options_stay_internal() {
+        let documented = HELP
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("--"))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<std::collections::BTreeSet<_>>();
+        let registered = PARSER_OPTIONS
+            .iter()
+            .filter(|(name, _)| !INTERNAL_OPTIONS.contains(name))
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(documented, registered, "public help and options diverged");
+
+        let man = include_str!("../../../man/shoal-kernel.1");
+        for (name, takes_value) in PARSER_OPTIONS {
+            let documented = man.contains(&name.replace("--", "\\-\\-"));
+            assert_eq!(
+                documented,
+                !INTERNAL_OPTIONS.contains(name),
+                "man visibility is wrong for {name}"
+            );
+            let mut invocation = vec![std::ffi::OsString::from(*name)];
+            if *takes_value {
+                invocation.push(std::ffi::OsString::from(match *name {
+                    "--launch-guard-token-id" => "managed-token",
+                    _ => "3",
+                }));
+            }
+            let result = Args::parse(invocation.into_iter());
+            if let Err(error) = result {
+                assert!(
+                    !error.contains("unknown"),
+                    "registered option was not recognized: {name}: {error}"
+                );
+            }
+        }
+        for name in INTERNAL_OPTIONS {
+            assert!(!HELP.contains(name), "ordinary help exposed {name}");
+        }
+    }
+
+    #[test]
+    fn parser_rejects_repeated_options_instead_of_silently_overwriting_them() {
+        for (name, takes_value) in PARSER_OPTIONS {
+            if *name == "--launch-guard-token-id" {
+                continue;
+            }
+            let mut invocation = Vec::new();
+            for _ in 0..2 {
+                invocation.push(std::ffi::OsString::from(*name));
+                if *takes_value {
+                    invocation.push(std::ffi::OsString::from("3"));
+                }
+            }
+            let error = Args::parse(invocation.into_iter()).unwrap_err();
+            assert!(
+                error.contains("only once"),
+                "duplicate {name} produced the wrong error: {error}"
+            );
+        }
+        let error = Args::parse(
+            [
+                "--launch-guard-fd",
+                "7",
+                "--launch-guard-token-id",
+                "first",
+                "--launch-guard-token-id",
+                "second",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap_err();
+        assert!(error.contains("only once"), "{error}");
     }
 
     #[test]
@@ -451,6 +643,63 @@ mod tests {
     }
 
     #[test]
+    fn daemon_stderr_detach_is_listener_only() {
+        let listener = Args::parse(
+            ["--detach-stderr-after-ready"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert!(listener.detach_stderr_after_ready);
+
+        let embedded = Args::parse(
+            ["--embedded-fd", "3", "--detach-stderr-after-ready"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            embedded.unwrap_err(),
+            "--detach-stderr-after-ready applies only to a named public socket"
+        );
+    }
+
+    #[test]
+    fn launch_guard_requires_an_exact_fd_and_token_id_pair() {
+        let missing_id = Args::parse(
+            ["--launch-guard-fd", "7"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            missing_id.unwrap_err(),
+            "--launch-guard-fd requires --launch-guard-token-id"
+        );
+
+        let missing_fd = Args::parse(
+            ["--launch-guard-token-id", "token-id"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            missing_fd.unwrap_err(),
+            "--launch-guard-token-id requires --launch-guard-fd first"
+        );
+
+        let parsed = Args::parse(
+            [
+                "--launch-guard-fd",
+                "7",
+                "--launch-guard-token-id",
+                "token-id",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert_eq!(parsed.launch_guard, Some((7, "token-id".into())));
+    }
+
+    #[test]
     fn explicit_token_store_is_parsed_without_changing_state_root() {
         let args = Args::parse(
             [
@@ -513,79 +762,5 @@ mod tests {
 
         let (stream, _peer) = UnixStream::pair().unwrap();
         assert!(validate_embedded_socket(stream.as_raw_fd()).is_ok());
-    }
-
-    /// The bug: `--socket /tmp/x.sock` puts the socket's parent at `/tmp` —
-    /// a pre-existing, root-owned, shared directory. The old
-    /// `prepare_socket` unconditionally `chmod`ed the parent to `0700`,
-    /// which a non-root caller cannot do to a directory it doesn't own —
-    /// surfaced verbatim as "Operation not permitted (os error 1)" with no
-    /// diagnostic. `prepare_socket` must now boot cleanly: it owns (and
-    /// therefore secures) only directories it creates or already owns, and
-    /// leaves a shared parent alone — the socket file itself (0600 at bind
-    /// time) is the real boundary.
-    #[test]
-    fn prepare_socket_survives_a_shared_not_owned_parent_dir() {
-        if we_are_root() {
-            eprintln!(
-                "skipping: running as root, cannot exercise a parent dir this caller doesn't own"
-            );
-            return;
-        }
-        let sock =
-            std::env::temp_dir().join(format!("shoal-kbug-test-{}.sock", std::process::id()));
-        let _ = fs::remove_file(&sock);
-        let result = prepare_socket(&sock);
-        assert!(
-            result.is_ok(),
-            "socket bring-up must not fail on a shared, not-owned-by-us parent: {result:?}"
-        );
-        let _ = fs::remove_file(&sock);
-    }
-
-    /// A directory the kernel *does* own, but genuinely cannot secure (no
-    /// write permission on its own parent so `create_dir_all` fails), must
-    /// fail with a message that NAMES the cause and tells the caller how to
-    /// route around it — never a bare, unexplained OS errno.
-    #[test]
-    fn secure_socket_dir_wraps_a_real_failure_descriptively() {
-        if we_are_root() {
-            eprintln!("skipping: root bypasses the permission check this test relies on");
-            return;
-        }
-        let base = tempfile::tempdir().unwrap();
-        let readonly = base.path().join("ro");
-        fs::create_dir(&readonly).unwrap();
-        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o500)).unwrap();
-        let child = readonly.join("shoal-sock-dir");
-
-        let err = secure_socket_dir(&child).expect_err("a read-only parent cannot be secured");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cannot secure socket dir"),
-            "error must name the cause: {msg}"
-        );
-        assert!(
-            msg.contains("use a socket path inside a directory you own"),
-            "error must hint at a fix: {msg}"
-        );
-
-        // Restore write access so the tempdir's own Drop cleanup can remove it.
-        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    /// The happy path is unchanged: a fresh parent the kernel creates itself
-    /// is still locked down to `0700`.
-    #[test]
-    fn prepare_socket_still_secures_a_freshly_created_parent() {
-        let base = tempfile::tempdir().unwrap();
-        let sock = base.path().join("run").join("kernel.sock");
-        prepare_socket(&sock).unwrap();
-        let parent_mode = fs::metadata(sock.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(parent_mode, 0o700, "a kernel-created parent must be 0700");
     }
 }

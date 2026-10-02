@@ -1,0 +1,23 @@
+#!/usr/bin/env shoal
+# Plan duplicate-file removal from a checksum inventory without mutating data.
+
+assert(args.len() == 2, "usage: file-deduplicate-plan.shl INVENTORY OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "artifact inventory is missing: {input}")
+let files = json.parse(input.read).files
+let groups = files.group_by(.sha256).where(group => group.values.len() > 1)
+let duplicate_sets = groups.map(group => {
+  let ordered = group.values.sort_by(.path)
+  let keep = ordered.first()
+  let remove = ordered.skip(1)
+  {sha256: group.key, keep: keep.path, remove: remove.map(.path), reclaim_bytes: remove.map(.bytes).sum()}
+}).sort_by(row => -row.reclaim_bytes)
+let report = {
+  duplicate_sets: duplicate_sets,
+  duplicate_files: duplicate_sets.map(row => row.remove.len()).sum(),
+  reclaim_bytes: duplicate_sets.map(.reclaim_bytes).sum(),
+  mutates: false,
+}
+json.stringify(report, pretty: true).save(output)
+echo "planned {report.duplicate_files} duplicate removals reclaiming {report.reclaim_bytes} bytes"

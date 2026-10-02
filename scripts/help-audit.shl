@@ -3,26 +3,41 @@
 
 let override = (env SHOAL_BIN_DIR).out
 let bin_dir = path(override ?? "target/debug")
-let binaries = [
-  "shoal",
-  "shoal-kernel",
-  "shoal-mcp",
-  "shoal-lsp",
-  "shoal-token",
-  "shoal-secret",
-  "shoal-history",
-  "shoal-doctor",
-  "shoal-sandbox-exec",
-  "shoal-landlock-helper",
+let shoal_nested_options = ["--json", "--check", "--side", "--n"]
+let contracts = [
+  {name: "shoal", options: ["--command", "--standalone", "--help", "--version"], actions: ["kernel", "fmt", "doctor", "lsp", "mcp", "completions", "prompt"]},
+  {name: "shoal-kernel", options: ["--session", "--socket", "--state-dir", "--token-store", "--policy", "--embedded-fd", "--detach-stderr-after-ready", "--require-token", "--require-peer-uid", "--max-connections", "--max-sessions", "--max-tasks-per-session", "--max-ptys-per-session", "--max-ptys-per-principal", "--max-ptys-global", "--max-subscriptions-per-session", "--max-blob-decompressions-per-window", "--blob-decompression-window-ms", "--frame-read-timeout-ms", "--help", "--version"], actions: []},
+  {name: "shoal-mcp", options: ["--socket", "--session", "--token", "--help", "--version"], actions: []},
+  {name: "shoal-lsp", options: ["--help", "--version"], actions: []},
+  {name: "shoal-token", options: ["--cap", "--ttl", "--help", "--version"], actions: ["create", "list", "revoke"]},
+  {name: "shoal-secret", options: ["--help", "--version"], actions: ["set", "list", "delete"]},
+  {name: "shoal-history", options: ["--state-dir", "--json", "--since", "--principal", "--kind", "--effects", "--head", "--status", "--limit", "--ttl", "--budget", "--apply", "--root", "--help", "--version"], actions: ["query", "show", "pin", "unpin", "gc", "status", "undo"]},
+  {name: "shoal-doctor", options: ["--json", "--help", "--version"], actions: []},
+  {name: "shoal-sandbox-exec", options: ["--deny-net", "--cpu-seconds", "--memory-bytes", "--read", "--write", "--delete", "--help", "--version"], actions: []},
+  {name: "shoal-landlock-helper", options: ["--help", "--version"], actions: []},
+]
+let help_sections = ["Usage:", "Options:", "Output:", "Errors:", "Examples:", "Exit status:"]
+let man_sections = [
+  ".SH NAME",
+  ".SH SYNOPSIS",
+  ".SH DESCRIPTION",
+  ".SH OPTIONS",
+  ".SH OUTPUT",
+  ".SH ERRORS",
+  ".SH EXAMPLES",
+  ".SH EXIT STATUS",
 ]
 
-for name in binaries {
+for contract in contracts {
+  let name = contract.name
   let executable = bin_dir.join(name)
   assert(executable.is_file, "missing executable: {executable}")
   let help = run(executable, "--help")
   assert(help.ok, "{name} --help failed: {help.err}")
-  assert(help.out.contains("Usage:"), "{name} --help has no Usage section")
-  assert(help.out.lines().len() <= 32, "{name} --help is too long")
+  for section in help_sections {
+    assert(help.out.contains(section), "{name} --help omits {section}")
+    assert(help.out.contains("{section}\n  "), "{name} --help has an empty {section} section")
+  }
   let version = run(executable, "--version")
   assert(version.ok, "{name} --version failed: {version.err}")
   assert(version.out.trim().starts_with("{name} "), "{name} --version is malformed: {version.out}")
@@ -31,16 +46,158 @@ for name in binaries {
   assert(page.is_file, "missing man page: {page}")
   let source = page.read
   assert(source.starts_with(".TH "), "{page}: missing TH header")
-  assert(source.contains(".SH NAME"), "{page}: missing NAME section")
-  assert(source.contains(".SH SYNOPSIS"), "{page}: missing SYNOPSIS section")
+  for section in man_sections {
+    assert(source.contains(section), "{page}: missing {section}")
+  }
+  for option in contract.options {
+    assert(help.out.contains(option), "{name} canonical option {option} is absent from --help")
+    let roff_option = option.replace("--", "\\-\\-")
+    assert(source.contains(roff_option), "{page}: canonical option {option} is absent")
+  }
+  let help_option_block = help.out.split("Options:\n")[1].split("\n\n").first()
+  for line in help_option_block.lines() {
+    for token in line.replace(",", "").split(" ").map(.trim()).where(word => word.starts_with("--")) {
+      assert(contract.options.contains(token), "{name} help documents unregistered option {token}")
+    }
+  }
+  let man_option_block = source.split(".SH OPTIONS")[1].split(".SH OUTPUT").first().replace("\\-", "-").replace("\"", "").replace(",", "")
+  for line in man_option_block.lines() {
+    for token in line.split(" ").map(.trim()).where(word => word.starts_with("--")) {
+      assert(contract.options.contains(token) || (name == "shoal" && shoal_nested_options.contains(token)), "{page} documents unregistered option {token}")
+    }
+  }
+  for action in contract.actions {
+    assert(help.out.contains(action), "{name} canonical action {action} is absent from --help")
+    assert(source.contains(action), "{page}: canonical action {action} is absent")
+  }
 }
 
 let shoal = bin_dir.join("shoal")
-let commands = ["fmt", "doctor", "kernel", "lsp", "mcp", "completions", "prompt"]
-for command in commands {
+let command_contracts = [
+  {command: "fmt", options: ["--check", "--help"]},
+  {command: "doctor", options: ["--json", "--help"]},
+  {command: "kernel", options: ["--json", "--help"]},
+  {command: "lsp", options: ["--help"]},
+  {command: "mcp", options: ["--help"]},
+  {command: "completions", options: ["--help"]},
+  {command: "prompt", options: ["--help"]},
+]
+for contract in command_contracts {
+  let command = contract.command
   let help = run(shoal, command, "--help")
   assert(help.ok, "shoal {command} --help failed: {help.err}")
-  assert(help.out.contains("Usage: shoal {command}"), "shoal {command} help has the wrong usage")
+  assert(help.out.contains("shoal {command}"), "shoal {command} help has the wrong usage")
+  for section in help_sections {
+    assert(help.out.contains(section), "shoal {command} --help omits {section}")
+    assert(help.out.contains("{section}\n  "), "shoal {command} --help has an empty {section} section")
+  }
+  for option in contract.options {
+    assert(help.out.contains(option), "shoal {command} parser option {option} is absent from help")
+  }
+  let option_block = help.out.split("Options:\n")[1].split("\n\n").first()
+  for line in option_block.lines() {
+    for token in line.replace(",", "").split(" ").map(.trim()).where(word => word.starts_with("--")) {
+      assert(contract.options.contains(token), "shoal {command} help documents unregistered option {token}")
+    }
+  }
 }
 
-echo "help audit: {binaries.len()} executables/man pages and {commands.len()} subcommands passed"
+let actions = [
+  {command: "kernel", action: "start", options: ["--json", "--help"]},
+  {command: "kernel", action: "status", options: ["--json", "--help"]},
+  {command: "kernel", action: "stop", options: ["--json", "--help"]},
+  {command: "prompt", action: "explain", options: ["--side", "--help"]},
+  {command: "prompt", action: "print", options: ["--side", "--help"]},
+  {command: "prompt", action: "bench", options: ["--side", "--n", "--help"]},
+]
+for item in actions {
+  let help = run(shoal, item.command, item.action, "--help")
+  assert(help.ok, "shoal {item.command} {item.action} --help failed: {help.err}")
+  assert(help.out.contains("shoal {item.command} {item.action}"), "action help has the wrong usage")
+  for section in help_sections {
+    assert(help.out.contains(section), "shoal {item.command} {item.action} --help omits {section}")
+    assert(help.out.contains("{section}\n  "), "shoal action help has an empty {section} section")
+  }
+  for option in item.options {
+    assert(help.out.contains(option), "shoal {item.command} {item.action} parser option {option} is absent from help")
+  }
+  let option_block = help.out.split("Options:\n")[1].split("\n\n").first()
+  for line in option_block.lines() {
+    for token in line.replace(",", "").split(" ").map(.trim()).where(word => word.starts_with("--")) {
+      assert(item.options.contains(token), "shoal {item.command} {item.action} help documents unregistered option {token}")
+    }
+  }
+}
+
+let companion_actions = [
+  {binary: "shoal-token", action: "create", options: ["--cap", "--ttl", "--help"]},
+  {binary: "shoal-token", action: "list", options: ["--help"]},
+  {binary: "shoal-token", action: "revoke", options: ["--help"]},
+  {binary: "shoal-secret", action: "set", options: ["--help"]},
+  {binary: "shoal-secret", action: "list", options: ["--help"]},
+  {binary: "shoal-secret", action: "delete", options: ["--help"]},
+  {binary: "shoal-history", action: "query", options: ["--since", "--principal", "--kind", "--effects", "--head", "--status", "--limit", "--help"]},
+  {binary: "shoal-history", action: "show", options: ["--help"]},
+  {binary: "shoal-history", action: "pin", options: ["--help"]},
+  {binary: "shoal-history", action: "unpin", options: ["--help"]},
+  {binary: "shoal-history", action: "gc", options: ["--ttl", "--budget", "--apply", "--help"]},
+  {binary: "shoal-history", action: "status", options: ["--help"]},
+  {binary: "shoal-history", action: "undo", options: ["--root", "--help"]},
+]
+for item in companion_actions {
+  let help = run(bin_dir.join(item.binary), item.action, "--help")
+  assert(help.ok, "{item.binary} {item.action} --help failed: {help.err}")
+  assert(help.out.contains("{item.binary} {item.action}"), "companion action help has the wrong usage")
+  for section in help_sections {
+    assert(help.out.contains(section), "{item.binary} {item.action} --help omits {section}")
+    assert(help.out.contains("{section}\n  "), "{item.binary} {item.action} help has an empty {section} section")
+  }
+  for option in item.options {
+    assert(help.out.contains(option), "{item.binary} {item.action} parser option {option} is absent from help")
+  }
+  let option_block = help.out.split("Options:\n")[1].split("\n\n").first()
+  for line in option_block.lines() {
+    for token in line.replace(",", "").split(" ").map(.trim()).where(word => word.starts_with("--")) {
+      assert(item.options.contains(token), "{item.binary} {item.action} help documents unregistered option {token}")
+    }
+  }
+}
+
+let history_global_help = run(bin_dir.join("shoal-history"), "--json", "show", "--help")
+assert(history_global_help.ok && history_global_help.out.contains("shoal-history show ID"), "shoal-history global options hide action help")
+
+let isolated_result = run("mktemp", "-d")
+assert(isolated_result.ok, "cannot create isolated help-audit home: {isolated_result.err}")
+let isolated = path(isolated_result.out.trim())
+let isolated_config = isolated.join("config")
+let isolated_state = isolated.join("state")
+let isolated_cache = isolated.join("cache")
+let isolated_tokens = isolated.join("tokens.json")
+for contract in contracts {
+  let executable = bin_dir.join(contract.name).abs()
+  let isolated_help = run(
+    "env",
+    "HOME={isolated}",
+    "XDG_CONFIG_HOME={isolated_config}",
+    "XDG_STATE_HOME={isolated_state}",
+    "XDG_CACHE_HOME={isolated_cache}",
+    "SHOAL_TOKEN_STORE={isolated_tokens}",
+    executable,
+    "--help",
+  )
+  assert(isolated_help.ok, "isolated {contract.name} --help failed: {isolated_help.err}")
+}
+assert(!isolated.join("config").exists, "--help created configuration state")
+assert(!isolated.join("state").exists, "--help created durable state")
+assert(!isolated.join("cache").exists, "--help created cache state")
+assert(!isolated.join("tokens.json").exists, "--help created token authority state")
+
+let shoal_smoke = run(bin_dir.join("shoal"), "-c", "math.sqrt(81)")
+assert(shoal_smoke.ok && shoal_smoke.out.trim() == "9", "shoal help smoke example failed: {shoal_smoke.err}")
+let sandbox_smoke = run(bin_dir.join("shoal-sandbox-exec"), "--", "/bin/true")
+assert(sandbox_smoke.ok, "sandbox help smoke example failed: {sandbox_smoke.err}")
+
+let isolated_removed = (rm --permanent --recursive (isolated))
+assert(isolated_removed.ok, "cannot remove isolated help-audit home: {isolated_removed.err}")
+
+echo "help audit: {contracts.len()} executable/parser/man contracts, {command_contracts.len()} subcommands, {actions.len()} shoal actions, {companion_actions.len()} companion actions, zero-effect help, and hermetic smoke examples passed"

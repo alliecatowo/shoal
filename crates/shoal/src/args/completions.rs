@@ -1,130 +1,7 @@
 //! Shell completion generation from one bounded CLI vocabulary.
 
+use super::schema::{ActionSpec, COMMANDS, CommandSpec, OptionSpec, ROOT_OPTIONS};
 use std::fmt::Write as _;
-
-#[derive(Clone, Copy)]
-struct OptionSpec {
-    short: Option<&'static str>,
-    long: &'static str,
-    takes_value: bool,
-}
-
-#[derive(Clone, Copy)]
-struct CommandSpec {
-    name: &'static str,
-    usage: &'static str,
-    words: &'static [&'static str],
-    options: &'static [OptionSpec],
-}
-
-const HELP: OptionSpec = OptionSpec {
-    short: Some("-h"),
-    long: "--help",
-    takes_value: false,
-};
-const ROOT_OPTIONS: &[OptionSpec] = &[
-    OptionSpec {
-        short: Some("-c"),
-        long: "--command",
-        takes_value: true,
-    },
-    OptionSpec {
-        short: None,
-        long: "--standalone",
-        takes_value: false,
-    },
-    HELP,
-    OptionSpec {
-        short: Some("-V"),
-        long: "--version",
-        takes_value: false,
-    },
-];
-const COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        name: "kernel",
-        usage: super::KERNEL_USAGE,
-        words: &["start", "status", "stop"],
-        options: &[
-            OptionSpec {
-                short: None,
-                long: "--json",
-                takes_value: false,
-            },
-            HELP,
-        ],
-    },
-    CommandSpec {
-        name: "fmt",
-        usage: super::FMT_USAGE,
-        words: &[],
-        options: &[
-            OptionSpec {
-                short: None,
-                long: "--check",
-                takes_value: false,
-            },
-            HELP,
-        ],
-    },
-    CommandSpec {
-        name: "doctor",
-        usage: super::DOCTOR_USAGE,
-        words: &[],
-        options: &[
-            OptionSpec {
-                short: None,
-                long: "--json",
-                takes_value: false,
-            },
-            HELP,
-        ],
-    },
-    CommandSpec {
-        name: "lsp",
-        usage: super::LSP_USAGE,
-        words: &[],
-        options: &[HELP],
-    },
-    CommandSpec {
-        name: "mcp",
-        usage: super::MCP_USAGE,
-        words: &[],
-        options: &[HELP],
-    },
-    CommandSpec {
-        name: "completions",
-        usage: super::COMPLETIONS_USAGE,
-        words: &["bash", "zsh", "fish"],
-        options: &[HELP],
-    },
-    CommandSpec {
-        name: "prompt",
-        usage: super::PROMPT_USAGE,
-        words: &[
-            "explain",
-            "print",
-            "bench",
-            "left",
-            "right",
-            "continuation",
-            "transient",
-        ],
-        options: &[
-            OptionSpec {
-                short: None,
-                long: "--side",
-                takes_value: true,
-            },
-            OptionSpec {
-                short: None,
-                long: "--n",
-                takes_value: true,
-            },
-            HELP,
-        ],
-    },
-];
 
 pub(super) fn generate(shell: &str) -> Result<String, String> {
     match shell {
@@ -156,6 +33,10 @@ fn command_words(command: &CommandSpec) -> String {
         .join(" ")
 }
 
+fn action_words(action: &ActionSpec) -> String {
+    option_words(action.options)
+}
+
 fn root_words() -> String {
     COMMANDS
         .iter()
@@ -171,13 +52,33 @@ fn bash() -> String {
         root_words()
     );
     for command in COMMANDS {
-        writeln!(
-            script,
-            "    {}) words='{}' ;;",
-            command.name,
-            command_words(command)
-        )
-        .unwrap();
+        if command.actions.is_empty() {
+            writeln!(
+                script,
+                "    {}) words='{}' ;;",
+                command.name,
+                command_words(command)
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                script,
+                "    {}) case \"${{COMP_WORDS[2]}}\" in",
+                command.name
+            )
+            .unwrap();
+            for action in command.actions {
+                writeln!(
+                    script,
+                    "      {}) words='{}' ;;",
+                    action.name,
+                    action_words(action)
+                )
+                .unwrap();
+            }
+            writeln!(script, "      *) words='{}' ;;", command_words(command)).unwrap();
+            script.push_str("    esac ;;\n");
+        }
     }
     script.push_str(
         "  esac\n  COMPREPLY=( $(compgen -W \"$words\" -- \"$cur\") )\n}\ncomplete -F _shoal shoal\n",
@@ -200,20 +101,44 @@ fn zsh() -> String {
             .join(" ")
     );
     for command in COMMANDS {
-        writeln!(
-            script,
-            "  {}) _values 'argument' {} ;;",
-            command.name,
-            command_words(command)
-        )
-        .unwrap();
+        if command.actions.is_empty() {
+            writeln!(
+                script,
+                "  {}) _values 'argument' {} ;;",
+                command.name,
+                command_words(command)
+            )
+            .unwrap();
+        } else {
+            writeln!(script, "  {}) case $words[3] in", command.name).unwrap();
+            for action in command.actions {
+                writeln!(
+                    script,
+                    "    {}) _values 'option' {} ;;",
+                    action.name,
+                    action_words(action)
+                )
+                .unwrap();
+            }
+            writeln!(
+                script,
+                "    *) _values 'argument' {} ;;",
+                command_words(command)
+            )
+            .unwrap();
+            script.push_str("  esac ;;\n");
+        }
     }
     script.push_str("esac\n");
     script
 }
 
 fn zsh_option(option: &OptionSpec) -> String {
-    let suffix = if option.takes_value { ":value:" } else { "" };
+    let suffix = if option.value.is_some() {
+        ":value:"
+    } else {
+        ""
+    };
     match option.short {
         Some(short) => format!("'{{{short},{}}}{suffix}'", option.long),
         None => format!("'{}{suffix}'", option.long),
@@ -229,8 +154,7 @@ fn fish() -> String {
         writeln!(
             script,
             "complete -c shoal -n '__fish_use_subcommand' -a '{}' -d '{}'",
-            command.name,
-            command.usage.lines().next().unwrap_or(command.name)
+            command.name, command.summary
         )
         .unwrap();
         for word in command.words {
@@ -244,8 +168,29 @@ fn fish() -> String {
         for option in command.options {
             fish_option(&mut script, option, Some(command.name));
         }
+        for action in command.actions {
+            for option in action.options {
+                fish_action_option(&mut script, option, command.name, action.name);
+            }
+        }
     }
     script
+}
+
+fn fish_action_option(script: &mut String, option: &OptionSpec, command: &str, action: &str) {
+    write!(
+        script,
+        "complete -c shoal -n '__fish_seen_subcommand_from {command}; and __fish_seen_subcommand_from {action}'"
+    )
+    .unwrap();
+    if let Some(short) = option.short {
+        write!(script, " -s {}", short.trim_start_matches('-')).unwrap();
+    }
+    write!(script, " -l {}", option.long.trim_start_matches("--")).unwrap();
+    if option.value.is_some() {
+        script.push_str(" -r");
+    }
+    script.push('\n');
 }
 
 fn fish_option(script: &mut String, option: &OptionSpec, command: Option<&str>) {
@@ -259,7 +204,7 @@ fn fish_option(script: &mut String, option: &OptionSpec, command: Option<&str>) 
         write!(script, " -s {}", short.trim_start_matches('-')).unwrap();
     }
     write!(script, " -l {}", option.long.trim_start_matches("--")).unwrap();
-    if option.takes_value {
+    if option.value.is_some() {
         script.push_str(" -r");
     }
     script.push('\n');
@@ -291,6 +236,16 @@ mod tests {
                         option.long
                     );
                 }
+                for action in command.actions {
+                    for option in action.options {
+                        assert!(
+                            contains_option(&script, shell, option),
+                            "{shell} omitted {} {}",
+                            action.name,
+                            option.long
+                        );
+                    }
+                }
             }
             for option in ROOT_OPTIONS {
                 assert!(
@@ -305,11 +260,11 @@ mod tests {
     #[test]
     fn help_and_completion_share_the_same_root_schema() {
         for command in COMMANDS {
-            assert!(super::super::USAGE.contains(command.name));
+            assert!(super::super::schema::root_help().contains(command.name));
             assert!(command.usage.contains(&format!("shoal {}", command.name)));
         }
         for option in ROOT_OPTIONS {
-            assert!(super::super::USAGE.contains(option.long));
+            assert!(super::super::schema::root_help().contains(option.long));
         }
     }
 

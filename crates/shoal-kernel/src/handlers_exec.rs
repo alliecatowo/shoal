@@ -149,6 +149,7 @@ mod tests {
         let poisoner = kernel.clone();
         let thread = std::thread::spawn(move || {
             let _journal = poisoner
+                .persistence
                 .journal
                 .lock()
                 .expect("test lock should not be poisoned");
@@ -162,6 +163,7 @@ mod tests {
         assert_eq!(approval_error.code, INTERNAL_ERROR);
         assert_eq!(approval_error.data.unwrap()["subsystem"], "journal");
         kernel
+            .runtime
             .plans
             .transaction(|plans| {
                 assert!(matches!(
@@ -260,12 +262,17 @@ mod tests {
 
     #[test]
     fn failed_task_launch_releases_resources_even_if_registry_removal_is_unavailable() {
-        let kernel = Kernel::new();
-        kernel.tasks.configure(1);
+        let kernel = Kernel::builder()
+            .limits(Limits {
+                max_tasks_per_session: 1,
+                ..Limits::default()
+            })
+            .build()
+            .unwrap();
         let (session, _) = attached(&kernel, "spawn-cleanup");
         let owner = session.key.owner();
-        let active_slot = kernel.tasks.reserve(&owner).unwrap();
-        let (_task_id, task_ref) = kernel.tasks.allocate();
+        let active_slot = kernel.runtime.tasks.reserve(&owner).unwrap();
+        let (_task_id, task_ref) = kernel.runtime.tasks.allocate();
         let task = Arc::new(TaskEntry {
             task: task_ref.clone(),
             owner: owner.clone(),
@@ -286,8 +293,8 @@ mod tests {
             deadline_ms: None,
             deadline_exceeded: AtomicBool::new(false),
         });
-        kernel.tasks.insert_checked(task.clone()).unwrap();
-        kernel.tasks.poison_entries_for_test();
+        kernel.runtime.tasks.insert_checked(task.clone()).unwrap();
+        kernel.runtime.tasks.poison_entries_for_test();
 
         kernel.cleanup_failed_task_launch(&task_ref, &task);
 
@@ -297,6 +304,7 @@ mod tests {
         drop(inner);
         assert!(task.session_lease.lock().unwrap().is_none());
         let replacement = kernel
+            .runtime
             .tasks
             .reserve(&owner)
             .expect("direct cleanup must release the one active-task slot");
@@ -370,6 +378,7 @@ mod tests {
         );
 
         let rows = kernel
+            .persistence
             .journal
             .lock()
             .unwrap()

@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Compare two artifact inventories by path, size, and digest.
+
+assert(args.len() == 3, "usage: artifact-diff.shl BEFORE AFTER OUTPUT")
+let before_file = path(args[0].str())
+let after_file = path(args[1].str())
+let output = path(args[2].str())
+assert(before_file.is_file && after_file.is_file, "artifact inventory input is missing")
+let before = json.parse(before_file.read).files
+let after = json.parse(after_file.read).files
+let before_paths = before.map(.path)
+let after_paths = after.map(.path)
+let added = after.where(row => !(row.path in before_paths))
+let removed = before.where(row => !(row.path in after_paths))
+let changed = after.where(row => {
+  let old = before.find(candidate => candidate.path == row.path)
+  old != null && (old.sha256 != row.sha256 || old.bytes != row.bytes)
+})
+let report = {added: added, removed: removed, changed: changed, clean: added.is_empty() && removed.is_empty() && changed.is_empty()}
+json.stringify(report, pretty: true).save(output)
+echo "artifact diff: +{added.len()} -{removed.len()} ~{changed.len()}"

@@ -81,8 +81,12 @@ fn scope_effect(effect: &Effect, cwd: &Path) -> Effect {
         Effect::FsWrite { paths: requested } => Effect::FsWrite {
             paths: paths(requested),
         },
-        Effect::FsDelete { paths: requested } => Effect::FsDelete {
+        Effect::FsDelete {
+            paths: requested,
+            permanent,
+        } => Effect::FsDelete {
             paths: paths(requested),
+            permanent: *permanent,
         },
         other => other.clone(),
     }

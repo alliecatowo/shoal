@@ -409,21 +409,21 @@ fn unrepresentable_sequence_quarantines_instead_of_wrapping() {
 
 #[test]
 fn production_channel_locks_have_no_raw_panicking_access() {
-    let source = include_str!("../channels.rs");
-    let production = source
-        .split("#[cfg(test)]")
-        .next()
-        .expect("production source prefix");
-    for forbidden in [
-        ".lock().unwrap(",
-        ".lock().expect(",
-        ".wait(state).unwrap(",
-        ".wait_timeout(state, wait).unwrap(",
+    for (name, production) in [
+        ("runtime", include_str!("runtime.rs")),
+        ("bus", include_str!("bus.rs")),
     ] {
-        assert!(
-            !production.contains(forbidden),
-            "production channel synchronization contains `{forbidden}`"
-        );
+        for forbidden in [
+            ".lock().unwrap(",
+            ".lock().expect(",
+            ".wait(state).unwrap(",
+            ".wait_timeout(state, wait).unwrap(",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production channel {name} synchronization contains `{forbidden}`"
+            );
+        }
     }
     let evaluator_surface = include_str!("eval.rs");
     let registered = evaluator_surface

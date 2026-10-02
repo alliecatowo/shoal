@@ -30,6 +30,9 @@ shoal-proto = { path = "../shoal-proto" }
 shoal-journal = { version = "0.1.0", path = "../shoal-journal" }
 shoal-host = { path = "../shoal-host" }
 shoal-paths = { path = "../shoal-paths" }
+shoal-auth = { path = "../shoal-auth" }
+blake3 = "1.8.5"
+getrandom = "0.4.1"
 unicode-width = "0.2.2"
 
 [dev-dependencies]

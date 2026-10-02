@@ -3,7 +3,7 @@ use serde_json::{Value as Json, json};
 use shoal_proto::error_code::{INTERNAL_ERROR, UNKNOWN_TASK};
 use shoal_proto::{Ref, RpcError, TaskControls, TaskRecord};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub(crate) struct TaskEntry {
@@ -222,7 +222,7 @@ impl Drop for TaskWorkerGuard {
         }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.task.fail_worker_panic();
-            self.kernel.events.publish(
+            self.kernel.runtime.events.publish(
                 &self.task.owner,
                 &self.channel,
                 json!({
@@ -377,7 +377,7 @@ pub(crate) const RETENTION_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 pub(crate) struct TaskRegistry {
     entries: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     slots: Arc<SessionQuota>,
-    max_active_per_owner: AtomicUsize,
+    max_active_per_owner: usize,
     next_id: AtomicU64,
     quarantined: AtomicBool,
 }
@@ -387,21 +387,21 @@ impl TaskRegistry {
         Self {
             entries: Mutex::new(HashMap::new()),
             slots: Arc::new(SessionQuota::default()),
-            max_active_per_owner: AtomicUsize::new(max_active_per_owner),
+            max_active_per_owner,
             next_id: AtomicU64::new(1),
             quarantined: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn configure(&self, max_active_per_owner: usize) {
+    #[cfg(test)]
+    pub(crate) fn configured_max(&self) -> usize {
         self.max_active_per_owner
-            .store(max_active_per_owner, Ordering::Relaxed);
     }
 
     pub(crate) fn reserve(&self, owner: &OwnerKey) -> Result<QuotaPermit, RpcError> {
         self.slots.reserve(
             owner,
-            self.max_active_per_owner.load(Ordering::Relaxed),
+            self.max_active_per_owner,
             "tasks_per_session",
             "task",
         )

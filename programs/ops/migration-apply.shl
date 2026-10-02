@@ -1,0 +1,22 @@
+#!/usr/bin/env shoal
+# Apply the supported state migration into a new output file.
+
+assert(args.len() == 3, "usage: migration-apply.shl STATE PLAN OUTPUT")
+let input = path(args[0].str())
+let plan_file = path(args[1].str())
+let output = path(args[2].str())
+assert(input.is_file && plan_file.is_file, "migration input or plan is missing")
+assert(!output.exists, "migration output already exists: {output}")
+let state = json.parse(input.read)
+let plan = json.parse(plan_file.read)
+assert(plan.schema == 1 && plan.source_schema == state.schema, "migration plan does not match input")
+assert(plan.target_schema == 2, "unsupported migration target: {plan.target_schema}")
+let migrated = if (state.schema == 1) {
+  {schema: 2, items: state.entries, metadata: {migrated_from: 1}}
+} else {
+  state
+}
+json.stringify(migrated, pretty: true).save(output)
+let verified = json.parse(output.read)
+assert(verified.schema == 2 && verified.items != null, "migrated state is invalid")
+echo "migrated state schema {state.schema} -> {verified.schema}"

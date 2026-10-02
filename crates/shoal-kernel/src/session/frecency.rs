@@ -20,7 +20,7 @@ impl Kernel {
         authenticated_bearer: bool,
     ) -> (String, Option<PathBuf>, &'static str) {
         if local_human && trust == ConnectionTrust::EmbeddedHuman {
-            let root = self.state_dir.clone().unwrap_or_else(|| {
+            let root = self.persistence.state_dir.clone().unwrap_or_else(|| {
                 shoal_paths::ShoalPaths::discover()
                     .state_dir()
                     .to_path_buf()
@@ -46,6 +46,7 @@ impl Kernel {
         }
         let scope = hasher.finalize().to_hex().to_string();
         let path = self
+            .persistence
             .state_dir
             .as_ref()
             .map(|root| root.join("frecency").join(format!("{scope}.frecency")));

@@ -37,3 +37,29 @@ fn empty_override_uses_the_xdg_state_store() {
     assert!(output.status.success());
     assert!(state.join("shoal/tokens.json").is_file());
 }
+
+#[test]
+fn invalid_or_help_only_invocations_do_not_create_the_token_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("authority/tokens.json");
+    for arguments in [
+        vec!["list", "unexpected"],
+        vec!["revoke", "id", "unexpected"],
+        vec!["create", "agent:test", "--ttl", "0"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoal-token"))
+            .args(arguments)
+            .env("SHOAL_TOKEN_STORE", &store)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!store.exists(), "invalid input created the token store");
+    }
+    let help = Command::new(env!("CARGO_BIN_EXE_shoal-token"))
+        .args(["create", "--help"])
+        .env("SHOAL_TOKEN_STORE", &store)
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(!store.exists(), "help created the token store");
+}

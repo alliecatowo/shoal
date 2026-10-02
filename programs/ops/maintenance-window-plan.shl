@@ -1,0 +1,25 @@
+#!/usr/bin/env shoal
+# Schedule prioritized maintenance tasks inside a bounded time window.
+
+assert(args.len() == 3, "usage: maintenance-window-plan.shl TASKS WINDOW_MINUTES OUTPUT")
+let input = path(args[0].str())
+let window = args[1].str().parse_int()
+let output = path(args[2].str())
+assert(input.is_file && window > 0, "maintenance task input/window is invalid")
+let tasks = json.parse(input.read).sort_by(row => -row.priority)
+let invalid = tasks.where(row => row.minutes <= 0 || row.priority < 0)
+assert(invalid.is_empty(), "maintenance tasks are invalid: {invalid}")
+var used = 0
+var selected = []
+var deferred = []
+for task in tasks {
+  if (used + task.minutes <= window) {
+    selected = selected + [{name: task.name, start_minute: used, minutes: task.minutes}]
+    used += task.minutes
+  } else {
+    deferred = deferred + [task.name]
+  }
+}
+let report = {window_minutes: window, used_minutes: used, selected: selected, deferred: deferred}
+json.stringify(report, pretty: true).save(output)
+echo "scheduled {selected.len()} tasks in {used}/{window} minutes; deferred {deferred.len()}"

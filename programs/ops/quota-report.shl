@@ -1,0 +1,18 @@
+#!/usr/bin/env shoal
+# Classify resource consumption against warning and hard quota thresholds.
+
+assert(args.len() == 2, "usage: quota-report.shl RESOURCES OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "resource usage input is missing: {input}")
+let resources = json.parse(input.read)
+let invalid = resources.where(row => row.limit <= 0 || row.used < 0 || row.warn_percent <= 0 || row.warn_percent > 100)
+assert(invalid.is_empty(), "resource quota rows are invalid: {invalid}")
+let rows = resources.map(row => {
+  let percent = (row.used * 100.0) / row.limit
+  let state = if (row.used > row.limit) { "exceeded" } else if (percent >= row.warn_percent) { "warning" } else { "ok" }
+  {name: row.name, used: row.used, limit: row.limit, percent: percent, state: state}
+})
+let report = {resources: rows, exceeded: rows.where(.state == "exceeded").map(.name).sort(), warnings: rows.where(.state == "warning").map(.name).sort()}
+json.stringify(report, pretty: true).save(output)
+echo "quota report: {report.exceeded.len()} exceeded, {report.warnings.len()} warning"

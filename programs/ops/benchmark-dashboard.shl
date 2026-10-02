@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Render benchmark comparison data as a human-readable Markdown dashboard.
+
+assert(args.len() == 2, "usage: benchmark-dashboard.shl COMPARISON OUTPUT")
+let comparison_file = path(args[0].str())
+let output = path(args[1].str())
+assert(comparison_file.is_file, "benchmark comparison is missing: {comparison_file}")
+let comparison = json.parse(comparison_file.read)
+let rows = comparison.benchmarks
+var document = "# Benchmark dashboard\n\n"
+document += "Regression budget: {comparison.budget_percent}%\n\n"
+document += "| benchmark | baseline ms | current ms | change % | status |\n"
+document += "|---|---:|---:|---:|---|\n"
+for row in rows {
+  let status = if (row.regression) { "REGRESSION" } else { "ok" }
+  document += "| {row.name} | {row.baseline_ms} | {row.current_ms} | {row.change_percent} | {status} |\n"
+}
+document += "\nRegressions: {comparison.regressions.len()} of {rows.len()}\n"
+document.save(output)
+assert(output.read.contains("| benchmark |"), "benchmark dashboard is malformed")
+echo "rendered benchmark dashboard for {rows.len()} cases"

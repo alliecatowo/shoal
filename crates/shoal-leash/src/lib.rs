@@ -60,6 +60,36 @@ opaque = "ask"
         assert_eq!(serde_json::from_str::<Effect>(&j).unwrap(), e);
     }
     #[test]
+    fn fs_delete_codec_is_backward_compatible_and_preserves_destructive_intent() {
+        let legacy = r#"{"kind":"fs_delete","paths":["/tmp/old"]}"#;
+        assert_eq!(
+            serde_json::from_str::<Effect>(legacy).unwrap(),
+            Effect::FsDelete {
+                paths: vec!["/tmp/old".into()],
+                permanent: false,
+            }
+        );
+
+        let recoverable = Effect::FsDelete {
+            paths: vec!["/tmp/recoverable".into()],
+            permanent: false,
+        };
+        let recoverable_json = serde_json::to_value(&recoverable).unwrap();
+        assert!(recoverable_json.get("permanent").is_none());
+
+        let destructive = Effect::FsDelete {
+            paths: vec!["/tmp/destructive".into()],
+            permanent: true,
+        };
+        let destructive_json = serde_json::to_value(&destructive).unwrap();
+        assert_eq!(destructive_json["kind"], "fs_delete");
+        assert_eq!(destructive_json["permanent"], true);
+        assert_eq!(
+            serde_json::from_value::<Effect>(destructive_json).unwrap(),
+            destructive
+        );
+    }
+    #[test]
     fn path_scope_does_not_allow_siblings_or_dotdot() {
         let p = policy();
         assert_eq!(
@@ -259,12 +289,73 @@ opaque = "ask"
                 Effect::Opaque,
                 Effect::FsDelete {
                     paths: vec!["/etc/passwd".into()],
+                    permanent: false,
                 },
             ],
             Reversibility::Unknown,
             Estimates::default(),
         );
         assert_eq!(p.evaluate_plan("agent", &plan), Verdict::Deny);
+    }
+    #[test]
+    fn permanent_delete_keeps_fs_grant_but_cannot_use_reversible_auto_apply() {
+        let p = policy();
+        let recoverable_effect = Effect::FsDelete {
+            paths: vec!["/work/generated/tmp/old".into()],
+            permanent: false,
+        };
+        let permanent_effect = Effect::FsDelete {
+            paths: vec!["/work/generated/tmp/old".into()],
+            permanent: true,
+        };
+        assert_eq!(
+            p.evaluate_effect("agent", &recoverable_effect),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.evaluate_effect("agent", &permanent_effect),
+            Verdict::Allow,
+            "delete mode must not silently introduce a different path capability"
+        );
+        assert_eq!(
+            p.evaluate_plan(
+                "agent",
+                &Plan::new(
+                    vec![recoverable_effect],
+                    Reversibility::Reversible,
+                    Estimates::default(),
+                ),
+            ),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.evaluate_plan(
+                "agent",
+                &Plan::new(
+                    vec![permanent_effect],
+                    Reversibility::Irreversible,
+                    Estimates::default(),
+                ),
+            ),
+            Verdict::ApprovalRequired
+        );
+        assert_eq!(
+            p.evaluate_plan(
+                "agent",
+                &Plan::new(
+                    vec![Effect::FsDelete {
+                        paths: vec!["/work/generated/tmp/old".into()],
+                        permanent: true,
+                    }],
+                    // Treat serialized/imported plans as hostile: even a
+                    // contradictory coarse label cannot auto-apply a
+                    // structurally destructive effect.
+                    Reversibility::Reversible,
+                    Estimates::default(),
+                ),
+            ),
+            Verdict::ApprovalRequired
+        );
     }
     #[test]
     fn enforcement_is_honest() {
@@ -392,6 +483,84 @@ opaque = "ask"
         assert!(sandbox.hermetic);
         assert_eq!(sandbox.net, NetPolicy::Deny);
         assert!(!policy.principal("agent").unwrap().is_fs_unrestricted());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_parent_grant_cannot_escape_through_a_child_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let allowed = fixture.path().join("allowed");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, allowed.join("escape")).unwrap();
+        let policy = Policy::from_toml(&format!(
+            "[principal.agent]\nauto_apply='in-grant'\n\
+             [principal.agent.fs]\nread=['{}/**']\n",
+            allowed.display()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate_effect(
+                "agent",
+                &Effect::FsRead {
+                    paths: vec![allowed.join("escape/secret")],
+                },
+            ),
+            Verdict::Deny,
+            "an existing symlink must not turn an allowed lexical subtree into outside authority",
+        );
+        assert_eq!(
+            policy.evaluate_effect(
+                "agent",
+                &Effect::FsRead {
+                    paths: vec![allowed.join("new-file")],
+                },
+            ),
+            Verdict::Allow,
+            "a not-yet-created child below the real allowed directory remains grantable",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_grant_has_one_canonical_meaning_in_policy_and_sandbox() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let link = fixture.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+        let policy = Policy::from_toml(&format!(
+            "[principal.agent]\nhermetic=true\nauto_apply='in-grant'\n\
+             [principal.agent.fs]\nread=['{}/**']\n",
+            link.display()
+        ))
+        .unwrap();
+
+        let through_link = Effect::FsRead {
+            paths: vec![link.join("child")],
+        };
+        let direct_target = Effect::FsRead {
+            paths: vec![target.join("child")],
+        };
+        assert_eq!(
+            policy.evaluate_effect("agent", &through_link),
+            Verdict::Allow
+        );
+        assert_eq!(
+            policy.evaluate_effect("agent", &direct_target),
+            Verdict::Allow
+        );
+        assert_eq!(
+            policy.sandbox_for("agent").unwrap().fs.read,
+            vec![std::fs::canonicalize(&target).unwrap()],
+            "the OS backend must receive the same canonical authority the semantic gate evaluates",
+        );
     }
 
     #[test]

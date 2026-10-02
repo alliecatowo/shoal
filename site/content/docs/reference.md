@@ -25,7 +25,7 @@ Use this page to find the authoritative chapter for a symbol or subsystem. It al
 | How does the interactive editor/session behave? | [Interactive shell](@/docs/repl.md) |
 | What does every `shoal` CLI form do? | [Command-line interface](@/docs/cli.md) |
 | How do I translate Bash/zsh/fish/Nushell habits? | [Migrating from traditional shells](@/docs/migration-from-shells.md) |
-| Show practical patterns. | [Recipes](@/docs/recipes.md) and the repository's executable `scripts/*.shl` operations programs |
+| Show practical patterns. | [Recipes](@/docs/recipes.md) and [operational programs](@/docs/operations-programs.md) |
 
 ### Language
 
@@ -52,6 +52,7 @@ Use this page to find the authoritative chapter for a symbol or subsystem. It al
 | Tool manifests/providers/locks/PATH/hermetic mode | [Reef tool resolution](@/docs/reef.md) |
 | Config discovery/precedence/editor/history/render/prompt | [Configuration and prompt](@/docs/configuration-prompt.md) |
 | Every configurable key chord/action | [Keybinding reference](@/docs/keybindings-reference.md) |
+| Backups, releases, migrations, benchmarks, and CI dogfood | [Operational programs](@/docs/operations-programs.md) |
 
 ### Agents and protocol
 
@@ -407,7 +408,10 @@ Derived effects/reversibility/estimates/verdict for source before spawn. Stored 
 
 ### Principal
 
-Identity attached to a kernel connection: token-supplied agent string or tokenless local `uid:<euid>`. Leash policy keys by principal.
+Identity attached to a kernel connection. A bearer selects its configured machine principal;
+tokenless public/MCP attachment is the restricted `agent:mcp` principal. Only the server-selected
+descriptor inherited by the private interactive REPL receives `uid:<euid>`/`local-human`. Leash
+policy keys by principal.
 
 ### PTY
 

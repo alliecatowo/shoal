@@ -96,7 +96,7 @@ impl Kernel {
                     && let Some(attachment) = attached.as_ref()
                     && let Err(error) = self.ensure_attachment_current(attachment)
                 {
-                    self.events.remove_conn(client);
+                    self.runtime.events.remove_conn(client);
                     *attached = None;
                     return Err(error);
                 }
@@ -215,6 +215,7 @@ impl Kernel {
             return Ok(());
         };
         let valid = self
+            .authority
             .auth
             .as_ref()
             .and_then(|store| store.lock().ok())

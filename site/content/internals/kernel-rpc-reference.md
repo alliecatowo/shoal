@@ -273,6 +273,13 @@ non-atomic spawn pinning, hermetic refusal, and spawn-time activation. Identical
 distinct and cannot overwrite one another; refs are still ephemeral object identifiers, not bearer
 capabilities.
 
+Filesystem-delete effects retain execution mode on the wire. Ordinary trash-backed `rm` and the
+source side of `mv` serialize as `{"kind":"fs_delete","paths":[...]}` and are reversible;
+`rm --permanent` adds `"permanent":true` and is irreversible. `plan.get`, `plan.list`, and
+MCP expose that stored effect unchanged. `plan.apply` reparses and re-derives the source, then
+requires the immutable binding (including delete mode) to match before execution. Both forms remain
+governed by the same `fs.delete` path capability.
+
 ### Run and approved modes
 
 Ordinary run derives a fresh plan and returns `LEASH_DENIED` or `APPROVAL_REQUIRED` before evaluation

@@ -7,21 +7,87 @@ let raw_lock_violations = kernel_sources.where((file) => (file.read.match(raw_lo
 assert(raw_lock_violations.is_empty(), "raw kernel lock unwraps bypass poison policy: {raw_lock_violations}")
 let rust_sources = glob("crates/**/*.rs").expand()
 let source_rows = rust_sources.map(file => ({path: file, lines: file.read.lines().len()}))
+let test_rows = source_rows
+  .where(row => row.path.name.ends_with("tests.rs") || row.path.display().contains("/tests/"))
 let production_oversized = source_rows
-  .where(row => !row.path.name.ends_with("tests.rs") && !row.path.display().contains("/benches/"))
+  .where(row => !row.path.name.ends_with("tests.rs") && !row.path.display().contains("/tests/") && !row.path.display().contains("/benches/"))
   .where(row => row.lines > 1200)
-let test_oversized = source_rows
-  .where(row => row.path.name.ends_with("tests.rs"))
-  .where(row => row.lines > 6000)
+let test_oversized = test_rows.where(row => row.lines > 1250)
+let kernel_test_oversized = test_rows
+  .where(row => row.path.display().contains("crates/shoal-kernel/"))
+  .where(row => row.lines > 1250)
+let kernel_production_oversized = source_rows
+  .where(row => row.path.display().contains("crates/shoal-kernel/src/") && !row.path.name.ends_with("tests.rs") && !row.path.display().contains("/tests/"))
+  .where(row => row.lines > 1050)
+let copy_production_oversized = source_rows
+  .where(row => row.path.display().contains("crates/shoal-eval/src/builtins/copy") && !row.path.display().contains("/tests/"))
+  .where(row => row.lines > 600)
+let protocol_surface_oversized = source_rows
+  .where(row => row.path.display() == "crates/shoal-proto/src/lib.rs" || row.path.display() == "crates/shoal-proto/src/protocol.rs")
+  .where(row => row.lines > 600)
+let eventbus_surface_oversized = source_rows
+  .where(row => row.path.display() == "crates/shoal-kernel/src/eventbus.rs" || row.path.display() == "crates/shoal-kernel/src/eventbus/handlers.rs")
+  .where(row => row.lines > 600)
+let wasm_surface_oversized = source_rows
+  .where(row => row.path.display() == "crates/shoal-wasm/src/lib.rs" || row.path.display() == "crates/shoal-wasm/src/host.rs" || row.path.display() == "crates/shoal-wasm/src/state.rs")
+  .where(row => row.lines > 600)
+let eval_journal_surface_oversized = source_rows
+  .where(row => !row.path.name.ends_with("tests.rs") && !row.path.display().contains("/tests/"))
+  .where(row => row.path.display() == "crates/shoal-eval/src/journal.rs" || row.path.display().contains("crates/shoal-eval/src/journal/"))
+  .where(row => row.lines > 600)
+let value_ports_surface_oversized = source_rows
+  .where(row => row.path.display() == "crates/shoal-value/src/ports.rs" || row.path.display() == "crates/shoal-value/src/ports/filesystem.rs" || row.path.display() == "crates/shoal-value/src/ports/std_fs.rs" || row.path.display() == "crates/shoal-value/src/ports/runtime.rs")
+  .where(row => row.lines > 600)
+let evaluator_security_surface_oversized = source_rows
+  .where(row => row.path.display().starts_with("crates/shoal-eval/src/channels") || row.path.display().starts_with("crates/shoal-eval/src/reef_builtins") || row.path.display().starts_with("crates/shoal-leash/src/policy"))
+  .where(row => !row.path.display().contains("/tests/"))
+  .where(row => row.lines > 600)
+let installer_transaction_oversized = source_rows
+  .where(row => row.path.display().contains("crates/shoal-installer/src/transaction/") && !row.path.name.ends_with("tests.rs") && !row.path.display().contains("/tests/"))
+  .where(row => row.lines > 600)
+let removal_tree_oversized = source_rows
+  .where(row => row.path.display().contains("crates/shoal-value/src/ports/removal_tree/") && !row.path.name.ends_with("tests.rs") && !row.path.display().contains("/tests/"))
+  .where(row => row.lines > 600)
 assert(production_oversized.is_empty(), "production Rust files exceed 1200 lines: {production_oversized}")
-assert(test_oversized.is_empty(), "Rust test modules exceed 6000 lines: {test_oversized}")
-let shell_files = run("git", "ls-files", "*.sh").out.str().lines()
+assert(test_oversized.is_empty(), "Rust test files exceed 1250 lines: {test_oversized}")
+assert(kernel_test_oversized.is_empty(), "kernel Rust test files exceed 1250 lines: {kernel_test_oversized}")
+assert(kernel_production_oversized.is_empty(), "kernel production files exceed 1050 lines: {kernel_production_oversized}")
+assert(copy_production_oversized.is_empty(), "copy production modules exceed 600 lines: {copy_production_oversized}")
+assert(protocol_surface_oversized.is_empty(), "protocol surface modules exceed 600 lines: {protocol_surface_oversized}")
+assert(eventbus_surface_oversized.is_empty(), "event-bus surface modules exceed 600 lines: {eventbus_surface_oversized}")
+assert(wasm_surface_oversized.is_empty(), "WASM surface modules exceed 600 lines: {wasm_surface_oversized}")
+assert(eval_journal_surface_oversized.is_empty(), "evaluator journal modules exceed 600 lines: {eval_journal_surface_oversized}")
+assert(value_ports_surface_oversized.is_empty(), "value port surface modules exceed 600 lines: {value_ports_surface_oversized}")
+assert(evaluator_security_surface_oversized.is_empty(), "evaluator/security architecture modules exceed 600 lines: {evaluator_security_surface_oversized}")
+assert(installer_transaction_oversized.is_empty(), "installer transaction modules exceed 600 lines: {installer_transaction_oversized}")
+assert(removal_tree_oversized.is_empty(), "recursive-removal modules exceed 600 lines: {removal_tree_oversized}")
+let kernel_main = path("crates/shoal-kernel/src/main.rs").read
+assert(kernel_main.contains("Kernel::builder()"), "the daemon must use the public composition builder")
+assert(kernel_main.contains(".limits(limits)"), "the daemon must configure quotas before construction")
+assert(kernel_main.contains(".listener_security(args.require_token, args.require_peer_uid)"), "the daemon must configure listener authority before construction")
+let mutable_kernel_configuration = kernel_sources
+  .where(file => file.read.contains("fn configure_limits(") || file.read.contains("fn configure_listener_security("))
+assert(mutable_kernel_configuration.is_empty(), "post-construction kernel configuration APIs must not return: {mutable_kernel_configuration}")
+let shell_files = run("git", "ls-files", "*.sh", "*.bash", "*.zsh", "*.ksh", "*.fish").out.str().lines()
   .where(line => !line.is_empty() && path(line).exists)
 assert(shell_files.is_empty(), "repository-owned shell scripts remain: {shell_files}")
+let shell_shebangs_result = run(
+  "git",
+  "grep",
+  "-I",
+  "-l",
+  "-E",
+  '^#![[:space:]]*((/usr/bin/env[[:space:]]+)(sh|bash|zsh|ksh|fish)|(/usr)?/bin/(sh|bash|zsh|ksh|fish))([[:space:]]|$)',
+  "--",
+  ".",
+)
+assert(shell_shebangs_result.status in [0, 1], "tracked interpreter audit failed: {shell_shebangs_result.stderr}")
+let shell_shebangs = shell_shebangs_result.stdout.str().lines().where(line => !line.is_empty())
+assert(shell_shebangs.is_empty(), "tracked files retain a foreign shell interpreter: {shell_shebangs}")
 
-let workflows = glob(".github/workflows/*.yml", hidden: true).expand()
+let workflows = (glob(".github/workflows/*.yml", hidden: true).expand() + glob(".github/workflows/*.yaml", hidden: true).expand()).sort()
 let workflow_lines = workflows.flat_map(file => file.read.lines().map(line => "{file}:{line.trim()}"))
-let shell_blocks = workflow_lines.where(line => line.contains("run: |") || line.contains("run: >") || line.contains("shell: bash") || line.contains("shell: sh"))
+let shell_blocks = workflow_lines.where(line => line.contains("run: |") || line.contains("run: >") || line.contains("shell: bash") || line.contains("shell: sh") || line.contains("shell: zsh") || line.contains("shell: ksh") || line.contains("shell: fish"))
 assert(shell_blocks.is_empty(), "workflow shell blocks remain: {shell_blocks}")
 let raw_runs = workflow_lines.where(.contains(":run: "))
 let foreign_runs = raw_runs.where(line => !line.contains("run: cargo build -p shoal --locked") && !line.contains("run: target/debug/shoal "))
@@ -31,4 +97,28 @@ let mise = path("mise.toml").read
 assert(mise.contains('run = "cargo build --workspace --release --locked"'), "release bootstrap must build the same workspace artifact set the installer copies")
 assert(!mise.contains("cargo build -p shoal --release"), "package-only release bootstrap can swap target/release artifacts after installation")
 
+let copy_inventory = path("crates/shoal-eval/src/builtins/copy/plan.rs").read
+assert(copy_inventory.contains("open_copy_source(source)"), "copy inventory must pin each source before effects")
+assert(copy_inventory.contains("open_copy_destination(destination)"), "copy inventory must pin each destination route before effects")
+assert(copy_inventory.contains("children_limited("), "recursive copy inventory must remain bounded during traversal")
+let copy_admission = path("crates/shoal-eval/src/builtins/copy/admission.rs").read
+assert(copy_admission.contains("validate_destination_job_conflicts"), "copy admission must reject overlapping or aliased destination jobs")
+assert(copy_admission.contains("retained_size("), "copy admission must retain its byte-budget measurement")
+let copy_execution = path("crates/shoal-eval/src/builtins/copy/execution.rs").read
+assert(copy_execution.contains(".copy_from(source.as_ref(), permissions)"), "copy execution must consume retained source and target capabilities")
+assert(!copy_execution.contains("fs.create_dir_all(&destination)"), "copy execution must create destinations through retained fd-relative targets")
+assert(!copy_execution.contains("fs.set_permissions(&destination"), "copy execution must apply modes through retained destination descriptors")
+assert(!copy_execution.contains(".copy_to(&destination"), "copy execution must not reopen destination leaves by pathname")
+let copy_source = path("crates/shoal-value/src/ports/copy_source.rs").read
+let copy_source_production = copy_source.split("    #[cfg(test)]").first()
+assert(!copy_source_production.contains("OpenOptions::new()"), "copy sources must write only into already-opened destination capabilities")
+let copy_path_policy = path("crates/shoal-eval/src/builtins/copy/path_policy.rs").read
+assert(!copy_path_policy.contains("canonicalize(source)"), "copy containment must derive source identity/path from the retained descriptor")
+let copy_destination = path("crates/shoal-value/src/ports/copy_destination.rs").read
+assert(copy_destination.contains("libc::mkdirat"), "copy destination creation must remain fd-relative")
+assert(copy_destination.contains("libc::RENAME_NOREPLACE"), "missing copy leaves require atomic no-replace publication")
+assert(copy_destination.contains("libc::RENAME_EXCHANGE"), "existing copy leaves require identity-verifiable atomic exchange")
+
+run("scripts/authority-doc-audit.shl")
+run("scripts/release-provenance-audit.shl")
 echo "source audit: {kernel_sources.len()} kernel files, {rust_sources.len()} Rust files, {workflows.len()} Shoal-driven workflows"

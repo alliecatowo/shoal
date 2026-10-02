@@ -1,0 +1,23 @@
+#!/usr/bin/env shoal
+# Balance test cases across a fixed number of shards using estimated duration.
+
+assert(args.len() == 3, "usage: test-shard-plan.shl TESTS SHARD_COUNT OUTPUT")
+let input = path(args[0].str())
+let shard_count = args[1].str().parse_int()
+let output = path(args[2].str())
+assert(input.is_file, "test inventory is missing: {input}")
+assert(shard_count >= 1 && shard_count <= 64, "shard count must be between 1 and 64")
+let tests = json.parse(input.read).sort_by(row => -row.estimated_ms)
+var shards = (0..shard_count).map(index => ({index: index, estimated_ms: 0, tests: []}))
+assert(shards.len() == shard_count, "range construction produced the wrong shard count")
+for test in tests {
+  let target = shards.sort_by(.estimated_ms).first()
+  shards = shards.map(shard => if (shard.index == target.index) {
+    {index: shard.index, estimated_ms: shard.estimated_ms + test.estimated_ms, tests: shard.tests + [test.name]}
+  } else { shard })
+}
+let assigned = shards.flat_map(.tests)
+assert(assigned.len() == tests.len() && assigned.uniq().len() == tests.len(), "test shard plan lost or duplicated cases")
+let report = {shards: shards.sort_by(.index), tests: tests.len(), estimated_total_ms: tests.map(.estimated_ms).sum()}
+json.stringify(report, pretty: true).save(output)
+echo "balanced {tests.len()} tests across {shard_count} shards"

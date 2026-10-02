@@ -41,8 +41,9 @@ mod task;
 mod value_types;
 
 pub use ports::{
-    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, FsEntryIdentity, FsFileSnapshot, Opener,
-    ReadSeek, SecretPort, StdClock, StdFs, StdOpener,
+    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, FsCopyChild, FsCopyDestination, FsCopySource,
+    FsCopyTarget, FsEntryIdentity, FsFileSnapshot, FsRemovalTree, Opener, ReadSeek, SecretPort,
+    StdClock, StdFs, StdOpener,
 };
 
 pub use env::{AssignError, Binding, Env};

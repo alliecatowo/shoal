@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use shoal_kernel::Kernel;
 use shoal_leash::Policy;
 use shoal_mcp::{Config, Facade};
-use shoal_proto::error_code::NOT_ATTACHED;
+use shoal_proto::error_code::{AUTH_FAILED, NOT_ATTACHED};
 use shoal_proto::{JSONRPC, RAW_PAGE_MAX_BYTES, Request, Response, write_frame};
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
@@ -67,7 +67,6 @@ impl LiveKernel {
             socket: self.socket.clone(),
             session: Some("default".into()),
             token: None,
-            local_auth: shoal_mcp::LocalAuthMode::RestrictedAgent,
         }
     }
 }
@@ -353,7 +352,8 @@ fn mcp_cancelled_task_reads_back_cancelled_not_completed() {
 
 /// site/content/internals/kernel-protocol.md, site/content/internals/language-conformance-contract.md: shoal's `rm` trashes (journaled, undo-recoverable
 /// via `apply`) rather than deleting outright, so `shoal_plan` must not
-/// flatly call it "irreversible" — but an opaque external `sh { rm -rf }`
+/// flatly call it "irreversible". Explicit `rm --permanent` must be reported
+/// irreversible, and an opaque external `sh { rm -rf }`
 /// (a structurally different effect, `Effect::Opaque`, never
 /// `Effect::FsDelete`) must never be reported reversible just because its
 /// source text also says "rm -rf".
@@ -372,6 +372,20 @@ fn mcp_shoal_plan_distinguishes_trash_rm_from_opaque_rm() {
     assert_eq!(
         plan["structuredContent"]["reversibility"], "reversible",
         "shoal's rm trashes (journaled undo); a plan for it must not read irreversible: {plan}"
+    );
+
+    let permanent_plan = call_tool(
+        &mut facade,
+        "shoal_plan",
+        json!({"src": format!("rm --permanent {}", doomed.display())}),
+    );
+    assert_eq!(
+        permanent_plan["structuredContent"]["reversibility"], "irreversible",
+        "explicit permanent deletion has no trash inverse: {permanent_plan}"
+    );
+    assert_eq!(
+        permanent_plan["structuredContent"]["effects"][0]["permanent"], true,
+        "MCP must preserve destructive intent in the structured effect: {permanent_plan}"
     );
 
     let opaque_plan = call_tool(
@@ -1029,6 +1043,57 @@ fn mcp_pty_list_and_resources_track_open_sessions() {
 // Workstream D — kernel attachment/authority contracts over the real socket.
 // site/content/internals/kernel-protocol.md / kernel-rpc-reference.md.
 // ---------------------------------------------------------------------------
+
+/// Public MCP has no human-presence assertion. The retired CLI flag fails
+/// before connection with migration guidance, and a hand-crafted wire request
+/// cannot bypass that client-side removal because the real kernel rejects it.
+/// A normal tokenless MCP config still attaches as the restricted agent.
+#[test]
+fn public_mcp_cannot_upgrade_to_local_human() {
+    let live = LiveKernel::start();
+
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_shoal-mcp"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(!help.contains("--local-human"), "{help}");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shoal-mcp"))
+        .args(["--socket", live.socket.to_str().unwrap(), "--local-human"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--local-human was removed"), "{stderr}");
+    assert!(stderr.contains("bearer token"), "{stderr}");
+    assert!(
+        stderr.contains("private interactive Shoal REPL"),
+        "{stderr}"
+    );
+
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let denied = raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({
+            "local_auth":"local-human",
+            "client":{"kind":"mcp","tty":false}
+        }),
+    );
+    let error = denied
+        .error
+        .expect("a public caller cannot assert human presence");
+    assert_eq!(error.code, AUTH_FAILED, "{error:?}");
+
+    let facade = Facade::connect(&live.config()).unwrap();
+    assert_eq!(facade.attachment()["auth_mode"], "restricted-agent");
+    assert_eq!(facade.attachment()["principal"], "agent:mcp");
+}
 
 /// HR-D4/HR-D8: `journal.query` requires an authenticated attachment. A fresh
 /// raw socket connection that never called `session.attach` must NOT be able to

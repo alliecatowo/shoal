@@ -1,0 +1,25 @@
+#!/usr/bin/env shoal
+# Score structured changes into an explicit release-risk report.
+
+assert(args.len() == 2, "usage: change-risk-report.shl CHANGES OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "change inventory is missing: {input}")
+let changes = json.parse(input.read)
+fn score(category) {
+  match category {
+    "security" => 5,
+    "breaking" => 5,
+    "feature" => 3,
+    "fix" => 2,
+    "documentation" => 1,
+    _ => 0,
+  }
+}
+let rows = changes.map(change => ({id: change.id, category: change.category, score: score(change.category)}))
+let unknown = rows.where(.score == 0)
+assert(unknown.is_empty(), "changes contain unknown risk categories: {unknown}")
+let total = rows.map(.score).sum()
+let report = {changes: rows.len(), score: total, level: if (total >= 10) { "high" } else if (total >= 5) { "medium" } else { "low" }, rows: rows}
+json.stringify(report, pretty: true).save(output)
+echo "release risk {report.level}: {total} points"

@@ -385,7 +385,7 @@ explicitly skipped with a reason.
 
 ### Current corpus state
 
-The 2026-07-18 observed result is 1,360 passed, 0 failed, and 4 skipped. The skips cover a native-thread
+The 2026-07-18 observed result is 1,375 passed, 0 failed, and 4 skipped across 1,379 cases. The skips cover a native-thread
 recursion-stack condition, a Node block, a jq feed composition, and full-chain Reef `which`. Counts
 are evidence from that run, not a permanently hardcoded health claim; release notes must run the
 corpus again.
@@ -393,7 +393,7 @@ corpus again.
 ### Exhaustive suite ledger
 
 Every suite is named below so a language area cannot disappear behind an aggregate count. Counts
-come from `[[case]]` records in the current tree and sum to 1,364. This table should eventually be
+come from `[[case]]` records in the current tree and sum to 1,379. This table should eventually be
 generated and checked in CI; until then, adding, renaming, or splitting a suite requires updating it.
 
 #### Core syntax, control flow, and diagnostics
@@ -436,10 +436,10 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `datetime-more.toml` | 9 | additional datetime arithmetic/parsing edges |
 | `datetime-relative.toml` | 10 | relative time anchors and duration composition |
 | `error-codes-2.toml` | 3 | follow-up stable error code cases |
-| `error-codes.toml` | 11 | representative stable runtime error taxonomy |
+| `error-codes.toml` | 12 | representative stable runtime error taxonomy |
 | `field-method-fallback.toml` | 16 | field lookup versus zero-arg method fallback |
 | `list-methods-2.toml` | 35 | extended list transformations and aggregates |
-| `list-methods-3.toml` | 14 | later list-method coverage |
+| `list-methods-3.toml` | 16 | later list-method coverage |
 | `list-record-error-boundaries.toml` | 14 | strict heterogeneous/list-record failure boundaries |
 | `literals.toml` | 48 | scalar, string, regex, size, duration, time, and collection literals |
 | `method-coercion-more.toml` | 44 | method argument coercion and type-specific dispatch |
@@ -471,7 +471,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `list-path-glob-binding.toml` | 4 | command parameter accumulation and glob/path binding |
 | `namespace-roundtrips-2.toml` | 8 | serialization namespace round trips |
 | `namespaces-more.toml` | 22 | additional structured namespace operations |
-| `namespaces.toml` | 77 | JSON/YAML/TOML/CSV/math/config namespace breadth |
+| `namespaces.toml` | 83 | JSON/YAML/TOML/CSV/math/config namespace breadth |
 | `os-namespace.toml` | 11 | environment/OS namespace reads and errors |
 | `path-field-accessors.toml` | 14 | pure and filesystem-backed path fields |
 | `path-fs-methods.toml` | 44 | path read/write/metadata/conversion methods |
@@ -486,7 +486,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `io.toml` | 14 | feed, shell blocks, runners, stdin/output boundaries |
 | `outcome-more.toml` | 4 | additional outcome fields/composition |
 | `outcome.toml` | 15 | status/signal/success/output and condition behavior |
-| `plan-effects.toml` | 16 | derived plan effects, reversibility, and estimates |
+| `plan-effects.toml` | 21 | derived plan effects, reversibility, and estimates |
 
 #### Reef
 
@@ -500,7 +500,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | Suite | Cases | Behavioral family |
 |---|---:|---|
 | `stream-sinks-more.toml` | 8 | save/feed/terminal sink extensions |
-| `streams-3.toml` | 2 | third-wave stream regressions |
+| `streams-3.toml` | 3 | third-wave stream regressions |
 | `streams-backpressure.toml` | 6 | boundedness, timeout, and pressure behavior |
 | `streams-more.toml` | 7 | additional transformations and consumption rules |
 | `streams.toml` | 45 | source/operator/sink baseline, lazy range expansion, bounded collection/fan-out, fairness, single consumption, bounded-history and unbounded-source errors |

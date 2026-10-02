@@ -19,7 +19,7 @@ still have different durability and backpressure properties.
 
 Sources: [`shoal-value/src/stream`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-value/src/stream),
 [`shoal-eval/src/streams.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/streams.rs) and its owned lossless-pump module `streams/buffer.rs`,
-[`channels.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/channels.rs), and
+[`channels.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/channels.rs) with its bounded `channels/{runtime,bus,eval}` owners, and
 [`methods/stream.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/methods/stream.rs).
 
 ## Core pull protocol

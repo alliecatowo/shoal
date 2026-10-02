@@ -150,6 +150,18 @@ const RM_FLAGS: &[CommandFlagSpec] = &[
         None,
         "Delete permanently instead of moving entries to Shoal trash.",
     ),
+    flag(
+        "expect-sha256",
+        &[],
+        Some("HEX"),
+        "Delete one permanent non-directory only when its SHA-256 digest matches HEX.",
+    ),
+    flag(
+        "expect-bytes",
+        &[],
+        Some("N"),
+        "Delete one permanent non-directory only when its byte length matches N.",
+    ),
 ];
 const LN_FLAGS: &[CommandFlagSpec] = &[flag(
     "symbolic",
@@ -637,8 +649,15 @@ const BUILTINS: &[BuiltinCommandSpec] = &[
         RM_FLAGS,
         &[],
         "A bounded list of removal reports.",
-        &["Directories require --recursive; protected/unsafe paths are rejected before mutation."],
-        ["rm old.log", "rm --recursive cache/"]
+        &[
+            "Directories require --recursive; protected/unsafe paths are rejected before mutation.",
+            "Conditional deletion requires --permanent, exactly one non-directory path, and both identity options."
+        ],
+        [
+            "rm old.log",
+            "rm --recursive cache/",
+            "rm --permanent --expect-sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --expect-bytes=8 cache.key"
+        ]
     ),
     spec!(
         "run",

@@ -1,0 +1,28 @@
+#!/usr/bin/env shoal
+# Enforce the minimum executable contract for each Reef adapter manifest.
+
+assert(args.len() == 2, "usage: adapter-conformance.shl DIRECTORY OUTPUT")
+let root = path(args[0].str())
+let output = path(args[1].str())
+assert(root.is_dir, "adapter directory is missing: {root}")
+let files = glob(root.join("*.toml").display()).expand().sort()
+let rows = files.map(file => {
+  let document = toml.parse(file.read)
+  let names = document.cmd.keys()
+  let command = if (names.len() == 1) { document.cmd[names.first()] } else { {} }
+  let command_keys = command.keys()
+  let binary = if ("bin" in command_keys) { command["bin"] } else { null }
+  let class = if ("class" in command_keys) { command["class"] } else { null }
+  let failures = [
+    if (names.len() != 1) { "expected exactly one cmd.NAME table" } else { null },
+    if (binary == null || binary.str().is_empty()) { "missing cmd.NAME.bin" } else { null },
+    if (!(class in ["cli", "daemon", "interpreter"])) { "invalid cmd.NAME.class" } else { null },
+    if (!("ok_codes" in command_keys)) { "missing cmd.NAME.ok_codes" } else { null },
+  ].where(item => item != null)
+  {file: file.name, adapter: names.first() ?? file.name, failures: failures, valid: failures.is_empty()}
+})
+let invalid = rows.where(row => !row.valid)
+let report = {checked: rows.len(), valid: rows.len() - invalid.len(), invalid: invalid}
+json.stringify(report, pretty: true).save(output)
+assert(invalid.is_empty(), "adapter conformance failures: {invalid}")
+echo "adapter conformance passed for {rows.len()} manifests"

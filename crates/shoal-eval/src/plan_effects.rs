@@ -7,12 +7,12 @@ use super::*;
 impl Evaluator {
     pub(crate) fn builtin_effects(&self, call: &CmdCall) -> VResult<Vec<Effect>> {
         let mut ps = Vec::new();
+        let mut options = true;
         for arg in &call.args {
-            if !matches!(
-                arg,
-                CmdArg::FlagLong { .. } | CmdArg::FlagShort { .. } | CmdArg::DashDash { .. }
-            ) {
-                ps.extend(self.plan_paths(arg)?);
+            match (options, arg) {
+                (true, CmdArg::DashDash { .. }) => options = false,
+                (true, CmdArg::FlagLong { .. } | CmdArg::FlagShort { .. }) => {}
+                (_, arg) => ps.extend(self.plan_paths(arg)?),
             }
         }
         let e = match call.head.as_str() {
@@ -58,10 +58,18 @@ impl Evaluator {
                     Effect::FsWrite { paths: vec![dst] },
                     Effect::FsDelete {
                         paths: ps[..ps.len() - 1].to_vec(),
+                        permanent: false,
                     },
                 ]
             }
-            "rm" => vec![Effect::FsDelete { paths: ps }],
+            "rm" => vec![Effect::FsDelete {
+                paths: ps,
+                permanent: call
+                    .args
+                    .iter()
+                    .take_while(|arg| !matches!(arg, CmdArg::DashDash { .. }))
+                    .any(|arg| matches!(arg, CmdArg::FlagLong { name, .. } if name == "permanent")),
+            }],
             "cd" | "j" | "jump" => vec![Effect::SessionWrite],
             _ => vec![],
         };
@@ -122,7 +130,13 @@ fn plan_text(arg: &CmdArg) -> VResult<String> {
             Expr::Int { value, .. } => Ok(value.to_string()),
             _ => Err(ErrorVal::arg_error("planning requires a literal argument")),
         },
-        _ => Err(ErrorVal::arg_error("planning requires a value argument")),
+        CmdArg::FlagLong { name, value, .. } => match value {
+            Some(value) => Ok(format!("--{name}={}", plan_text(value)?)),
+            None => Ok(format!("--{name}")),
+        },
+        CmdArg::FlagShort { chars, .. } => Ok(format!("-{chars}")),
+        CmdArg::DashDash { .. } => Ok("--".into()),
+        CmdArg::Dash { .. } => Ok("-".into()),
     }
 }
 /// Parse one declared adapter effect against the **full** effect vocabulary
@@ -170,7 +184,10 @@ pub(crate) fn parse_declared_effect(
     match kind {
         "fs.read" => vec![Effect::FsRead { paths: abs(values) }],
         "fs.write" => vec![Effect::FsWrite { paths: abs(values) }],
-        "fs.delete" => vec![Effect::FsDelete { paths: abs(values) }],
+        "fs.delete" => vec![Effect::FsDelete {
+            paths: abs(values),
+            permanent: false,
+        }],
         // A declared spawn (`proc.spawn(container)`) is name-only: the argument
         // is a description, not a locatable binary, so the hash stays empty
         // (matching the name-only fallback the adapter's own bin uses when it

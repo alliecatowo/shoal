@@ -1,0 +1,31 @@
+#!/usr/bin/env shoal
+# Select cache files for pruning until a byte budget is met.
+
+assert(args.len() == 3, "usage: cache-prune-plan.shl INVENTORY MAX_BYTES OUTPUT")
+let inventory_file = path(args[0].str())
+let max_bytes = args[1].str().parse_int()
+let output = path(args[2].str())
+assert(inventory_file.is_file, "cache inventory is missing: {inventory_file}")
+assert(max_bytes >= 0, "MAX_BYTES must be non-negative")
+let inventory = json.parse(inventory_file.read)
+assert(inventory.entries.all(row => row.bytes >= 0 && row.sha256.len() == 64), "cache inventory lacks strong file identities")
+let ranked = inventory.entries.sort_by(row => -row.bytes)
+var remaining = inventory.bytes
+var selected = []
+for file in ranked {
+  if (remaining > max_bytes) {
+    selected = selected + [file]
+    remaining -= file.bytes
+  }
+}
+let plan = {
+  schema: 2,
+  original_bytes: inventory.bytes,
+  target_bytes: max_bytes,
+  projected_bytes: remaining,
+  reclaim_bytes: inventory.bytes - remaining,
+  remove: selected,
+}
+assert(remaining <= max_bytes || selected.len() == ranked.len(), "prune planner stopped early")
+json.stringify(plan, pretty: true).save(output)
+echo "planned {selected.len()} cache removals reclaiming {plan.reclaim_bytes} bytes"

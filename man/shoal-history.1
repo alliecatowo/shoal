@@ -7,24 +7,79 @@ shoal-history \- query and maintain the Shoal journal
 .RI [ \-\-json ]
 .I command
 .RI [ options ]
+.SH DESCRIPTION
+Queries effect history and maintains the journal database and content-addressed storage.
+Without an explicit state directory it uses layered
+.B journal.state_dir
+configuration, then the shared XDG state root.
+If COMMAND is omitted,
+.B query
+is used.
 .SH COMMANDS
 .TP
 .B query
-Filter journal entries.
+Filter entries with
+.BR \-\-since ,
+.BR \-\-principal ,
+.BR \-\-kind ,
+.BR \-\-effects ,
+.BR \-\-head ,
+.BR \-\-status " ok|failed",
+and
+.BR \-\-limit .
 .TP
-.B show
-Show one entry.
+.BI show " ID"
+Show one entry and its recorded operations.
 .TP
-.BR pin , unpin
-Manage retained CAS objects.
+.BI pin " HASH"
+Retain a content-addressed object during collection.
+.TP
+.BI unpin " HASH"
+Release a retained content-addressed object.
 .TP
 .B gc
-Preview or apply storage collection.
+Preview collection; use
+.B \-\-ttl SECONDS
+and
+.B \-\-budget BYTES
+to select candidates, and
+.B \-\-apply
+to delete them.
 .TP
 .B status
-Report database and CAS use.
+Report journal database, WAL, spill, and CAS use and admission limits.
 .TP
-.B undo
-Apply recorded inverse operations.
+.BI undo " ID \-\-root PATH"
+Apply the entry's recorded inverse operations below the explicit containment root.
+.SH OPTIONS
+.TP
+.BI \-\-state-dir " PATH"
+Override configured and default state storage.
+.TP
+.B \-\-json
+Emit structured JSON for query, show, status, and undo.
+.TP
+.BR \-h , " \-\-help"
+Print complete command and filter help.
+.TP
+.BR \-V , " \-\-version"
+Print the version.
+.SH OUTPUT
+Query and show render human history by default; status renders storage totals.
+JSON mode emits stable structured records.
+GC always reports a JSON summary including whether it was a dry run.
+.SH ERRORS
+Malformed filters, missing values, invalid entry IDs, unknown hashes, missing undo roots,
+unknown commands, configuration errors, and journal failures are reported on standard error.
+.SH EXAMPLES
+.EX
+shoal-history query --status failed --limit 20
+shoal-history --json show 42
+shoal-history gc --ttl 604800 --budget 1073741824
+shoal-history gc --ttl 604800 --apply
+shoal-history undo 42 --root ./workspace
+.EE
+.SH EXIT STATUS
+Returns 0 on success, 1 for missing records and operational failures, and 2 for invalid arguments.
 .SH SEE ALSO
 .BR shoal (1)

@@ -1,0 +1,27 @@
+#!/usr/bin/env shoal
+# Convert Reef doctor findings into an explicit, reviewable repair plan.
+
+assert(args.len() == 2, "usage: reef-repair-plan.shl FINDINGS OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "Reef findings input is missing: {input}")
+let findings = json.parse(input.read)
+assert(findings.len() >= 0, "Reef findings must be a JSON sequence")
+let actionable = findings.where(row => row.status != "ok" && row.status != "shadowed")
+fn repair_action(status) {
+  match status {
+    "unlocked" => "lock",
+    "drift" => "relock",
+    "missing" => "install-and-lock",
+    "orphaned" => "remove-lock",
+    _ => "inspect",
+  }
+}
+let actions = actionable.map(row => ({
+  tool: row.name,
+  status: row.status,
+  action: repair_action(row.status),
+})).sort_by(.tool)
+let plan = {healthy: actions.is_empty(), findings: findings.len(), actions: actions, requires_confirmation: !actions.is_empty()}
+json.stringify(plan, pretty: true).save(output)
+echo "Reef repair plan contains {actions.len()} actions"

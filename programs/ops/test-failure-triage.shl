@@ -1,0 +1,18 @@
+#!/usr/bin/env shoal
+# Group failed test results by stable failure signature and owner.
+
+assert(args.len() == 2, "usage: test-failure-triage.shl RESULTS OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "test results are missing: {input}")
+let results = json.parse(input.read)
+let failures = results.where(.status == "failed")
+let groups = failures.group_by(.signature).map(group => ({
+  signature: group.key,
+  tests: group.values.map(.name).sort(),
+  owners: group.values.map(.owner).uniq().sort(),
+  count: group.values.len(),
+})).sort_by(row => -row.count)
+let report = {tests: results.len(), failures: failures.len(), groups: groups, healthy: failures.is_empty()}
+json.stringify(report, pretty: true).save(output)
+echo "triaged {failures.len()} failed tests into {groups.len()} signatures"

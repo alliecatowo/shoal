@@ -1,18 +1,44 @@
+const HELP: &str = "Diagnose the Shoal installation
+
+Usage:
+  shoal-doctor [--json]
+
+Options:
+  --json         Emit the complete machine-readable report
+  -h, --help     Print this help and exit
+  -V, --version  Print the version and exit
+
+Output:
+  A human checklist by default, or a JSON report containing every check and severity.
+
+Errors:
+  Failed checks remain in the report so one broken dependency does not hide later findings.
+
+Examples:
+  shoal-doctor
+  shoal-doctor --json
+
+Exit status:
+  0 when required checks pass; 1 when required checks fail; 2 for invalid arguments or rendering.";
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
-        println!("Diagnose the Shoal installation\n\nUsage: shoal-doctor [--json]");
+        println!("{HELP}");
         return;
     }
     if args.as_slice() == ["-V"] || args.as_slice() == ["--version"] {
         println!("shoal-doctor {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    if args.iter().any(|arg| arg != "--json") {
-        eprintln!("shoal-doctor: unexpected argument (try --help)");
-        std::process::exit(2);
-    }
-    let json = !args.is_empty();
+    let json = match args.as_slice() {
+        [] => false,
+        [argument] if argument == "--json" => true,
+        _ => {
+            eprintln!("shoal-doctor: expected one optional --json (try --help)");
+            std::process::exit(2);
+        }
+    };
     let report = shoal_doctor::run(&shoal_doctor::Options::from_env());
     if json {
         match serde_json::to_string_pretty(&report) {

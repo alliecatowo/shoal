@@ -817,6 +817,23 @@ flags  = { short = { s = "short" } }
     }
 
     #[test]
+    fn builtin_flag_candidates_come_from_typed_command_metadata() {
+        let completer = completer_at(Path::new("."));
+        let flags = completer.flag_candidates("rm", "--");
+        for expected in [
+            "--recursive",
+            "--permanent",
+            "--expect-sha256=",
+            "--expect-bytes=",
+        ] {
+            assert!(flags.iter().any(|flag| flag == expected), "{flags:?}");
+        }
+        let short = completer.flag_candidates("rm", "-");
+        assert!(short.iter().any(|flag| flag == "-r"));
+        assert!(short.iter().any(|flag| flag == "-R"));
+    }
+
+    #[test]
     fn callable_shadow_hides_adapter_flags_by_shared_precedence() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(

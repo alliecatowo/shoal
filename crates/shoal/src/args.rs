@@ -12,18 +12,8 @@ use crate::prompt;
 
 #[path = "args/completions.rs"]
 mod completions;
-
-pub(crate) const USAGE: &str = "Shoal language and interactive shell\n\nUsage: shoal [OPTIONS] [SCRIPT [ARGS...]]\n       shoal <COMMAND> [ARGS...]\n\nOptions:\n  -c, --command SOURCE  Evaluate source\n  --standalone          Run in-process without kernel protocol\n  -h, --help            Print help\n  -V, --version         Print version\n\nCommands:\n  kernel      Manage the resident kernel\n  fmt         Format .shl source\n  doctor      Diagnose the installation\n  lsp         Run the language server\n  mcp         Run the MCP server\n  completions Generate shell completions\n  prompt      Inspect and benchmark the prompt";
-pub(crate) const FMT_USAGE: &str = "Format Shoal source\n\nUsage: shoal fmt [--check] [FILE...]\n\nWith no files, reads standard input.";
-pub(crate) const DOCTOR_USAGE: &str =
-    "Diagnose the Shoal installation\n\nUsage: shoal doctor [--json]";
-pub(crate) const KERNEL_USAGE: &str =
-    "Manage the resident kernel\n\nUsage: shoal kernel <start|status|stop> [--json]";
-pub(crate) const LSP_USAGE: &str = "Run the language server\n\nUsage: shoal lsp";
-pub(crate) const MCP_USAGE: &str = "Run the MCP server\n\nUsage: shoal mcp";
-pub(crate) const COMPLETIONS_USAGE: &str =
-    "Generate shell completions\n\nUsage: shoal completions <bash|zsh|fish>";
-pub(crate) const PROMPT_USAGE: &str = "Inspect and benchmark the prompt\n\nUsage: shoal prompt <explain|print|bench> [--side SIDE] [--n N]\n\nSIDE is left, right, continuation, or transient.";
+#[path = "args/schema.rs"]
+mod schema;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KernelAction {
@@ -32,15 +22,69 @@ pub(crate) enum KernelAction {
     Stop { json: bool },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionMode {
+    Default,
+    Standalone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionSurface {
+    Interactive,
+    NonInteractive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionHost {
+    LocalEvaluator,
+    PrivateKernel,
+}
+
+/// Resolve CLI execution ownership in one place. Noninteractive invocations
+/// are deliberately local in both modes; `--standalone` is an explicit,
+/// idempotent choice there. Only an interactive default run may select the
+/// isolated private kernel, and only while `kernel.enabled` permits it.
+pub(crate) const fn execution_host(
+    mode: ExecutionMode,
+    surface: ExecutionSurface,
+    kernel_enabled: bool,
+) -> ExecutionHost {
+    if matches!(surface, ExecutionSurface::Interactive)
+        && matches!(mode, ExecutionMode::Default)
+        && kernel_enabled
+    {
+        ExecutionHost::PrivateKernel
+    } else {
+        ExecutionHost::LocalEvaluator
+    }
+}
+
 pub(crate) enum Action {
-    Command(String, Vec<OsString>),
-    Script(PathBuf, Vec<OsString>),
-    Stdin,
-    Interactive { standalone: bool },
-    Help(&'static str),
+    Command {
+        source: String,
+        args: Vec<OsString>,
+        mode: ExecutionMode,
+    },
+    Script {
+        path: PathBuf,
+        args: Vec<OsString>,
+        mode: ExecutionMode,
+    },
+    Stdin {
+        mode: ExecutionMode,
+    },
+    Interactive {
+        mode: ExecutionMode,
+    },
+    Help(String),
     Version,
-    Fmt { check: bool, files: Vec<PathBuf> },
-    Doctor { json: bool },
+    Fmt {
+        check: bool,
+        files: Vec<PathBuf>,
+    },
+    Doctor {
+        json: bool,
+    },
     Kernel(KernelAction),
     Companion(&'static str),
     Completions(String),
@@ -61,21 +105,53 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
         }
         standalone = true;
     }
+    let mode = if standalone {
+        ExecutionMode::Standalone
+    } else {
+        ExecutionMode::Default
+    };
     let Some(first) = iter.next() else {
         return Ok(if stdin_is_tty {
-            Action::Interactive { standalone }
+            Action::Interactive { mode }
         } else {
-            Action::Stdin
+            Action::Stdin { mode }
         });
     };
+    if standalone
+        && matches!(
+            first.to_str(),
+            Some(
+                "fmt"
+                    | "doctor"
+                    | "kernel"
+                    | "prompt"
+                    | "lsp"
+                    | "mcp"
+                    | "completions"
+                    | "-h"
+                    | "--help"
+                    | "-V"
+                    | "--version"
+            )
+        )
+    {
+        return Err(
+            "--standalone applies only to the interactive shell, -c, scripts, or stdin".into(),
+        );
+    }
     match first.to_str() {
         Some("fmt") => {
+            let args = iter.collect::<Vec<_>>();
+            if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+                return Ok(Action::Help(schema::command_help("fmt").unwrap()));
+            }
             let mut check = false;
             let mut files = vec![];
-            for a in iter {
-                if a == "-h" || a == "--help" {
-                    return Ok(Action::Help(FMT_USAGE));
-                } else if a == "--check" {
+            for a in args {
+                if a == "--check" {
+                    if check {
+                        return Err("--check may be specified only once".into());
+                    }
                     check = true
                 } else if a.to_str().is_some_and(|s| s.starts_with('-')) {
                     return Err(format!("unknown fmt option `{}`", a.to_string_lossy()));
@@ -88,14 +164,13 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
         Some("doctor") => {
             let args = iter.collect::<Vec<_>>();
             if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
-                return Ok(Action::Help(DOCTOR_USAGE));
+                return Ok(Action::Help(schema::command_help("doctor").unwrap()));
             }
-            if args.iter().any(|a| a != "--json") {
-                return Err("doctor accepts only --json".into());
+            match args.as_slice() {
+                [] => Ok(Action::Doctor { json: false }),
+                [flag] if flag == "--json" => Ok(Action::Doctor { json: true }),
+                _ => Err("doctor accepts one optional --json".into()),
             }
-            Ok(Action::Doctor {
-                json: !args.is_empty(),
-            })
         }
         Some("kernel") => {
             let args = iter
@@ -104,8 +179,14 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
                         .map_err(|_| "kernel arguments must be UTF-8".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if let [verb, flag] = args.as_slice()
+                && (flag == "-h" || flag == "--help")
+                && let Some(help) = schema::action_help("kernel", verb)
+            {
+                return Ok(Action::Help(help));
+            }
             if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
-                return Ok(Action::Help(KERNEL_USAGE));
+                return Ok(Action::Help(schema::command_help("kernel").unwrap()));
             }
             let (verb, rest) = args
                 .split_first()
@@ -125,16 +206,26 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
         }
         Some("prompt") => {
             let args = iter
-                .filter_map(|a| a.into_string().ok())
-                .collect::<Vec<_>>();
+                .map(|argument| {
+                    argument
+                        .into_string()
+                        .map_err(|_| "prompt arguments must be valid UTF-8".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if let [action, flag] = args.as_slice()
+                && (flag == "-h" || flag == "--help")
+                && let Some(help) = schema::action_help("prompt", action)
+            {
+                return Ok(Action::Help(help));
+            }
             if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
-                Ok(Action::Help(PROMPT_USAGE))
+                Ok(Action::Help(schema::command_help("prompt").unwrap()))
             } else {
                 Ok(Action::Prompt(prompt::parse_action(args.into_iter())?))
             }
         }
-        Some("lsp") => companion_or_help(iter, "shoal-lsp", LSP_USAGE),
-        Some("mcp") => companion_or_help(iter, "shoal-mcp", MCP_USAGE),
+        Some("lsp") => companion_or_help(iter, "shoal-lsp", "lsp"),
+        Some("mcp") => companion_or_help(iter, "shoal-mcp", "mcp"),
         Some("completions") => {
             let first = iter
                 .next()
@@ -142,7 +233,10 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
                 .into_string()
                 .map_err(|_| "shell name is not UTF-8")?;
             if first == "-h" || first == "--help" {
-                return no_trailing(iter, Action::Help(COMPLETIONS_USAGE));
+                return no_trailing(
+                    iter,
+                    Action::Help(schema::command_help("completions").unwrap()),
+                );
             }
             let shell = first;
             if iter.next().is_some() {
@@ -150,7 +244,7 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
             }
             Ok(Action::Completions(shell))
         }
-        Some("-h" | "--help") => no_trailing(iter, Action::Help(USAGE)),
+        Some("-h" | "--help") => no_trailing(iter, Action::Help(schema::root_help())),
         Some("-V" | "--version") => no_trailing(iter, Action::Version),
         Some("-c" | "--command") => {
             let source = iter
@@ -158,27 +252,44 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
                 .ok_or_else(|| "-c/--command requires source".to_string())?
                 .into_string()
                 .map_err(|_| "command source is not valid UTF-8".to_string())?;
-            Ok(Action::Command(source, iter.collect()))
+            Ok(Action::Command {
+                source,
+                args: iter.collect(),
+                mode,
+            })
         }
         Some("--") => {
             let path = iter
                 .next()
                 .ok_or_else(|| "-- must be followed by a script path".to_string())?;
-            Ok(Action::Script(path.into(), iter.collect()))
+            Ok(Action::Script {
+                path: path.into(),
+                args: iter.collect(),
+                mode,
+            })
         }
-        Some(s) if s.starts_with('-') => Err(format!("unknown option `{s}`\n\n{USAGE}")),
-        _ => Ok(Action::Script(first.into(), iter.collect())),
+        Some(s) if s.starts_with('-') => {
+            Err(format!("unknown option `{s}`\n\n{}", schema::root_help()))
+        }
+        _ => Ok(Action::Script {
+            path: first.into(),
+            args: iter.collect(),
+            mode,
+        }),
     }
 }
 
 fn companion_or_help(
     mut iter: impl Iterator<Item = OsString>,
     name: &'static str,
-    usage: &'static str,
+    command: &'static str,
 ) -> Result<Action, String> {
     match iter.next() {
         None => Ok(Action::Companion(name)),
-        Some(arg) if arg == "-h" || arg == "--help" => no_trailing(iter, Action::Help(usage)),
+        Some(arg) if arg == "-h" || arg == "--help" => no_trailing(
+            iter,
+            Action::Help(schema::command_help(command).expect("known companion command")),
+        ),
         Some(_) => Err("unexpected argument".into()),
     }
 }
@@ -252,15 +363,21 @@ mod tests {
 
     #[test]
     fn argument_modes_are_deterministic() {
-        assert!(USAGE.contains("--standalone          Run in-process without kernel protocol"));
-        assert!(!USAGE.contains("embedded kernel"));
+        let help = schema::root_help();
+        assert!(help.contains("--standalone"));
+        assert!(help.contains("Use local evaluation"));
+        assert!(!help.contains("embedded kernel"));
         assert!(matches!(
             parse_args(vec![], true).unwrap(),
-            Action::Interactive { standalone: false }
+            Action::Interactive {
+                mode: ExecutionMode::Default
+            }
         ));
         assert!(matches!(
             parse_args(vec!["--standalone".into()], true).unwrap(),
-            Action::Interactive { standalone: true }
+            Action::Interactive {
+                mode: ExecutionMode::Standalone
+            }
         ));
         assert!(matches!(
             parse_args(
@@ -268,19 +385,48 @@ mod tests {
                 true
             )
             .unwrap(),
-            Action::Command(_, _)
+            Action::Command {
+                mode: ExecutionMode::Standalone,
+                ..
+            }
         ));
         assert!(matches!(
             parse_args(vec!["--standalone".into(), "script.shl".into()], true).unwrap(),
-            Action::Script(_, _)
+            Action::Script {
+                mode: ExecutionMode::Standalone,
+                ..
+            }
         ));
         assert!(parse_args(vec!["--standalone".into(), "--standalone".into()], true).is_err());
-        assert!(matches!(parse_args(vec![], false).unwrap(), Action::Stdin));
+        assert!(matches!(
+            parse_args(vec![], false).unwrap(),
+            Action::Stdin {
+                mode: ExecutionMode::Default
+            }
+        ));
         assert!(matches!(
             parse_args(vec!["-c".into(), "1 + 1".into()], true).unwrap(),
-            Action::Command(_, _)
+            Action::Command {
+                mode: ExecutionMode::Default,
+                ..
+            }
         ));
+        assert_eq!(
+            execution_host(ExecutionMode::Default, ExecutionSurface::Interactive, true),
+            ExecutionHost::PrivateKernel
+        );
+        for mode in [ExecutionMode::Default, ExecutionMode::Standalone] {
+            assert_eq!(
+                execution_host(mode, ExecutionSurface::NonInteractive, true),
+                ExecutionHost::LocalEvaluator
+            );
+        }
         assert!(parse_args(vec!["--wat".into()], true).is_err());
+        let error = match parse_args(vec!["--standalone".into(), "doctor".into()], true) {
+            Err(error) => error,
+            Ok(_) => panic!("--standalone must not be ignored by a developer subcommand"),
+        };
+        assert!(error.contains("applies only"));
     }
 
     #[test]
@@ -301,11 +447,92 @@ mod tests {
             parse_args(vec!["doctor".into(), "--json".into()], true).unwrap(),
             Action::Doctor { json: true }
         ));
+        assert!(
+            parse_args(
+                vec!["doctor".into(), "--json".into(), "--json".into()],
+                true
+            )
+            .is_err()
+        );
         assert!(matches!(
             parse_args(vec!["lsp".into()], true).unwrap(),
             Action::Companion("shoal-lsp")
         ));
         assert!(completion_script("wat").is_err());
+    }
+
+    #[test]
+    fn canonical_schema_options_are_accepted_only_in_their_documented_scope() {
+        let root_cases = [
+            vec!["-h"],
+            vec!["--help"],
+            vec!["-V"],
+            vec!["--version"],
+            vec!["-c", "null"],
+            vec!["--command", "null"],
+            vec!["--standalone"],
+        ];
+        for case in root_cases {
+            assert!(
+                parse_args(case.into_iter().map(Into::into).collect(), true).is_ok(),
+                "root schema option was rejected"
+            );
+        }
+        for case in [
+            vec!["fmt", "--check", "fixture.shl"],
+            vec!["doctor", "--json"],
+            vec!["kernel", "start", "--json"],
+            vec!["kernel", "status", "--json"],
+            vec!["kernel", "stop", "--json"],
+            vec!["prompt", "explain", "--side", "right"],
+            vec!["prompt", "print", "--side", "transient"],
+            vec!["prompt", "bench", "--side", "left", "--n", "1"],
+            vec!["completions", "bash"],
+            vec!["completions", "zsh"],
+            vec!["completions", "fish"],
+        ] {
+            assert!(
+                parse_args(
+                    case.iter().map(|value| OsString::from(*value)).collect(),
+                    true
+                )
+                .is_ok(),
+                "schema invocation was rejected: {case:?}"
+            );
+        }
+        for invalid in [
+            vec!["kernel", "--json", "status"],
+            vec!["prompt", "explain", "--n", "1"],
+            vec!["prompt", "print", "--n", "1"],
+            vec!["doctor", "--json", "--json"],
+            vec!["lsp", "extra"],
+            vec!["mcp", "extra"],
+            vec!["completions", "zsh", "extra"],
+        ] {
+            assert!(
+                parse_args(
+                    invalid.iter().map(|value| OsString::from(*value)).collect(),
+                    true
+                )
+                .is_err(),
+                "out-of-scope argument was silently accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_rejects_non_utf8_arguments_instead_of_silently_dropping_them() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let error = match parse_args(
+            vec!["prompt".into(), std::ffi::OsString::from_vec(vec![0xff])],
+            true,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid prompt bytes must remain observable"),
+        };
+        assert!(error.contains("valid UTF-8"));
     }
 
     #[test]

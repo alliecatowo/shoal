@@ -1,0 +1,23 @@
+#!/usr/bin/env shoal
+# Validate, deduplicate, and sort a record dataset by stable identifier.
+
+assert(args.len() == 2, "usage: dataset-normalize.shl INPUT OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "dataset input is missing: {input}")
+let rows = json.parse(input.read)
+assert(rows.len() >= 0, "dataset input must be a JSON sequence")
+let invalid = rows.where(row => row.id == null || row.id.str().is_empty() || row.value == null)
+assert(invalid.is_empty(), "dataset contains invalid records: {invalid}")
+let duplicates = rows.group_by(row => row.id.str()).where(group => group.values.len() > 1)
+  .map(group => ({id: group.key, copies: group.values.len()}))
+let normalized = rows.group_by(row => row.id.str()).map(group => group.values.last()).sort_by(row => row.id.str())
+let report = {
+  schema: 1,
+  input_records: rows.len(),
+  output_records: normalized.len(),
+  duplicates: duplicates,
+  records: normalized,
+}
+json.stringify(report, pretty: true).save(output)
+echo "normalized {rows.len()} records to {normalized.len()} unique identifiers"

@@ -1,0 +1,26 @@
+#!/usr/bin/env shoal
+# Collect selected diagnostics into a portable incident-analysis bundle.
+
+assert(args.len() == 3, "usage: incident-bundle.shl LOG_DIRECTORY METADATA OUTPUT_DIRECTORY")
+let logs = path(args[0].str())
+let metadata_file = path(args[1].str())
+let output = path(args[2].str())
+assert(logs.is_dir && metadata_file.is_file, "incident inputs are missing")
+assert(!output.exists, "incident output already exists: {output}")
+let output_created = (mkdir (output))
+let logs_copied = (cp --recursive (logs) (output.join("logs")))
+let metadata_copied = (cp (metadata_file) (output.join("metadata.json")))
+let copied_logs = glob(output.join("logs/**/*").display(), hidden: true).expand().where(.is_file).sort()
+let prefix = "{output.abs().display()}/"
+let rows = copied_logs.map(file => ({path: file.abs().display().replace(prefix, ""), bytes: file.size / 1b}))
+let manifest = {
+  schema: 1,
+  created_by: "incident-bundle.shl",
+  log_files: rows.len(),
+  log_bytes: rows.map(.bytes).sum(),
+  metadata_bytes: output.join("metadata.json").size / 1b,
+  files: rows,
+}
+json.stringify(manifest, pretty: true).save(output.join("manifest.json"))
+assert(output.join("manifest.json").is_file, "incident manifest was not written")
+echo "created incident bundle with {rows.len()} logs"

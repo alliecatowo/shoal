@@ -14,7 +14,7 @@ toc = true
 
 Shoal is a substantial, working preview—not a production-hardened login shell or multi-tenant agent sandbox. The language, structured shell, adapters, Reef resolver, journal/undo, kernel, MCP tools/resources/events, PTYs, LSP, prompt, and configuration system all execute real code today. The current security model still requires a fully trusted local kernel socket, and several protocol/operational contracts need hardening before consequential unattended deployment.
 
-This page is dated because status prose goes stale. It was checked against the source tree and the 1,364-case conformance corpus on **2026-07-18**.
+This page is dated because status prose goes stale. It was checked against the source tree and the 1,379-case conformance corpus on **2026-07-18**.
 
 ## Readiness in one table
 
@@ -49,8 +49,8 @@ The documentation uses these labels:
 The language contract lives in `spec/cases/*.toml`:
 
 ```text
-1,364 cases
-1,360 passed
+1,379 cases
+1,375 active
 0 failed
 4 skipped
 ```

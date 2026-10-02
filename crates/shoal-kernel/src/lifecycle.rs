@@ -11,23 +11,23 @@ impl Kernel {
         Ok(json!({
             "pid": std::process::id(),
             "principal": attachment.principal,
-            "uptime_ms": self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            "durable": self.state_dir.is_some(),
-            "state_dir": self.state_dir.as_ref().map(|path| path.display().to_string()),
+            "uptime_ms": self.lifecycle.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            "durable": self.persistence.state_dir.is_some(),
+            "state_dir": self.persistence.state_dir.as_ref().map(|path| path.display().to_string()),
             "connections": {
-                "active": self.connections.active(),
-                "max": self.connections.max(),
+                "active": self.admission.connections.active(),
+                "max": self.admission.connections.max(),
             },
             "security": {
                 "epoch": ATTACH_SECURITY_EPOCH,
                 "connection_trust": attachment.connection_trust.as_str(),
                 "raw_local_human": attachment.connection_trust == ConnectionTrust::EmbeddedHuman,
                 "bearer_establishes_human_presence": false,
-                "public_token_required": self.require_public_token.load(Ordering::SeqCst),
-                "public_peer_uid_required": self.require_peer_uid.load(Ordering::SeqCst),
+                "public_token_required": self.authority.require_public_token.load(Ordering::SeqCst),
+                "public_peer_uid_required": self.authority.require_peer_uid.load(Ordering::SeqCst),
                 "machine_admin_credential_required": attachment.connection_trust == ConnectionTrust::Public,
             },
-            "shutdown_requested": self.shutdown_requested.load(Ordering::SeqCst),
+            "shutdown_requested": self.lifecycle.shutdown_requested.load(Ordering::SeqCst),
         }))
     }
 
@@ -43,7 +43,10 @@ impl Kernel {
                 data: Some(json!({"principal": attachment.principal})),
             });
         }
-        let already = self.shutdown_requested.swap(true, Ordering::SeqCst);
+        let already = self
+            .lifecycle
+            .shutdown_requested
+            .swap(true, Ordering::SeqCst);
         Ok(json!({"stopping": true, "already_requested": already}))
     }
 }

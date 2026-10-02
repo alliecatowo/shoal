@@ -9,6 +9,7 @@ use shoal_eval::Evaluator;
 use shoal_value::Env;
 
 use super::{parse_job_control, rewrite_fg};
+use crate::args::{ExecutionHost, ExecutionMode, ExecutionSurface};
 use crate::embedded_kernel::{EmbeddedKernelChild, EmbeddedKernelConfig};
 use crate::kernel_repl::{KernelRpc, ProtocolOutcome, ProtocolSession};
 use crate::repl_state::{ProtocolSnapshot, RemoteEnvMirror};
@@ -136,8 +137,11 @@ impl<R: KernelRpc> ReplProtocol for ProtocolSession<R> {
     }
 }
 
-pub(super) fn protocol_requested(standalone: bool, kernel_enabled: bool) -> bool {
-    !standalone && kernel_enabled
+pub(super) fn protocol_requested(mode: ExecutionMode, kernel_enabled: bool) -> bool {
+    matches!(
+        crate::args::execution_host(mode, ExecutionSurface::Interactive, kernel_enabled),
+        ExecutionHost::PrivateKernel
+    )
 }
 
 pub(super) fn execute_protocol_line(

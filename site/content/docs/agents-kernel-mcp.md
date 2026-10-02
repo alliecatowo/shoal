@@ -73,6 +73,18 @@ When the socket is absent, `shoal-mcp` best-effort starts a detached `shoal-kern
 
 Autostart failure is not swallowed as success. The facade attempts its normal connection after the bounded wait, and that connection error becomes the visible failure.
 
+Autostart's security defaults are deliberately layered:
+
+| Connection | Effective identity | Implicit Leash authority |
+| --- | --- | --- |
+| tokenless named/public socket | `agent:mcp`, `restricted-agent` | none |
+| bearer on named/public socket | token principal/profile | none; add that principal to policy |
+| inherited private REPL descriptor | `uid:<euid>`, `local-human` | permissive only when no policy was configured |
+
+The last row is not reachable through MCP's public socket. Saying that a zero-flag kernel
+“constructs a permissive policy” refers only to this private-human entry; it does not make a
+tokenless MCP agent permissive.
+
 Disable autostart when a service manager or operator owns lifecycle:
 
 ```bash
@@ -112,7 +124,28 @@ Limit flags cover connections, retained sessions, tasks per owner, PTYs per owne
 subscriptions per owner, CAS verification starts/window, and frame-read timeout. See the kernel
 protocol page for defaults and release/eviction semantics.
 
-On startup the process prints `shoal-kernel: ready PATH` to stderr. SIGINT/SIGTERM handling asks the serve loop to stop and the bound-socket guard removes the socket on normal teardown.
+Only after atomic socket publication succeeds does the process print `shoal-kernel: ready PATH` to
+stderr. SIGINT/SIGTERM handling asks the serve loop to stop; the bound-socket guard removes its exact
+published inode on normal teardown without deleting a pathname replacement.
+
+`shoal kernel start` is the managed operator path. When it creates a new daemon without an explicit
+`SHOAL_TOKEN`, it mints a per-socket `supervisor` bearer and records the one-time secret in an
+owner-only file below the Shoal state directory. The daemon inherits startup stderr only through its
+readiness announcement, then detaches it; this lets `run(shoal, "kernel", "start", "--json")` and
+other captured supervisors finish while retaining deterministic pre-listen diagnostics. Before it
+can bind the public socket, the child blocks on an inherited parent-death gate. The launcher first
+persists the exact child PID into the credential and then sends one release byte. If the launcher is
+killed before that commit, EOF makes the child revoke the unreleased bearer and exit without a
+socket; if another start replaced the credential, PID binding fails and the losing child is reaped.
+A per-socket lifecycle lock serializes the complete provision-through-readiness transaction; a
+waiting start re-probes after acquiring it and preserves an already-live winner's credential.
+A later
+`shoal kernel stop` validates that managed bearer and verifies the answering PID is the exact child
+recorded by the successful start handshake before requesting `kernel.shutdown`, revoking it, and
+removing the file. Credential I/O stays relative to a verified owner-only directory descriptor;
+removal first quarantines and validates the entry so a concurrent replacement is not unlinked.
+Setting `SHOAL_TOKEN` explicitly bypasses the managed credential. Tokenless public clients
+remain restricted `agent:mcp`; same-UID socket access alone never gains shutdown authority.
 
 ### Socket discovery
 
@@ -125,7 +158,14 @@ Kernel and MCP use the same order:
 
 The `$TMPDIR` fallback makes the default usable on macOS, where `XDG_RUNTIME_DIR` is commonly unset.
 
-The kernel creates an owned socket directory with mode `0700` and the socket file with mode `0600`. If an explicit socket lives under a shared directory the kernel does not own, it leaves that directory's permissions alone; the socket file is still the primary access boundary. A stale path is removed only when it is an unconnected socket owned by the effective user. The kernel refuses an active listener, an unowned socket, or a non-socket path.
+The kernel creates missing socket-directory components with mode `0700`, using retained directory
+descriptors and refusing symbolic-link components. It leaves every already-existing explicit/shared
+directory unchanged. The socket is bound below a private staging directory and made `0600` before
+atomic no-overwrite publication, so no broader umask-derived mode is ever visible at the public
+name. A current entry is quarantined before it is inspected or removed: an active listener, an
+unowned socket, or a non-socket entry is restored. Normal teardown similarly removes only the exact
+device/inode the kernel published and preserves a replacement. The socket file remains the primary
+access boundary, while a shared parent can still permit denial-of-service or path replacement.
 
 ### State directory
 
@@ -155,6 +195,12 @@ Environment equivalents:
 | `SHOAL_NO_AUTOSTART` | Nonempty disables detached kernel startup. |
 
 Flags overwrite environment-derived values. `shoal-mcp` speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and never writes protocol noise to stdout.
+
+There is deliberately no public local-human option. The retired `--local-human` flag exits with
+status 2 and migration guidance because a named socket cannot prove a human is present. Use a
+policy-scoped bearer token for an agent that needs selected effects. Use the ordinary private Shoal
+REPL for server-selected local-human authority; forwarding or possessing a named socket is never a
+substitute.
 
 The initialized MCP protocol version is `2025-06-18`. Advertised capabilities are tools and subscribable resources, with no dynamic list-change notifications.
 
@@ -289,6 +335,11 @@ The position distinction does not turn every syntactic statement into an express
 
 Planning parses source and derives concrete effect records without executing it:
 
+
+`shoal_plan` distinguishes recovery semantics as structured data: ordinary `rm` is trash-backed
+and reports `reversibility: "reversible"`, while `rm --permanent` includes
+`{"kind":"fs_delete", "permanent":true, ...}` and reports `"irreversible"`. MCP clients should
+use the structured effect and reversibility fields instead of inferring safety from source text.
 
 Plan references bind the full source/AST, effects, reversibility, estimates, principal, and Session through a full BLAKE3 digest, then add a monotonic per-kernel object suffix so storing identical content twice still creates two objects. Application rechecks the stored identity and source. `cap.request` requires an attachment; by default the requester cannot approve its own plan, and a distinct approver needs the embedded-human trust root or an explicit `supervisor`/`plan.approve` bearer. Plans remain ephemeral object handles rather than durable authorization tokens.
 

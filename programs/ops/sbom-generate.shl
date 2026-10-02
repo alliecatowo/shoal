@@ -1,0 +1,26 @@
+#!/usr/bin/env shoal
+# Convert Cargo metadata into a deterministic dependency component inventory.
+
+assert(args.len() == 2, "usage: sbom-generate.shl CARGO_METADATA OUTPUT")
+let metadata_file = path(args[0].str())
+let output = path(args[1].str())
+assert(metadata_file.is_file, "Cargo metadata input is missing: {metadata_file}")
+let metadata = json.parse(metadata_file.read)
+assert(metadata.packages != null, "Cargo metadata has no package list")
+let components = metadata.packages.map(package => ({
+  name: package.name,
+  version: package.version,
+  source: package.source ?? "workspace",
+  license: package.license ?? "NOASSERTION",
+})).sort_by(row => "{row.name}:{row.version}:{row.source}")
+let duplicate = components.group_by(row => "{row.name}:{row.version}:{row.source}")
+  .where(group => group.values.len() > 1).map(.key)
+assert(duplicate.is_empty(), "duplicate SBOM component identities: {duplicate}")
+let document = {
+  bom_format: "Shoal operational component inventory",
+  spec_version: 1,
+  components: components,
+  component_count: components.len(),
+}
+json.stringify(document, pretty: true).save(output)
+echo "generated SBOM inventory with {components.len()} components"

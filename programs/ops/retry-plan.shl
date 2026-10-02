@@ -1,0 +1,17 @@
+#!/usr/bin/env shoal
+# Select bounded retries from failed task outcomes and retry policy.
+
+assert(args.len() == 3, "usage: retry-plan.shl FAILURES MAX_ATTEMPTS OUTPUT")
+let input = path(args[0].str())
+let max_attempts = args[1].str().parse_int()
+let output = path(args[2].str())
+assert(input.is_file && max_attempts >= 1, "retry input or attempt bound is invalid")
+let failures = json.parse(input.read)
+let retryable_codes = ["timeout", "unavailable", "rate_limited"]
+let retry = failures.where(row => row.code in retryable_codes && row.attempts < max_attempts)
+  .map(row => ({task: row.task, next_attempt: row.attempts + 1, reason: row.code}))
+let exhausted = failures.where(row => row.code in retryable_codes && row.attempts >= max_attempts).map(.task).sort()
+let terminal = failures.where(row => !(row.code in retryable_codes)).map(.task).sort()
+let report = {max_attempts: max_attempts, retry: retry, exhausted: exhausted, terminal: terminal}
+json.stringify(report, pretty: true).save(output)
+echo "retry plan: {retry.len()} retry, {exhausted.len()} exhausted, {terminal.len()} terminal"

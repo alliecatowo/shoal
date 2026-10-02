@@ -28,7 +28,8 @@ Plans contain concrete effects from a closed enum:
 
 | Effect | Meaning |
 |---|---|
-| `FsRead`, `FsWrite`, `FsDelete` | access to named path sets |
+| `FsRead`, `FsWrite` | access to named path sets |
+| `FsDelete` | access to named paths plus `permanent`; absent/false is recoverable trash or a reversible move source, true is destructive deletion |
 | `ProcSpawn` | spawn identified by executable hash and `argv0` |
 | `NetConnect`, `NetListen` | outbound host/port or inbound port |
 | `EnvRead`, `EnvWrite` | session/process environment names |
@@ -40,6 +41,11 @@ Plans contain concrete effects from a closed enum:
 
 Every `Plan` also carries `Reversibility` (`Reversible`, `Irreversible`, or `Unknown`), optional byte
 and item estimates, and a stable `plan_ref` derived from canonical serialized contents.
+Recoverable `rm` and `mv` source removal are reversible. `rm --permanent` emits
+`fs_delete { permanent: true }` and is irreversible across evaluator records, kernel storage,
+`plan.get`/`plan.list`, and MCP output. The attribute does not create a broader policy capability:
+both modes are still evaluated against the same `fs.delete` path grant. Legacy serialized
+`fs_delete` effects without the attribute deserialize as recoverable deletes.
 
 ```mermaid
 flowchart LR
@@ -204,10 +210,10 @@ sandbox can enforce them:
 |---|---|---|
 | `shoal-value` `methods/path.rs::save` — value `.save`/`.append`, `save(path, value)` builtin | file write / append | `CallCtx::fs().write` / `.append` (HR-C1) |
 | `shoal-value` `methods/stream.rs::stream_save` — stream `.save`/`.append` | open-once incremental append | `CallCtx::fs().open_append` (HR-C2) |
-| `shoal-value` `ports.rs::StdFs` | every `std::fs` syscall | the port adapter itself — the boundary, not a bypass |
+| `shoal-value` `ports/std_fs.rs::StdFs` | every `std::fs` syscall | the port adapter itself — the boundary, not a bypass |
 | `shoal-eval` `path_access.rs::path_fs_method` — path `.read`/`.read_bytes`/`.lines`/`.exists`/`.is_dir`/`.is_file`/`.size`/`.modified` | bounded streaming read / stat | `self.fs.open_read` / `.metadata` |
 | `shoal-eval` `command.rs` redirects `>` and `>>` | file write / append | `self.fs.write` / `.append` |
-| `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*`; removal commits use `rename_if_unchanged` |
+| `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*`; recursive copy retains descriptor-budgeted `FsCopySource` and `FsCopyDestination`/`FsCopyTarget` capabilities from complete cross-job preflight through fd-relative creation, stable source streaming, and randomized conditional atomic publication; removal commits use `rename_if_unchanged`, and permanent trees use bounded `FsRemovalTree` capabilities |
 | `shoal-eval` `frecency.rs` dir-jump store load/save | read / write / rename | `self.fs.*` |
 | `shoal-eval` `journal.rs` undo snapshot + restore | bounded stable read | `self.fs.read_bounded_stable` |
 | `shoal-eval` `reef_builtins.rs` manifest read | stat / read | `self.fs.is_file` / `.read_to_string` |
@@ -221,6 +227,17 @@ adapter, so forgetting the wire is a compile error. The evaluator returns its `A
 (`set_fs`), and recording/denying tests prove scalar and stream saves reach that adapter end to end.
 Production hosts currently leave the evaluator on `StdFs`; this seam is not itself a Leash-backed
 in-process sandbox.
+
+`cp` deliberately has a stronger mutation contract than the compatibility `Fs::copy`,
+`create_dir_all`, and `set_permissions` methods. Its plan never calls those pathname operations:
+the standard adapter pins the deepest existing destination directory, admits every target route and
+existing identity, creates descendants relative to retained descriptors, writes regular files to a
+fresh sibling, and publishes with no-replace or exchange primitives. Exchange-based overwrite checks
+the displaced identity and link count and rolls back a mismatch. This closes destination-ancestor,
+final-symlink, replacement, and raced-hard-link truncation windows; adapters lacking equivalent
+primitives return `Unsupported` rather than degrading the guarantee. Root containment likewise uses
+the retained source descriptor path and retained destination route, avoiding a second canonicalize of
+an ambient source pathname.
 
 Child evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and `on` inherit
 the parent's Leash policy/principal, all ports (including `ConfigPort` and `WatchPort`), Reef state,
@@ -329,13 +346,14 @@ epoch deadline, cancellation, and two-second wall-time limits constrain invocati
 compilation is byte-capped but not epoch-interruptible. Treat every new hostcall as a new authority
 surface requiring canonical effects, scoped inputs, bounded transfer, and adversarial tests.
 
-## Fail-open local policy is a conscious risk
+## Missing local policy is a conscious permissive default
 
 `Policy::load_user_or_permissive` falls back to a permissive policy if the per-user policy is missing
-**or malformed**, so a syntax error does not brick an interactive shell. That is convenient for local
-humans and dangerous if callers assume malformed policy fails closed. Kernel startup with an
-explicit policy path uses the fallible loader instead. Any new agent host should choose and document
-its loader deliberately.
+so a first interactive shell is usable without configuration. A present-but-unreadable, malformed,
+oversized, or non-regular policy quarantines to deny-all; an explicit kernel policy path also fails
+startup on load error. The convenience fallback grants only the requested local-human principal,
+not tokenless `agent:mcp` or bearer principals. Any new host must choose and document both its loader
+and the connection identity that consumes the result.
 
 ## Review checklist for a new effect
 

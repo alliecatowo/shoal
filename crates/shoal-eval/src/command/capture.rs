@@ -41,6 +41,7 @@ impl Evaluator {
                 .expect("presence checked")
                 .cas(),
             hash: spill.hash.clone(),
+            len: spill.len,
             _lease: Some(lease),
         };
         Some(Arc::new(shoal_value::CasBytesVal {
@@ -99,7 +100,7 @@ impl Evaluator {
                     format!("no CAS blob for content ref {prefix}{hash}"),
                 )
             })?;
-        let loader = CasBytesLoader::new(journal.cas(), hash.to_string());
+        let loader = CasBytesLoader::new(journal.cas(), hash.to_string(), len);
         Ok(Value::CasBytes(Arc::new(shoal_value::CasBytesVal {
             hash: hash.to_string(),
             len,
@@ -123,14 +124,16 @@ impl Evaluator {
 pub(crate) struct CasBytesLoader {
     cas: shoal_journal::Cas,
     hash: String,
+    len: u64,
     _lease: Option<shoal_journal::PinLease>,
 }
 
 impl CasBytesLoader {
-    pub(crate) fn new(cas: shoal_journal::Cas, hash: String) -> Self {
+    pub(crate) fn new(cas: shoal_journal::Cas, hash: String, len: u64) -> Self {
         Self {
             cas,
             hash,
+            len,
             _lease: None,
         }
     }
@@ -138,10 +141,10 @@ impl CasBytesLoader {
 
 impl shoal_value::BytesLoad for CasBytesLoader {
     fn load(&self) -> std::io::Result<Vec<u8>> {
-        self.cas.read(&self.hash)
+        self.cas.read_exact(&self.hash, self.len)
     }
 
     fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
-        self.cas.open_verified(&self.hash)
+        self.cas.open_verified_exact(&self.hash, self.len)
     }
 }

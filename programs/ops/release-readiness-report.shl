@@ -1,0 +1,16 @@
+#!/usr/bin/env shoal
+# Turn named release checks into an auditable readiness decision.
+
+assert(args.len() == 2, "usage: release-readiness-report.shl CHECKS OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "release checks are missing: {input}")
+let checks = json.parse(input.read)
+let invalid = checks.where(row => row.name == null || !(row.status in ["pass", "fail", "waived"]))
+assert(invalid.is_empty(), "release checks contain invalid rows: {invalid}")
+let duplicate = checks.group_by(.name).where(group => group.values.len() > 1).map(.key)
+assert(duplicate.is_empty(), "release checks contain duplicate names: {duplicate}")
+let failures = checks.where(.status == "fail")
+let report = {ready: failures.is_empty(), checks: checks.len(), failures: failures, waived: checks.where(.status == "waived").map(.name).sort()}
+json.stringify(report, pretty: true).save(output)
+echo "release readiness: {if (report.ready) { "ready" } else { "blocked" }} ({failures.len()} failures)"

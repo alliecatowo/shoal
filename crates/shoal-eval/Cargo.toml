@@ -15,6 +15,7 @@ jiff = "0.2.32"
 libc = "0.2.186"
 serde_json = "1.0.150"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10.9"
 shoal-adapters = { version = "0.1.0", path = "../shoal-adapters" }
 shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 shoal-exec = { version = "0.1.0", path = "../shoal-exec" }

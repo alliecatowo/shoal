@@ -1,0 +1,27 @@
+#!/usr/bin/env shoal
+# Plan an explicit v1-to-v2 state migration without touching the input.
+
+assert(args.len() == 2, "usage: migration-plan.shl STATE OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "state input is missing: {input}")
+let state = json.parse(input.read)
+assert(state.schema == 1 || state.schema == 2, "unsupported state schema: {state.schema}")
+let actions = if (state.schema == 1) {
+  [
+    {op: "rename", from: "entries", to: "items"},
+    {op: "default", field: "metadata", value: {}},
+    {op: "set-schema", value: 2},
+  ]
+} else {
+  []
+}
+let plan = {
+  schema: 1,
+  source_schema: state.schema,
+  target_schema: 2,
+  required: state.schema != 2,
+  actions: actions,
+}
+json.stringify(plan, pretty: true).save(output)
+echo "migration required: {plan.required}; actions: {actions.len()}"

@@ -24,6 +24,22 @@ fn parsed(cwd: &Path, src: &str) -> Value {
 }
 
 #[test]
+fn which_rejects_unknown_or_repeated_options() {
+    let directory = tempfile::tempdir().unwrap();
+    for source in [
+        "which --typo cargo",
+        "which --all --all cargo",
+        "which -aa cargo",
+    ] {
+        let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+        let error = evaluator
+            .eval_program(&shoal_syntax::parse(source).unwrap())
+            .unwrap_err();
+        assert_eq!(error.code, "arg_error", "{source}: {error}");
+    }
+}
+
+#[test]
 fn which_reports_the_same_winning_source_as_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let mut ev = Evaluator::new(dir.path().into());

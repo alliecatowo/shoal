@@ -59,7 +59,7 @@ fn poisoned_subscriber_queue_is_discarded_and_closed() {
 fn poisoned_channel_registry_makes_repeated_requests_fail_closed() {
     let kernel = Kernel::new();
     let mut attached = attachment(&kernel, "poisoned-channels");
-    kernel.events.channels.poison_buffers_for_test();
+    kernel.runtime.events.channels.poison_buffers_for_test();
 
     for _ in 0..2 {
         let error = kernel
@@ -74,7 +74,7 @@ fn poisoned_channel_registry_makes_repeated_requests_fail_closed() {
 
     // Internal semantic publishers are infallible by design. They must
     // stop at the quarantine boundary rather than panic or notify.
-    let marker = kernel.events.publish(
+    let marker = kernel.runtime.events.publish(
         &attached.as_ref().unwrap().session.key.owner(),
         "user.poison",
         json!({"ignored": true}),
@@ -86,7 +86,7 @@ fn poisoned_channel_registry_makes_repeated_requests_fail_closed() {
 fn poisoned_durable_index_makes_repeated_requests_fail_closed() {
     let kernel = Kernel::new();
     let mut attached = attachment(&kernel, "poisoned-durable");
-    kernel.events.durable.poison_journal_for_test();
+    kernel.runtime.events.durable.poison_journal_for_test();
 
     for _ in 0..2 {
         let error = kernel
@@ -103,7 +103,11 @@ fn poisoned_subscription_registry_is_quarantined_without_request_panics() {
     let mut attached = attachment(&kernel, "poisoned-subscriptions");
     let (_peer, server) = UnixStream::pair().unwrap();
     let writer = Arc::new(Mutex::new(server));
-    kernel.events.subscriptions.poison_connections_for_test();
+    kernel
+        .runtime
+        .events
+        .subscriptions
+        .poison_connections_for_test();
 
     for _ in 0..2 {
         let error = kernel
@@ -691,7 +695,10 @@ fn events_read_clamps_rows_and_bytes_with_continuation_metadata() {
     let mut attached = attachment(&kernel, "bounded-read");
     let owner = attached.as_ref().unwrap().session.key.owner();
     for n in 0..(EVENTS_MAX_PAGE + 20) {
-        kernel.events.publish(&owner, "user.page", json!({"n":n}));
+        kernel
+            .runtime
+            .events
+            .publish(&owner, "user.page", json!({"n":n}));
     }
     let page = kernel
         .handle_events_read(
@@ -777,7 +784,10 @@ fn user_publish_rejects_huge_deep_and_invalid_channels_before_retention() {
         serde_json::to_vec(&invalid_data).unwrap().len() < 1024,
         "hostile name rejection must stay far below the frame wall"
     );
-    assert_eq!(kernel.events.channels.user_identity_count(&owner), 0);
+    assert_eq!(
+        kernel.runtime.events.channels.user_identity_count(&owner),
+        0
+    );
 }
 
 #[test]
@@ -959,7 +969,7 @@ fn corrupt_program_shaped_ast_is_never_replayed_as_an_event() {
     let mut attached = attachment(&kernel, "corrupt-ast");
     let owner = attached.as_ref().unwrap().session.key.owner();
     let id = {
-        let journal = kernel.journal.lock().unwrap();
+        let journal = kernel.persistence.journal.lock().unwrap();
         let id = journal
             .append(&EntryRecord {
                 kind: shoal_journal::EntryKind::Exec,
@@ -990,7 +1000,7 @@ fn historical_large_transcripts_stop_before_materializing_a_whole_row_page() {
     let mut attached = attachment(&kernel, "large-transcript-page");
     let owner = attached.as_ref().unwrap().session.key.owner();
     {
-        let journal = kernel.journal.lock().unwrap();
+        let journal = kernel.persistence.journal.lock().unwrap();
         for n in 0..3 {
             let id = journal
                 .append(&EntryRecord {

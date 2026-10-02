@@ -207,6 +207,7 @@ fn raw_page(r#ref: &Ref, value: &Value, slice: Option<[usize; 2]>) -> Result<Jso
 impl Kernel {
     pub(crate) fn require_journal_read(&self, attachment: &Attachment) -> Result<(), RpcError> {
         if self
+            .authority
             .policy
             .evaluate_effect(&attachment.principal, &Effect::JournalRead)
             == Verdict::Allow
@@ -408,6 +409,7 @@ impl Kernel {
                 data: Some(json!({"field":"kind","expected":["statement","exec","approval"]})),
             })?;
         let rows = self
+            .persistence
             .journal
             .lock()
             .map_err(|_| poisoned_subsystem("journal"))?

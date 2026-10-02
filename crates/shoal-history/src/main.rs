@@ -3,6 +3,217 @@ use shoal_journal::{EntryKind, Journal};
 use std::path::PathBuf;
 use std::time::Duration;
 
+const HELP: &str = "Shoal journal history
+
+Usage:
+  shoal-history [--state-dir PATH] [--json] COMMAND [OPTIONS]
+
+Commands:
+  query   Filter journal entries (the default command)
+  show    Show one entry by numeric ID
+  pin     Retain a CAS object by hash
+  unpin   Release a retained CAS object
+  gc      Preview or apply storage collection
+  status  Show database and CAS use
+  undo    Apply an entry's inverse operations below an explicit root
+
+Options:
+  --state-dir PATH  Override layered journal.state_dir and the XDG state root
+  --json            Emit structured JSON where supported
+  query: --since NS --principal NAME --kind KIND --effects EFFECT --head HEAD
+         --status ok|failed --limit N
+  gc:    --ttl SECONDS --budget BYTES --apply
+  undo:  --root PATH
+  -h, --help        Print this help and exit
+  -V, --version     Print the version and exit
+
+Output:
+  Human history/status text by default; --json emits stable structured records.
+
+Errors:
+  Rejects malformed filters, missing IDs/hashes/roots, unknown commands, and journal failures.
+
+Examples:
+  shoal-history query --status failed --limit 20
+  shoal-history --json status
+  shoal-history gc --ttl 604800 --apply
+
+Exit status:
+  0 on success; 1 for missing records or operational failures; 2 for invalid arguments.";
+
+const ACTIONS: &[&str] = &["query", "show", "pin", "unpin", "gc", "status", "undo"];
+const GLOBAL_OPTIONS: &[&str] = &["--state-dir", "--json"];
+const QUERY_OPTIONS: &[&str] = &[
+    "--since",
+    "--principal",
+    "--kind",
+    "--effects",
+    "--head",
+    "--status",
+    "--limit",
+];
+const GC_OPTIONS: &[&str] = &["--ttl", "--budget", "--apply"];
+const UNDO_OPTIONS: &[&str] = &["--root"];
+
+fn action_help(command: &str) -> Option<&'static str> {
+    match command {
+        "query" => Some(
+            "Query Shoal journal entries
+
+Usage:
+  shoal-history query [FILTERS]
+
+Options:
+  --since NS --principal NAME --kind KIND --effects EFFECT --head HEAD
+  --status ok|failed --limit N
+  -h, --help  Print this action help and exit
+
+Output:
+  Matching human records, or structured records when global --json is present.
+
+Errors:
+  Rejects missing or malformed filter values and reports journal read failures.
+
+Examples:
+  shoal-history query --status failed --limit 20
+
+Exit status:
+  0 on success; 1 for journal failures; 2 for invalid filters.",
+        ),
+        "show" => Some(
+            "Show one Shoal journal entry
+
+Usage:
+  shoal-history show ID
+
+Options:
+  -h, --help  Print this action help and exit
+
+Output:
+  The complete human entry, or a structured record when global --json is present.
+
+Errors:
+  Rejects malformed IDs and reports missing entries or journal failures.
+
+Examples:
+  shoal-history --json show 42
+
+Exit status:
+  0 on success; 1 when the entry is missing or unreadable; 2 for an invalid ID.",
+        ),
+        "pin" => Some(
+            "Pin a Shoal content-addressed object
+
+Usage:
+  shoal-history pin HASH
+
+Options:
+  -h, --help  Print this action help and exit
+
+Output:
+  Silent on success.
+
+Errors:
+  Rejects a missing hash and reports journal or CAS update failures.
+
+Examples:
+  shoal-history pin BLOB_HASH
+
+Exit status:
+  0 on success; 1 for storage failures; 2 when HASH is missing.",
+        ),
+        "unpin" => Some(
+            "Unpin a Shoal content-addressed object
+
+Usage:
+  shoal-history unpin HASH
+
+Options:
+  -h, --help  Print this action help and exit
+
+Output:
+  Silent on success.
+
+Errors:
+  Rejects a missing hash and reports journal or CAS update failures.
+
+Examples:
+  shoal-history unpin BLOB_HASH
+
+Exit status:
+  0 on success; 1 for storage failures; 2 when HASH is missing.",
+        ),
+        "gc" => Some(
+            "Collect Shoal journal storage
+
+Usage:
+  shoal-history gc [--ttl SECONDS] [--budget BYTES] [--apply]
+
+Options:
+  --ttl SECONDS  Select objects older than the duration
+  --budget BYTES Select enough objects to satisfy the storage budget
+  --apply        Delete candidates; omission is a dry run
+  -h, --help     Print this action help and exit
+
+Output:
+  A JSON summary with dry-run, candidate, deletion, and byte counts.
+
+Errors:
+  Rejects malformed numbers and reports journal or CAS collection failures.
+
+Examples:
+  shoal-history gc --ttl 604800 --apply
+
+Exit status:
+  0 on success; 1 for storage failures; 2 for invalid options.",
+        ),
+        "status" => Some(
+            "Show Shoal journal storage use
+
+Usage:
+  shoal-history status
+
+Options:
+  -h, --help  Print this action help and exit
+
+Output:
+  Database, WAL, CAS, spill, pin, and admission totals in human or global --json form.
+
+Errors:
+  Reports journal metadata and filesystem accounting failures.
+
+Examples:
+  shoal-history --json status
+
+Exit status:
+  0 on success; 1 when storage status cannot be read.",
+        ),
+        "undo" => Some(
+            "Apply a Shoal journal entry's inverse operations
+
+Usage:
+  shoal-history undo ID --root PATH
+
+Options:
+  --root PATH   Require inverse effects to remain below PATH
+  -h, --help    Print this action help and exit
+
+Output:
+  Applied step count in human form, or step statuses when global --json is present.
+
+Errors:
+  Rejects malformed IDs or missing roots and reports containment or inverse-operation failures.
+
+Examples:
+  shoal-history undo 42 --root ./workspace
+
+Exit status:
+  0 on success; 1 when undo fails; 2 for an invalid ID or missing root.",
+        ),
+        _ => None,
+    }
+}
+
 fn main() {
     match run(std::env::args().skip(1).collect()) {
         Ok(()) => {}
@@ -14,9 +225,7 @@ fn main() {
 }
 fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
     if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
-        println!(
-            "Shoal journal history\n\nUsage: shoal-history [--state-dir PATH] [--json] COMMAND [OPTIONS]\n\nState: explicit --state-dir, else layered journal.state_dir, else the shared XDG state root\n\nCommands:\n  query   Filter journal entries\n  show    Show one entry\n  pin     Retain a CAS object\n  unpin   Release a CAS object\n  gc      Collect journal storage\n  status  Show storage use\n  undo    Apply an entry's inverse operations"
-        );
+        println!("{HELP}");
         return Ok(());
     }
     if args.as_slice() == ["-V"] || args.as_slice() == ["--version"] {
@@ -25,23 +234,51 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
     }
     let mut state_override = None;
     let mut json = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
+    let mut seen_global = std::collections::BTreeSet::new();
+    while let Some(option) = args.first().cloned() {
+        if !GLOBAL_OPTIONS.contains(&option.as_str()) {
+            break;
+        }
+        match option.as_str() {
             "--state-dir" => {
-                if i + 1 >= args.len() {
+                if !seen_global.insert(option.clone()) {
+                    return Err((2, format!("{option} may be specified only once")));
+                }
+                if args.len() < 2 {
                     return Err((2, "--state-dir requires PATH".into()));
                 }
-                state_override = Some(PathBuf::from(args.remove(i + 1)));
-                args.remove(i);
+                state_override = Some(PathBuf::from(args.remove(1)));
+                args.remove(0);
             }
             "--json" => {
+                if !seen_global.insert(option.clone()) {
+                    return Err((2, format!("{option} may be specified only once")));
+                }
                 json = true;
-                args.remove(i);
+                args.remove(0);
             }
-            _ => i += 1,
+            _ => unreachable!("global registry and parser match arms must remain in parity"),
         }
     }
+    if let [command, flag] = args.as_slice()
+        && (flag == "-h" || flag == "--help")
+    {
+        let help = action_help(command).ok_or((2, format!("unknown command {command}")))?;
+        println!("{help}");
+        return Ok(());
+    }
+    if json
+        && matches!(
+            args.first().map(String::as_str).unwrap_or("query"),
+            "pin" | "unpin" | "gc"
+        )
+    {
+        return Err((
+            2,
+            "--json is supported by query, show, status, and undo only".into(),
+        ));
+    }
+    validate_action_shape(&args)?;
     let state = match state_override {
         Some(state) => state,
         None => {
@@ -56,7 +293,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
     let journal = Journal::open(&state).map_err(op)?;
     match command {
         "query" => {
-            let f = parse_query(&args[1..])?;
+            let f = parse_query(args.get(1..).unwrap_or(&[]))?;
             let rows = query(&journal, &f).map_err(op)?;
             if json {
                 let value = rows
@@ -91,31 +328,11 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
             journal.unpin(h).map_err(op)?;
         }
         "gc" => {
-            let mut ttl = None;
-            let mut budget = None;
-            let mut apply = false;
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--ttl" => {
-                        ttl = Some(Duration::from_secs(parse_u64(args.get(i + 1), "ttl")?));
-                        i += 2
-                    }
-                    "--budget" => {
-                        budget = Some(parse_u64(args.get(i + 1), "budget")?);
-                        i += 2
-                    }
-                    "--apply" => {
-                        apply = true;
-                        i += 1
-                    }
-                    x => return Err((2, format!("unknown gc option {x}"))),
-                }
-            }
-            let r = gc(&journal, ttl, budget, apply).map_err(op)?;
+            let options = parse_gc(&args[1..])?;
+            let r = gc(&journal, options.ttl, options.budget, options.apply).map_err(op)?;
             println!(
                 "{}",
-                serde_json::json!({"dry_run":!apply,"candidates":r.candidates.len(),"deleted":r.deleted.len(),"reclaimed_bytes":r.reclaimed_bytes,"remaining_bytes":r.remaining_bytes})
+                serde_json::json!({"dry_run":!options.apply,"candidates":r.candidates.len(),"deleted":r.deleted.len(),"reclaimed_bytes":r.reclaimed_bytes,"remaining_bytes":r.remaining_bytes})
             )
         }
         "status" => {
@@ -154,11 +371,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
         }
         "undo" => {
             let id = parse_id(args.get(1))?;
-            let root = args
-                .windows(2)
-                .find(|w| w[0] == "--root")
-                .map(|w| PathBuf::from(&w[1]))
-                .ok_or((2, "undo requires --root PATH".into()))?;
+            let root = PathBuf::from(&args[3]);
             let r = undo(&journal, id, &root).map_err(|e| (1, e.to_string()))?;
             if json {
                 let steps = r
@@ -187,6 +400,79 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
     Ok(())
 }
 
+fn validate_action_shape(args: &[String]) -> Result<(), (i32, String)> {
+    let command = args.first().map(String::as_str).unwrap_or("query");
+    if !ACTIONS.contains(&command) {
+        return Err((2, format!("unknown command {command}")));
+    }
+    match command {
+        "query" => parse_query(args.get(1..).unwrap_or(&[])).map(|_| ()),
+        "show" => exact_arity(args, 2, "show ID").and_then(|()| parse_id(args.get(1)).map(|_| ())),
+        "pin" => exact_arity(args, 2, "pin HASH"),
+        "unpin" => exact_arity(args, 2, "unpin HASH"),
+        "gc" => parse_gc(&args[1..]).map(|_| ()),
+        "status" => exact_arity(args, 1, "status"),
+        "undo" => {
+            exact_arity(args, 4, "undo ID --root PATH")?;
+            parse_id(args.get(1))?;
+            if !UNDO_OPTIONS.contains(&args[2].as_str()) {
+                return Err((2, "undo requires `undo ID --root PATH`".into()));
+            }
+            Ok(())
+        }
+        _ => Err((2, format!("unknown command {command}"))),
+    }
+}
+
+fn exact_arity(args: &[String], expected: usize, usage: &str) -> Result<(), (i32, String)> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err((2, format!("usage: shoal-history {usage}")))
+    }
+}
+
+struct GcArgs {
+    ttl: Option<Duration>,
+    budget: Option<u64>,
+    apply: bool,
+}
+
+fn parse_gc(args: &[String]) -> Result<GcArgs, (i32, String)> {
+    let mut parsed = GcArgs {
+        ttl: None,
+        budget: None,
+        apply: false,
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < args.len() {
+        let option = args[i].as_str();
+        if !GC_OPTIONS.contains(&option) {
+            return Err((2, format!("unknown gc option {option}")));
+        }
+        if !seen.insert(option) {
+            return Err((2, format!("{option} may be specified only once")));
+        }
+        match option {
+            "--ttl" => {
+                parsed.ttl = Some(Duration::from_secs(parse_u64(args.get(i + 1), "ttl")?));
+                i += 2
+            }
+            "--budget" => {
+                parsed.budget = Some(parse_u64(args.get(i + 1), "budget")?);
+                i += 2
+            }
+            "--apply" => {
+                parsed.apply = true;
+                i += 1
+            }
+            x => return Err((2, format!("unknown gc option {x}"))),
+        }
+    }
+    Ok(parsed)
+}
+
 fn configured_state_dir(
     cwd: &std::path::Path,
     fallback: PathBuf,
@@ -202,8 +488,15 @@ fn configured_state_dir(
 }
 fn parse_query(args: &[String]) -> Result<QueryFilter, (i32, String)> {
     let mut f = QueryFilter::default();
+    let mut seen = std::collections::BTreeSet::new();
     let mut i = 0;
     while i < args.len() {
+        if !QUERY_OPTIONS.contains(&args[i].as_str()) {
+            return Err((2, format!("unknown query option {}", args[i])));
+        }
+        if !seen.insert(args[i].as_str()) {
+            return Err((2, format!("{} may be specified only once", args[i])));
+        }
         match args[i].as_str() {
             "--since" => {
                 f.since_ns = Some(parse_i64(args.get(i + 1), "since")?);
@@ -269,6 +562,65 @@ fn op(e: impl std::fmt::Display) -> (i32, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_and_option_registries_match_help_and_man() {
+        let man = include_str!("../../../man/shoal-history.1");
+        for action in ACTIONS {
+            assert!(HELP.contains(action), "root help omitted {action}");
+            assert!(
+                action_help(action).is_some(),
+                "action help omitted {action}"
+            );
+            assert!(man.contains(action), "man page omitted {action}");
+        }
+        for option in GLOBAL_OPTIONS {
+            assert!(HELP.contains(option), "root help omitted {option}");
+            assert!(
+                man.contains(&option.replace("--", "\\-\\-")),
+                "man page omitted {option}"
+            );
+        }
+        for (action, options) in [
+            ("query", QUERY_OPTIONS),
+            ("gc", GC_OPTIONS),
+            ("undo", UNDO_OPTIONS),
+        ] {
+            let help = action_help(action).unwrap();
+            for option in options {
+                assert!(help.contains(option), "{action} help omitted {option}");
+                assert!(
+                    man.contains(&option.replace("--", "\\-\\-")),
+                    "man page omitted {action} {option}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn action_shapes_reject_trailing_and_repeated_arguments() {
+        for invalid in [
+            vec!["show", "1", "extra"],
+            vec!["pin", "hash", "extra"],
+            vec!["unpin", "hash", "extra"],
+            vec!["status", "extra"],
+            vec!["undo", "1", "--root", ".", "extra"],
+            vec!["gc", "--apply", "--apply"],
+            vec!["query", "--limit", "1", "--limit", "2"],
+        ] {
+            let owned = invalid.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(
+                validate_action_shape(&owned).is_err(),
+                "accepted invalid invocation: {owned:?}"
+            );
+        }
+        assert!(validate_action_shape(&[]).is_ok());
+        assert!(validate_action_shape(&["status".into()]).is_ok());
+        assert!(
+            validate_action_shape(&["undo".into(), "1".into(), "--root".into(), ".".into()])
+                .is_ok()
+        );
+    }
 
     #[test]
     fn production_cli_has_no_json_serialization_panics() {

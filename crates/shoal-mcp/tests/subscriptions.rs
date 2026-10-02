@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use shoal_kernel::{Kernel, Limits};
 use shoal_leash::Policy;
-use shoal_mcp::{Config, Facade, LocalAuthMode};
+use shoal_mcp::{Config, Facade};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,11 +21,14 @@ impl LiveKernel {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("run/kernel.sock");
         let stop = Arc::new(AtomicBool::new(false));
-        let kernel = Kernel::with_policy(Policy::permissive("agent:mcp"));
-        kernel.configure_limits(Limits {
-            max_connections,
-            ..Limits::default()
-        });
+        let kernel = Kernel::builder()
+            .policy(Policy::permissive("agent:mcp"))
+            .limits(Limits {
+                max_connections,
+                ..Limits::default()
+            })
+            .build()
+            .unwrap();
         let serve_socket = socket.clone();
         let serve_stop = stop.clone();
         let handle = std::thread::spawn(move || {
@@ -52,7 +55,6 @@ impl LiveKernel {
             socket: self.socket.clone(),
             session: Some("default".into()),
             token: None,
-            local_auth: LocalAuthMode::RestrictedAgent,
         }
     }
 }

@@ -78,9 +78,17 @@ cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
 
 # Run a script
 cargo run -p shoal -- examples/example.shl
+
+# Run 51 real operations programs against disposable asserted fixtures
+mise run dogfood
 ```
 
-The repository currently ships **49 declarative adapters** and a normative corpus of **1,355
+The functional program collection covers backup/restore, journal and cache administration, release
+and SBOM verification, migrations, deployment and rollback planning, drift and quota reporting,
+adapter governance, benchmark dashboards, test triage, Reef repair planning, and incident response. See the
+[operational-program guide](https://alliecatowo.github.io/shoal/docs/operations-programs/).
+
+The repository currently ships **49 declarative adapters** and a normative corpus of **1,379
 cases across 79 suites**. The corpus is the executable language contract.
 
 ## The model
@@ -111,8 +119,9 @@ optional span instead of inventing one.
 
 ## Agents and interactive programs
 
-The default CLI/REPL starts an isolated private `shoal-kernel` over an inherited descriptor;
-`shoal --standalone` selects the embedded evaluator. A separate durable named-socket kernel serves
+The default interactive REPL starts an isolated private `shoal-kernel` over an inherited descriptor;
+`shoal --standalone` selects the embedded evaluator. Scripts, `-c`, and stdin are already local,
+noninteractive evaluator runs, so the flag is an explicit idempotent choice there. A separate durable named-socket kernel serves
 agent Sessions, and `shoal-mcp` provides the MCP facade. The
 installable Claude Code [plugin](plugin/) adds the full language card and **13 tools** for structured
 execution, plans, approvals, refs, journal queries, cancellation, and interactive PTYs.

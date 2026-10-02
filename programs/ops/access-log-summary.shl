@@ -1,0 +1,23 @@
+#!/usr/bin/env shoal
+# Aggregate structured request logs by route and outcome.
+
+assert(args.len() == 2, "usage: access-log-summary.shl INPUT OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "access log is missing: {input}")
+let rows = json.parse(input.read)
+let invalid = rows.where(row => row.route == null || row.status == null || row.duration_ms == null)
+assert(invalid.is_empty(), "access log contains malformed rows: {invalid}")
+let routes = rows.group_by(.route).map(group => ({
+  route: group.key,
+  requests: group.values.len(),
+  errors: group.values.where(row => row.status >= 500).len(),
+  total_ms: group.values.map(.duration_ms).sum(),
+})).sort_by(row => -row.requests)
+let report = {
+  requests: rows.len(),
+  errors: rows.where(row => row.status >= 500).len(),
+  routes: routes,
+}
+json.stringify(report, pretty: true).save(output)
+echo "summarized {rows.len()} requests across {routes.len()} routes"

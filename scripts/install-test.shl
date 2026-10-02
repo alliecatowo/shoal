@@ -40,6 +40,7 @@ for binary in binaries {
   run("install", "-m", "0644", path("man").join("{binary}.1"), release_man_dir.join("{binary}.1"))
 }
 run("install", "-m", "0755", "scripts/install.shl", release_dir.join("install.shl"))
+run("install", "-m", "0755", build_dir.join("shoal-install-transaction"), release_dir.join("shoal-install-transaction"))
 let source_shoal = release_dir.join("shoal")
 let installer = release_dir.join("install.shl")
 
@@ -52,6 +53,10 @@ env.XDG_CONFIG_HOME = prefix.join("config").display()
 env.XDG_CACHE_HOME = prefix.join("cache").display()
 env.SHOAL_SECRET_DIR = prefix.join("data/secrets").display()
 env.SHOAL_INSTALL_TEST_FAIL_AFTER = ""
+env.SHOAL_INSTALL_TEST_FAIL_STAGE_AFTER = ""
+env.SHOAL_INSTALL_TEST_KILL_AFTER = ""
+env.SHOAL_INSTALL_TEST_HOLD_LOCK_MS = ""
+env.SHOAL_INSTALL_LOCK_TIMEOUT_MS = "10000"
 
 # Refuse a managed-path symlink during preflight without touching its target
 # or creating transaction state.
@@ -64,11 +69,31 @@ let refused_symlink = run(source_shoal, installer)
 assert(!refused_symlink.ok, "installer accepted a managed-path symlink")
 assert(run("test", "-L", managed_symlink).ok, "installer replaced the refused symlink")
 assert(symlink_target.read == "outside-managed-set\n", "installer touched the symlink target")
-assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "symlink preflight leaked a transaction directory")
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "symlink preflight leaked a transaction directory")
 rm --permanent (managed_symlink)
 
 let installed = run(source_shoal, installer)
 assert(installed.ok, "temporary-prefix install failed: {installed.err}")
+
+# Two simultaneous installs serialize on the owner-only prefix lock and both
+# observe coherent generations. A bounded contender also fails rather than
+# waiting forever.
+env.SHOAL_INSTALL_TEST_HOLD_LOCK_MS = "250"
+let concurrent_first = spawn { run(source_shoal, installer) }
+let pause = run("sleep", "0.05")
+let concurrent_second = spawn { run(source_shoal, installer) }
+let first_result = concurrent_first.await()
+let second_result = concurrent_second.await()
+assert(first_result.ok && second_result.ok, "serialized concurrent installers failed")
+env.SHOAL_INSTALL_LOCK_TIMEOUT_MS = "40"
+let lock_holder = spawn { run(source_shoal, installer) }
+let contention_pause = run("sleep", "0.05")
+let bounded_contender = run(source_shoal, installer)
+assert(!bounded_contender.ok, "bounded installer contention unexpectedly succeeded")
+assert(lock_holder.await().ok, "lock holder failed")
+env.SHOAL_INSTALL_TEST_HOLD_LOCK_MS = ""
+env.SHOAL_INSTALL_LOCK_TIMEOUT_MS = "10000"
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "concurrent installs leaked transaction state")
 
 for binary in binaries {
   let source = release_dir.join(binary)
@@ -98,7 +123,37 @@ let reef = run(install_dir.join("shoal"), "-c", "reef doctor")
 assert(reef.ok, "installed Shoal cannot execute Reef: {reef.err}")
 let checked = run(source_shoal, installer, "--check")
 assert(checked.ok, "installed artifact check failed: {checked.err}")
-assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "successful check leaked a transaction directory")
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "successful check leaked a transaction directory")
+
+# A post-crash user replacement is neither the snapshotted old generation nor
+# the transaction's intended new generation. Recovery must refuse before
+# changing any destination, even when the interrupted install had already
+# published its first artifact.
+env.SHOAL_INSTALL_TEST_KILL_AFTER = "1"
+let killed_install_replacement = run(source_shoal, installer)
+assert(!killed_install_replacement.ok, "install replacement crash seam unexpectedly succeeded")
+env.SHOAL_INSTALL_TEST_KILL_AFTER = ""
+let installed_shoal = install_dir.join("shoal")
+"post-crash install replacement\n".save(installed_shoal)
+let refused_install_recovery = run(source_shoal, installer, "--check")
+assert(!refused_install_recovery.ok, "install recovery overwrote a post-crash replacement")
+assert(installed_shoal.read == "post-crash install replacement\n", "install recovery changed the post-crash replacement")
+run("install", "-m", "0755", source_shoal, installed_shoal)
+assert(run(source_shoal, installer, "--check").ok, "install recovery did not resume after the replacement was restored to an expected state")
+
+# The same invariant applies when an interrupted uninstall left its first
+# destination absent: recovery may restore that old file only while the name
+# is still absent, never over a user-created replacement.
+env.SHOAL_INSTALL_TEST_KILL_AFTER = "1"
+let killed_uninstall_replacement = run(source_shoal, installer, "--uninstall")
+assert(!killed_uninstall_replacement.ok, "uninstall replacement crash seam unexpectedly succeeded")
+env.SHOAL_INSTALL_TEST_KILL_AFTER = ""
+"post-crash uninstall replacement\n".save(installed_shoal)
+let refused_uninstall_recovery = run(source_shoal, installer, "--check")
+assert(!refused_uninstall_recovery.ok, "uninstall recovery overwrote a post-crash replacement")
+assert(installed_shoal.read == "post-crash uninstall replacement\n", "uninstall recovery changed the post-crash replacement")
+rm --permanent (installed_shoal)
+assert(run(source_shoal, installer, "--check").ok, "uninstall recovery did not resume after the replacement name was cleared")
 
 # Corrupt one old managed file, inject failure after two replacements, and
 # prove rollback restores both a normal release artifact and the exact corrupt
@@ -112,14 +167,14 @@ let failed = run(source_shoal, installer)
 assert(!failed.ok, "injected install failure unexpectedly succeeded")
 assert(run("cmp", "-s", source_shoal, install_dir.join("shoal")).ok, "rollback did not restore shoal")
 assert(run("cmp", "-s", false_path, old_kernel).ok, "rollback did not restore prior shoal-kernel")
-assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "rollback leaked a transaction directory")
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "rollback leaked a transaction directory")
 
 # A clean install removes the complete managed set before committing the new
 # set. Its removal phase participates in the same rollback contract.
 let failed_clean = run(source_shoal, installer, "--clean")
 assert(!failed_clean.ok, "injected clean-install failure unexpectedly succeeded")
 assert(run("cmp", "-s", false_path, old_kernel).ok, "clean rollback did not restore prior shoal-kernel")
-assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "clean rollback leaked a transaction directory")
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "clean rollback leaked a transaction directory")
 
 # A successful clean install then replaces the deliberately stale fixture.
 env.SHOAL_INSTALL_TEST_FAIL_AFTER = ""
@@ -129,10 +184,74 @@ assert(run("cmp", "-s", release_dir.join("shoal-kernel"), old_kernel).ok, "clean
 let clean_check = run(source_shoal, installer, "--check")
 assert(clean_check.ok, "clean install verification failed: {clean_check.err}")
 
-# Uninstall is scoped to managed files and leaves unrelated prefix content.
+# Every artifact replacement plus manifest publication is a SIGKILL seam.
+# Recovery first restores the exact deliberately-drifted old generation; a
+# subsequent install can then publish the intended release again.
+let crash_fixture = prefix.join("crash-fixture")
+"old-generation\n".save(crash_fixture)
+for phase in 1..=24 {
+  run("install", "-m", "0755", crash_fixture, old_kernel)
+  env.SHOAL_INSTALL_TEST_KILL_AFTER = phase.str()
+  let killed = run(source_shoal, installer)
+  assert(!killed.ok, "SIGKILL injection at commit phase {phase} unexpectedly succeeded")
+  env.SHOAL_INSTALL_TEST_KILL_AFTER = ""
+  let recovered_old_check = run(source_shoal, installer, "--check")
+  assert(!recovered_old_check.ok, "recovery at phase {phase} did not restore the deliberately drifted old generation")
+  assert(run("cmp", "-s", crash_fixture, old_kernel).ok, "recovery at phase {phase} lost the exact old artifact")
+  assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "recovery at phase {phase} leaked transaction state")
+  let republished = run(source_shoal, installer)
+  assert(republished.ok, "reinstall after recovered phase {phase} failed: {republished.err}")
+}
+
+# Staging failures happen before destination mutation and are fully cleaned.
+env.SHOAL_INSTALL_TEST_FAIL_STAGE_AFTER = "3"
+let staging_failure = run(source_shoal, installer)
+assert(!staging_failure.ok, "injected staging assertion failure unexpectedly succeeded")
+env.SHOAL_INSTALL_TEST_FAIL_STAGE_AFTER = ""
+assert(run(source_shoal, installer, "--check").ok, "staging failure changed the installed generation")
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "staging failure leaked transaction state")
+
+# A symlinked destination parent is rejected by fd-relative traversal without
+# touching the directory it points at.
+let outside_parent = prefix.join("outside-parent")
+run("install", "-d", "-m", "0755", outside_parent)
+let outside_marker = outside_parent.join("shoal")
+"outside-parent\n".save(outside_marker)
+let bash_parent = prefix.join("share/bash-completion/completions")
+rm --permanent --recursive (bash_parent)
+ln --symbolic (outside_parent) (bash_parent)
+let parent_swap = run(source_shoal, installer)
+assert(!parent_swap.ok, "installer accepted a symlinked destination parent")
+assert(outside_marker.read == "outside-parent\n", "installer escaped through a destination-parent symlink")
+rm --permanent (bash_parent)
+run("install", "-d", "-m", "0755", bash_parent)
+let parent_repaired = run(source_shoal, installer)
+assert(parent_repaired.ok, "install after destination-parent repair failed: {parent_repaired.err}")
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "parent-swap refusal leaked transaction state")
+
+# Uninstall uses the same durable protocol. Exercise an interrupted artifact
+# removal and an interrupted manifest removal; both must restore the complete
+# installed generation before check proceeds.
+for phase in [12, 24] {
+  env.SHOAL_INSTALL_TEST_KILL_AFTER = phase.str()
+  let killed_uninstall = run(source_shoal, installer, "--uninstall")
+  assert(!killed_uninstall.ok, "SIGKILL uninstall phase {phase} unexpectedly succeeded")
+  env.SHOAL_INSTALL_TEST_KILL_AFTER = ""
+  let recovered_uninstall = run(source_shoal, installer, "--check")
+  assert(recovered_uninstall.ok, "uninstall recovery at phase {phase} did not restore the installed generation: {recovered_uninstall.err}")
+  assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "uninstall recovery at phase {phase} leaked transaction state")
+}
+
+# Uninstall refuses a user replacement before removing anything. Explicit
+# force removes only the named managed paths and never follows links.
 let marker = prefix.join("keep-me")
 "unrelated\n".save(marker)
-let removed = run(source_shoal, installer, "--uninstall")
+"user replacement\n".save(old_kernel)
+let refused_replacement = run(source_shoal, installer, "--uninstall")
+assert(!refused_replacement.ok, "uninstall removed a user-replaced managed name")
+assert(old_kernel.read == "user replacement\n", "refused uninstall changed the replacement")
+assert(install_dir.join("shoal").is_file, "refused uninstall partially removed the managed set")
+let removed = run(source_shoal, installer, "--uninstall", "--force")
 assert(removed.ok, "temporary-prefix uninstall failed: {removed.err}")
 for binary in binaries {
   assert(!install_dir.join(binary).exists, "uninstall retained executable: {binary}")
@@ -142,7 +261,7 @@ for completion in completion_files {
   assert(!completion.exists, "uninstall retained completion: {completion}")
 }
 assert(marker.is_file && marker.read == "unrelated\n", "uninstall touched unrelated prefix content")
-assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "uninstall leaked a transaction directory")
+assert(glob("{prefix.display()}/.shoal-install-transaction").expand().is_empty(), "uninstall leaked a transaction directory")
 
 rm --permanent --recursive (prefix)
 echo "temporary-prefix install/check/rollback/clean/uninstall gate passed"

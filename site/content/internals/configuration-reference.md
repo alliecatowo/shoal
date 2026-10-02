@@ -325,7 +325,7 @@ currently accepts and snapshots the field without applying its intended behavior
 | resolved config snapshot | active | active | exposed to language `config` methods |
 | `prompt.template` | parallel path | not applicable | rich prompt loader independently reads and migrates it |
 | `reef.*` | parallel path | parallel path | Reef reparses raw user config with its own schema |
-| `kernel.enabled`, `kernel.session` | active | not consumed | default interactive execution uses an isolated private kernel; `false` selects local evaluation; session names that private principal-owned Session |
+| `kernel.enabled`, `kernel.session` | active | deliberately not consumed | default interactive execution uses an isolated private kernel; `false` or interactive `--standalone` selects local evaluation; `-c`, scripts, and stdin are always local, and session names that private principal-owned Session |
 | `journal.enabled`, `journal.state_dir` | active | no language journal | `enabled` gates language history/undo only; state root feeds local storage and private kernel; kernel security audit remains mandatory |
 | `leash.policy` | active | active | shared bootstrap loads configured policy before evaluation; malformed configured policy fails startup rather than degrading permissively |
 

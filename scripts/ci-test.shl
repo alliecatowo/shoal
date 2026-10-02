@@ -8,4 +8,6 @@ run("cargo", "build", "--workspace", "--all-targets", "--locked")
 run("scripts/help-audit.shl")
 run("cargo", "test", "--workspace", "--locked")
 run("cargo", "test", "-p", "shoal", "--test", "conformance", "--locked", "--", "--nocapture")
+env.SHOAL_DOGFOOD_SHOAL = "target/debug/shoal"
+run("target/debug/shoal", "--standalone", "scripts/dogfood-test.shl")
 echo "workspace test gate passed"

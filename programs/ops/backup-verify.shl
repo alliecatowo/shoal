@@ -1,0 +1,24 @@
+#!/usr/bin/env shoal
+# Verify a backup's file set and byte counts against its manifest.
+
+assert(args.len() == 1, "usage: backup-verify.shl BACKUP")
+let backup = path(args[0].str())
+let data = backup.join("data")
+let manifest_file = backup.join("manifest.json")
+assert(data.is_dir && manifest_file.is_file, "not a Shoal backup: {backup}")
+let manifest = json.parse(manifest_file.read)
+assert(manifest.schema == 1, "unsupported backup manifest schema: {manifest.schema}")
+fn digest(file: path) {
+  let result = if ((which sha256sum).out != null) { run("sha256sum", file) } else { run("shasum", "-a", "256", file) }
+  assert(result.ok, "checksum failed for {file}: {result.err}")
+  result.out.str().words().first()
+}
+let prefix = "{data.abs().display()}/"
+let actual = glob(data.join("**/*").display(), hidden: true).expand()
+  .where(.is_file)
+  .map(file => ({path: file.abs().display().replace(prefix, ""), bytes: file.size / 1b, sha256: digest(file)}))
+  .sort_by(.path)
+let expected = manifest.files.sort_by(.path)
+assert(actual == expected, "backup content drift: expected {expected}, found {actual}")
+assert(actual.map(.bytes).sum() == manifest.total_bytes, "backup byte total drift")
+echo "verified backup with {actual.len()} files and {manifest.total_bytes} bytes"

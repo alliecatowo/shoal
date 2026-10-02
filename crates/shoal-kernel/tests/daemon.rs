@@ -445,6 +445,77 @@ fn wait_for_embedded_exit(child: &mut Child, stderr_path: &Path) {
 }
 
 #[test]
+fn detached_daemon_closes_captured_stderr_after_readiness() {
+    use std::io::Read as _;
+
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("run/detached.sock");
+    let state = temp.path().join("state");
+    let admin_token = create_admin_token(&state);
+    let missing_log = temp.path().join("not-used.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--detach-stderr-after-ready",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket, &missing_log);
+
+    let mut stderr = child.stderr.take().unwrap();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut captured = String::new();
+        let result = stderr.read_to_string(&mut captured).map(|_| captured);
+        let _ = send.send(result);
+    });
+    let captured = receive
+        .recv_timeout(Duration::from_secs(2))
+        .expect("captured stderr remained open after daemon readiness")
+        .unwrap();
+    assert!(captured.contains("shoal-kernel: ready"), "{captured:?}");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "closing captured stderr must not stop the resident daemon"
+    );
+
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 1.into(),
+            method: "session.attach".into(),
+            params: credentialed_admin_attach_params(&admin_token),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut reader).error.is_none());
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "kernel.shutdown".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut reader).result.unwrap()["stopping"], true);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn daemon_binds_secure_socket_and_attaches() {
     let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
         .lock()

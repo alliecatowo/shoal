@@ -1,0 +1,165 @@
+#!/usr/bin/env shoal
+# Build a durable incident workspace with health, traffic, timeline, and redacted evidence.
+
+assert(args.len() == 7, "usage: incident-command-center.shl PROBES ACCESS EVENTS LOGS SECRETS METADATA OUTPUT_DIRECTORY")
+let probes_file = path(args[0].str()).abs()
+let access_file = path(args[1].str()).abs()
+let events_file = path(args[2].str()).abs()
+let logs_file = path(args[3].str()).abs()
+let secrets_file = path(args[4].str()).abs()
+let metadata_file = path(args[5].str()).abs()
+let output = path(args[6].str()).abs()
+
+for input in [probes_file, access_file, events_file, logs_file, secrets_file, metadata_file] {
+  assert(input.is_file, "incident input is missing: {input}")
+}
+assert(!output.exists, "incident command-center output already exists: {output}")
+
+let metadata = json.parse(metadata_file.read)
+assert(metadata.id != null && !metadata.id.is_empty(), "incident metadata is missing its identifier")
+assert(metadata.owner != null && !metadata.owner.is_empty(), "incident metadata is missing its owner")
+assert(metadata.started_at_ns != null && metadata.started_at_ns >= 0, "incident metadata has an invalid start time")
+assert(metadata.objective != null && !metadata.objective.is_empty(), "incident metadata is missing its response objective")
+
+let probes = json.parse(probes_file.read)
+let invalid_probes = probes.where(row => row.service == null || row.component == null || !(row.status in ["ok", "degraded", "down"]))
+assert(invalid_probes.is_empty(), "incident probes contain malformed rows: {invalid_probes}")
+let duplicate_probes = probes.group_by(row => "{row.service}:{row.component}").where(group => group.values.len() > 1).map(.key)
+assert(duplicate_probes.is_empty(), "incident probes contain duplicate components: {duplicate_probes}")
+let services = probes.group_by(.service).map(group => {
+  let down = group.values.where(.status == "down")
+  let degraded = group.values.where(.status == "degraded")
+  let state = if (!down.is_empty()) { "down" } else if (!degraded.is_empty()) { "degraded" } else { "ok" }
+  {
+    service: group.key,
+    status: state,
+    components: group.values.len(),
+    down_components: down.map(.component).sort(),
+    degraded_components: degraded.map(.component).sort(),
+    healthy_components: group.values.where(.status == "ok").map(.component).sort(),
+  }
+}).sort_by(.service)
+let down_services = services.where(.status == "down")
+let degraded_services = services.where(.status == "degraded")
+let healthy_services = services.where(.status == "ok")
+
+let access = json.parse(access_file.read)
+let invalid_access = access.where(row => row.route == null || row.status == null || row.status < 100 || row.status > 599 || row.duration_ms == null || row.duration_ms < 0)
+assert(invalid_access.is_empty(), "incident traffic evidence contains malformed rows: {invalid_access}")
+let route_rows = access.group_by(.route).map(group => {
+  let server_errors = group.values.where(row => row.status >= 500)
+  let client_errors = group.values.where(row => row.status >= 400 && row.status < 500)
+  let durations = group.values.map(.duration_ms).sort()
+  {
+    route: group.key,
+    requests: group.values.len(),
+    server_errors: server_errors.len(),
+    client_errors: client_errors.len(),
+    total_ms: durations.sum(),
+    maximum_ms: if (durations.is_empty()) { 0 } else { durations.last() },
+    erroring: !server_errors.is_empty(),
+  }
+}).sort_by(row => -row.server_errors)
+let total_server_errors = route_rows.map(.server_errors).sum()
+let total_client_errors = route_rows.map(.client_errors).sum()
+let affected_routes = route_rows.where(.erroring).map(.route).sort()
+
+let events = json.parse(events_file.read)
+let invalid_events = events.where(row => row.timestamp_ns == null || row.timestamp_ns < 0 || row.source == null || row.message == null || !(row.kind in ["alert", "observation", "action", "recovery"]))
+assert(invalid_events.is_empty(), "incident timeline contains malformed events: {invalid_events}")
+let duplicate_events = events.group_by(.timestamp_ns).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_events.is_empty(), "incident timeline contains ambiguous timestamps: {duplicate_events}")
+let ordered_events = events.sort_by(.timestamp_ns)
+let origin = if (ordered_events.is_empty()) { metadata.started_at_ns } else { ordered_events.first().timestamp_ns }
+let timeline = ordered_events.map(event => ({
+  timestamp_ns: event.timestamp_ns,
+  offset_ns: event.timestamp_ns - origin,
+  source: event.source,
+  kind: event.kind,
+  message: event.message,
+}))
+let recovery_events = timeline.where(.kind == "recovery")
+let action_events = timeline.where(.kind == "action")
+let duration_ns = if (timeline.is_empty()) { 0 } else { timeline.last().timestamp_ns - origin }
+
+let secrets = json.parse(secrets_file.read)
+let invalid_secrets = secrets.where(row => row.name == null || row.value == null || row.value.len() < 4)
+assert(invalid_secrets.is_empty(), "incident redaction values are malformed or dangerously short: {invalid_secrets}")
+let duplicate_secret_names = secrets.group_by(.name).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_secret_names.is_empty(), "incident redaction names are duplicated: {duplicate_secret_names}")
+let logs = json.parse(logs_file.read)
+let invalid_logs = logs.where(row => row.timestamp_ns == null || row.level == null || row.source == null || row.message == null)
+assert(invalid_logs.is_empty(), "incident logs contain malformed rows: {invalid_logs}")
+let redacted_logs = logs.map(row => {
+  var message = row.message
+  for secret in secrets { message = message.replace(secret.value, "[REDACTED:{secret.name}]") }
+  {timestamp_ns: row.timestamp_ns, level: row.level, source: row.source, message: message}
+}).sort_by(.timestamp_ns)
+let leaked_rows = redacted_logs.where(row => secrets.where(secret => row.message.contains(secret.value)).len() > 0)
+assert(leaked_rows.is_empty(), "redacted incident evidence still contains configured secret material")
+let error_logs = redacted_logs.where(row => row.level in ["error", "fatal"])
+let warning_logs = redacted_logs.where(.level == "warn")
+let source_logs = redacted_logs.group_by(.source).map(group => ({
+  source: group.key,
+  records: group.values.len(),
+  errors: group.values.where(row => row.level in ["error", "fatal"]).len(),
+  warnings: group.values.where(.level == "warn").len(),
+})).sort_by(row => -row.errors)
+
+var severity = "informational"
+if (!degraded_services.is_empty() || total_server_errors > 0 || !warning_logs.is_empty()) { severity = "degraded" }
+if (!down_services.is_empty() || total_server_errors >= 2 || !error_logs.is_empty()) { severity = "critical" }
+let recovered = !timeline.is_empty() && timeline.last().kind == "recovery" && down_services.is_empty()
+var actions = []
+for service in down_services {
+  actions = actions + [{priority: 1, owner: metadata.owner, action: "restore-service", target: service.service, reason: "service has down components"}]
+}
+for service in degraded_services {
+  actions = actions + [{priority: 2, owner: metadata.owner, action: "inspect-components", target: service.service, reason: service.degraded_components.join(",")}]
+}
+for route in affected_routes {
+  actions = actions + [{priority: 2, owner: metadata.owner, action: "inspect-route", target: route, reason: "server errors observed"}]
+}
+if (!error_logs.is_empty()) {
+  actions = actions + [{priority: 1, owner: metadata.owner, action: "triage-errors", target: "logs", reason: "{error_logs.len()} error records"}]
+}
+if (!recovered) {
+  actions = actions + [{priority: 3, owner: metadata.owner, action: "confirm-recovery", target: metadata.id, reason: "no terminal recovery evidence"}]
+}
+let ordered_actions = actions.sort_by(.priority)
+
+let output_created = (mkdir (output))
+let evidence = output.join("evidence")
+let evidence_created = (mkdir (evidence))
+json.stringify({schema: 1, incident: metadata.id, services: services, unhealthy: services.where(.status != "ok").map(.service).sort()}, pretty: true).save(evidence.join("health.json"))
+json.stringify({schema: 1, requests: access.len(), server_errors: total_server_errors, client_errors: total_client_errors, routes: route_rows}, pretty: true).save(evidence.join("traffic.json"))
+json.stringify({schema: 1, origin_ns: origin, duration_ns: duration_ns, events: timeline}, pretty: true).save(evidence.join("timeline.json"))
+json.stringify({schema: 1, redactions: secrets.map(.name).sort(), records: redacted_logs}, pretty: true).save(evidence.join("redacted-logs.json"))
+json.stringify({schema: 1, incident: metadata.id, actions: ordered_actions}, pretty: true).save(output.join("action-plan.json"))
+
+let evidence_files = glob(output.join("**/*").display(), hidden: true).expand().where(.is_file).sort()
+let prefix = "{output.display()}/"
+let evidence_rows = evidence_files.map(file => ({path: file.abs().display().replace(prefix, ""), bytes: file.size / 1b}))
+let summary = {
+  schema: 1,
+  operation: "incident-command-center",
+  incident: metadata,
+  severity: severity,
+  recovered: recovered,
+  objective: metadata.objective,
+  services: {total: services.len(), healthy: healthy_services.len(), degraded: degraded_services.len(), down: down_services.len()},
+  traffic: {requests: access.len(), server_errors: total_server_errors, client_errors: total_client_errors, affected_routes: affected_routes},
+  timeline: {events: timeline.len(), actions: action_events.len(), recoveries: recovery_events.len(), duration_ns: duration_ns},
+  logs: {records: redacted_logs.len(), errors: error_logs.len(), warnings: warning_logs.len(), sources: source_logs},
+  response_actions: ordered_actions,
+  evidence: evidence_rows,
+  evidence_files: evidence_rows.len(),
+  evidence_bytes: evidence_rows.map(.bytes).sum(),
+}
+json.stringify(summary, pretty: true).save(output.join("summary.json"))
+assert(output.join("summary.json").is_file, "incident summary was not persisted")
+assert(output.join("action-plan.json").is_file, "incident action plan was not persisted")
+let persisted = json.parse(output.join("summary.json").read)
+assert(persisted.severity == severity, "persisted incident severity disagrees with computed state")
+assert(persisted.logs.records == redacted_logs.len(), "persisted incident log count is incomplete")
+echo "incident {metadata.id}: {severity}, {services.len()} services, {access.len()} requests, {ordered_actions.len()} actions, {evidence_rows.len()} evidence files"

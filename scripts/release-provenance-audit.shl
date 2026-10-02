@@ -1,0 +1,47 @@
+#!/usr/bin/env shoal
+# Guard the security boundary of the tag-release workflow without publishing.
+
+let workflow = path(".github/workflows/release.yml").read
+let package = path("scripts/release-package.shl").read
+let verifier = path("scripts/verify-release.shl").read
+let release_ci = path("scripts/ci-release-build.shl").read
+let sbom = path("scripts/release-sbom.shl").read
+let inspector = path("crates/shoal-installer/src/release.rs").read
+
+assert(workflow.contains("permissions: \{\}"), "release workflow must deny token permissions by default")
+assert(workflow.contains("contents: read\n      id-token: write\n      attestations: write"), "build job lacks the exact read/OIDC attestation permission set")
+assert(!workflow.contains("artifact-metadata: write"), "file release attestations must not receive unused artifact-metadata write authority")
+assert(!workflow.contains("actions: read"), "same-run artifact download must not receive unused Actions API authority")
+assert(workflow.matches(re"(?m)^      contents: write$").len() == 1, "exactly one publish job may hold contents: write")
+assert(workflow.matches(re"(?m)^      id-token: write$").len() == 1, "only the build job may mint an OIDC identity")
+assert(workflow.contains("needs: build"), "publication must wait for every matrix build")
+assert(workflow.contains("actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0"), "GitHub attestation action is not review-pinned")
+assert(!workflow.contains("anchore/sbom-action"), "SBOM action executes a mutable upstream installer and must not be used")
+assert(workflow.contains("target/debug/shoal scripts/release-sbom.shl"), "release workflow does not use the digest-pinned SBOM generator")
+assert(workflow.contains("ubuntu-24.04-arm") && workflow.contains("macos-15-intel"), "release architecture matrix is not native")
+assert(!workflow.contains("sudo") && !workflow.contains("apt-get") && !workflow.contains("cross"), "release workflow installs mutable cross-build tooling")
+assert(package.contains("host == target"), "packager does not enforce its native runner invariant")
+assert(package.contains("--format=ustar") && package.contains("--format\", \"ustar"), "both GNU and BSD tar paths must select ustar")
+assert(package.contains("--sort=name") && package.contains("gzip\", \"-n"), "archive order or gzip header is not normalized")
+assert(package.contains("COPYFILE_DISABLE"), "macOS release packaging does not suppress AppleDouble metadata")
+assert(package.contains("source_date_epoch"), "archive timestamps are not derived from the source commit")
+assert(verifier.contains("--signer-workflow") && verifier.contains("--source-digest"), "consumer verification does not bind workflow + source identity")
+assert(verifier.contains("https://spdx.dev/Document/v2.3"), "consumer verification omits the signed SBOM predicate")
+assert(verifier.contains('run(inspector, "--json", archive, sbom_path)'), "consumer verification does not execute the semantic inspector")
+assert(verifier.match(re"(?s)attestation.*--json.*archive, sbom_path") != null, "consumer verification parses release assets before authenticating them")
+assert(!verifier.contains('run("tar", "xzf", archive'), "consumer verifier must not extract an untrusted archive")
+assert(!verifier.contains('run("tar", "xOf", archive'), "consumer verifier must not invoke an unbounded tar parser before semantic inspection")
+assert(inspector.contains("archive entry is not POSIX ustar") && inspector.contains("archive entry mtime disagrees"), "semantic inspector does not prove ustar/source-epoch metadata")
+assert(inspector.contains('SPDX/Cargo.lock package coverage mismatch'), "semantic inspector does not reconcile SPDX packages with Cargo.lock")
+assert(inspector.contains("MAX_ARCHIVE_DECOMPRESSED_BYTES") && inspector.contains("MAX_SBOM_BYTES"), "semantic inspector lacks explicit archive/SBOM input bounds")
+assert(inspector.contains("unknown endpoint") && inspector.contains("not reachable from the release root"), "semantic inspector does not prove SPDX dependency graph integrity")
+assert(release_ci.contains("scripts/release-package-test.shl"), "ordinary CI does not exercise deterministic release packaging")
+assert(sbom.contains('let syft_version = "1.48.0"'), "Syft release version is not pinned")
+assert(sbom.matches(re"[0-9a-f]{64}").len() == 4, "every supported Syft platform needs one pinned SHA-256")
+assert(sbom.contains("SYFT_CHECK_FOR_APP_UPDATE"), "pinned Syft must not perform ambient update checks")
+
+# Static workflow assertions protect authority and pins. The semantic mutation
+# suite proves that plausible-looking but false release metadata is rejected.
+run("cargo", "test", "-p", "shoal-installer", "--lib", "release::tests", "--locked", "--quiet")
+
+echo "release provenance audit passed"

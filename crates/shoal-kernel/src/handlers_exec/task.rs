@@ -13,7 +13,7 @@ impl Kernel {
         attachment: &Attachment,
         session: &Arc<Session>,
     ) -> Result<Json, RpcError> {
-        let active_slot = self.tasks.reserve(&session.key.owner())?;
+        let active_slot = self.runtime.tasks.reserve(&session.key.owner())?;
         let elide_spec = params.elide;
         let wait = params.timeout_ms.map(std::time::Duration::from_millis);
         let requested_deadline_ms = params.deadline_ms;
@@ -31,7 +31,7 @@ impl Kernel {
         // it directly instead of re-deriving it from `task_ref.0` (which
         // is already the `task:N`-prefixed ref string and would double
         // the prefix).
-        let (task_id, task_ref) = self.tasks.allocate();
+        let (task_id, task_ref) = self.runtime.tasks.allocate();
         let task_owner = session.key.owner();
         let task = Arc::new(TaskEntry::new_running(
             task_ref.clone(),
@@ -41,7 +41,7 @@ impl Kernel {
             active_slot,
             deadline_ms,
         ));
-        self.tasks.insert_checked(task.clone())?;
+        self.runtime.tasks.insert_checked(task.clone())?;
         let waiter = task.clone();
         let worker_session = session.clone();
         let kernel = self.clone();
@@ -49,7 +49,7 @@ impl Kernel {
         task_attachment.cancel_epoch = Some(cancel.clone());
         let task_attached = Some(task_attachment);
         let task_channel = format!("task.{task_id}");
-        kernel.events.publish(
+        kernel.runtime.events.publish(
             &session.key.owner(),
             &task_channel,
             json!({"$":"str","v":"started"}),
@@ -150,7 +150,7 @@ impl Kernel {
         // Release the permit and Session lease through the owned task even if
         // a simultaneous registry failure makes removal unavailable.
         task.fail_worker_panic();
-        self.tasks.remove(task_ref);
+        self.runtime.tasks.remove(task_ref);
     }
 }
 
@@ -226,7 +226,7 @@ fn run_task_worker(
         let mut inner = match task.lock_inner() {
             Ok(inner) => inner,
             Err(_) => {
-                kernel.events.publish(
+                kernel.runtime.events.publish(
                     &task.owner,
                     &task_channel,
                     json!({
@@ -314,6 +314,7 @@ fn run_task_worker(
     }
     worker_guard.disarm();
     kernel
+        .runtime
         .events
         .publish(&task.owner, &task_channel, exit_payload);
     kernel.reap_finished_tasks(&task.owner);

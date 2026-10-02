@@ -1,0 +1,24 @@
+#!/usr/bin/env shoal
+# Reconcile a deployment plan with per-host observed versions.
+
+assert(args.len() == 3, "usage: deployment-verify.shl PLAN OBSERVATIONS OUTPUT")
+let plan_file = path(args[0].str())
+let observations_file = path(args[1].str())
+let output = path(args[2].str())
+assert(plan_file.is_file && observations_file.is_file, "deployment verification input is missing")
+let plan = json.parse(plan_file.read)
+let observations = json.parse(observations_file.read)
+let rows = plan.steps.map(step => {
+  let observed = observations.find(row => row.host == step.host)
+  {
+    host: step.host,
+    expected: step.version,
+    observed: if (observed == null) { null } else { observed.version },
+    healthy: observed != null && observed.version == step.version && observed.status == "healthy",
+  }
+})
+let failures = rows.where(row => !row.healthy)
+let report = {verified: failures.is_empty(), hosts: rows, failures: failures}
+json.stringify(report, pretty: true).save(output)
+assert(failures.is_empty(), "deployment verification failed: {failures}")
+echo "verified {rows.len()} deployed hosts"

@@ -1,0 +1,26 @@
+#!/usr/bin/env shoal
+# Compare Cargo dependency inventories, including parallel package versions.
+
+assert(args.len() == 3, "usage: dependency-diff.shl BEFORE AFTER OUTPUT")
+let before_file = path(args[0].str())
+let after_file = path(args[1].str())
+let output = path(args[2].str())
+assert(before_file.is_file && after_file.is_file, "dependency inventory is missing")
+let before = json.parse(before_file.read).packages
+let after = json.parse(after_file.read).packages
+let before_groups = before.group_by(.name).map(group => ({name: group.key, versions: group.values.map(.version).uniq().sort()}))
+let after_groups = after.group_by(.name).map(group => ({name: group.key, versions: group.values.map(.version).uniq().sort()}))
+let before_names = before_groups.map(.name)
+let after_names = after_groups.map(.name)
+let added = after_groups.where(row => !(row.name in before_names))
+let removed = before_groups.where(row => !(row.name in after_names))
+let updated = after_groups.where(row => {
+  let old = before_groups.find(candidate => candidate.name == row.name)
+  old != null && old.versions != row.versions
+}).map(row => {
+  let old = before_groups.find(candidate => candidate.name == row.name)
+  {name: row.name, from: old.versions, to: row.versions}
+})
+let report = {added: added, removed: removed, updated: updated}
+json.stringify(report, pretty: true).save(output)
+echo "dependency diff: +{added.len()} -{removed.len()} ~{updated.len()}"

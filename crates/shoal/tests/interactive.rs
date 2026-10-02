@@ -62,6 +62,25 @@ fn dash_c_builtin_renders() {
 }
 
 #[test]
+fn standalone_dash_c_is_a_real_local_execution_selection() {
+    // Noninteractive execution is local by contract in both modes. Point the
+    // private-kernel override at a program that cannot exist: an accidentally
+    // kernel-routed `--standalone -c` invocation would fail before evaluation.
+    let out = Command::new(BIN)
+        .args(["--standalone", "-c", "40 + 2"])
+        .env("NO_COLOR", "1")
+        .env("SHOAL_KERNEL_BIN", "/shoal-test/no-private-kernel-here")
+        .output()
+        .expect("spawn shoal --standalone -c");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"42\n");
+}
+
+#[test]
 fn dash_c_echo_has_no_gutter() {
     // A bare `echo` prints its text verbatim — no `│` gutter glyph, which used
     // to leak into piped/non-interactive output and prefix every line.

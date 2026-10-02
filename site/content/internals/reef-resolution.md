@@ -45,7 +45,7 @@ accDescr: Nearest-first scopes produce one effective constraint, which is satisf
 | `report.rs` | source-chain explanation records |
 | `error.rs` | stable Reef error taxonomy |
 | evaluator `reef_resolve.rs` | caching, overrides, spawn hook, lock/view integration |
-| evaluator `reef_builtins.rs` | `which` and `reef` user commands |
+| evaluator `reef_builtins/{which,commands,support}` | `which`, Reef lifecycle commands, and their bounded input/report helpers |
 | evaluator `reef.rs` | prompt snapshot and script-runner selection |
 
 ## Manifest model

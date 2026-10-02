@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Resolve layered key/value configuration with last-layer-wins semantics.
+
+assert(args.len() >= 3, "usage: config-overlay.shl BASE OVERLAY... OUTPUT")
+let inputs = args.take(args.len() - 1).map(value => path(value.str()))
+let output = path(args.last().str())
+for input in inputs { assert(input.is_file, "configuration layer is missing: {input}") }
+let rows = inputs.enumerate().flat_map(pair => {
+  let layer = pair[0]
+  let document = json.parse(pair[1].read)
+  assert(document.len() >= 0, "configuration layer must be a sequence: {pair[1]}")
+  document.map(entry => ({key: entry.key, value: entry.value, layer: layer}))
+})
+let invalid = rows.where(row => row.key == null || row.key.str().is_empty())
+assert(invalid.is_empty(), "configuration keys must be non-empty strings")
+let resolved = rows.group_by(.key).map(group => group.values.sort_by(row => -row.layer).first())
+  .map(row => ({key: row.key, value: row.value, source_layer: row.layer}))
+  .sort_by(.key)
+let report = {layers: inputs.len(), source_entries: rows.len(), resolved: resolved}
+json.stringify(report, pretty: true).save(output)
+echo "resolved {rows.len()} entries into {resolved.len()} keys"

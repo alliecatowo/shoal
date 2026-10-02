@@ -1,6 +1,7 @@
 //! Portable node/metadata admission for `cp`.
 
-use super::*;
+use shoal_value::{ErrorVal, FsCopySource, FsCopyTarget, VResult};
+use std::path::Path;
 
 pub(super) struct PortableSource {
     pub(super) is_dir: bool,
@@ -8,7 +9,7 @@ pub(super) struct PortableSource {
 }
 
 pub(super) fn inspect_source(
-    fs: &dyn Fs,
+    source: &dyn FsCopySource,
     path: &Path,
     metadata: &std::fs::Metadata,
 ) -> VResult<PortableSource> {
@@ -26,10 +27,20 @@ pub(super) fn inspect_source(
             "special files such as FIFOs, sockets, and device nodes",
         ));
     }
-    if fs
-        .has_extended_attributes(path)
-        .map_err(|error| super::super::ioerr("copy metadata", path, error))?
-    {
+    let has_extended_attributes = source.has_extended_attributes().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            ErrorVal::new(
+                "unsupported",
+                format!(
+                    "copy metadata {} requires descriptor-based inspection: {error}",
+                    path.display()
+                ),
+            )
+        } else {
+            super::super::ioerr("copy metadata", path, error)
+        }
+    })?;
+    if has_extended_attributes {
         return Err(unsupported_source(path, "extended attributes"));
     }
     #[cfg(unix)]
@@ -57,11 +68,16 @@ pub(super) fn inspect_source(
     })
 }
 
-pub(super) fn validate_destination(fs: &dyn Fs, path: &Path, source_is_dir: bool) -> VResult<()> {
-    let metadata = match fs.symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(super::super::ioerr("copy", path, error)),
+pub(super) fn validate_destination(
+    target: &dyn FsCopyTarget,
+    path: &Path,
+    source_is_dir: bool,
+) -> VResult<()> {
+    let Some(metadata) = target
+        .metadata()
+        .map_err(|error| super::super::ioerr("copy", path, error))?
+    else {
+        return Ok(());
     };
     if metadata.file_type().is_symlink() {
         return Err(unsupported_destination(path, "a symbolic link"));
@@ -79,8 +95,8 @@ pub(super) fn validate_destination(fs: &dyn Fs, path: &Path, source_is_dir: bool
             return Err(unsupported_destination(path, "a hard-linked file alias"));
         }
     }
-    if fs
-        .has_extended_attributes(path)
+    if target
+        .has_extended_attributes()
         .map_err(|error| super::super::ioerr("copy metadata", path, error))?
     {
         return Err(unsupported_destination(path, "extended attributes"));

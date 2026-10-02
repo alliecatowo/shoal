@@ -1,6 +1,6 @@
 //! Private one-shot kernel transport for the interactive shell.
 
-use shoal_mcp::{Config, KernelClient, LocalAuthMode};
+use shoal_mcp::{Config, KernelClient};
 use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -115,10 +115,10 @@ pub(crate) fn connect(
         socket: PathBuf::new(),
         session: Some(config.session),
         token: None,
-        local_auth: LocalAuthMode::LocalHuman,
     };
-    let client = KernelClient::from_stream(parent, &client_config, "shoal-repl", true)
-        .map_err(|error| error.to_string())?;
+    let client =
+        KernelClient::from_embedded_human_stream(parent, &client_config, "shoal-repl", true)
+            .map_err(|error| error.to_string())?;
     Ok((client, guard))
 }
 

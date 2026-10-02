@@ -1,0 +1,24 @@
+#!/usr/bin/env shoal
+# Validate structural, uniqueness, and license policy for a generated SBOM.
+
+assert(args.len() == 2, "usage: sbom-verify.shl SBOM OUTPUT")
+let sbom_file = path(args[0].str())
+let output = path(args[1].str())
+assert(sbom_file.is_file, "SBOM is missing: {sbom_file}")
+let sbom = json.parse(sbom_file.read)
+assert(sbom.spec_version == 1 && sbom.components != null, "unsupported SBOM format")
+assert(sbom.component_count == sbom.components.len(), "SBOM component count drift")
+let missing_identity = sbom.components.where(component => component.name.is_empty() || component.version.is_empty())
+let duplicate = sbom.components.group_by(component => "{component.name}:{component.version}:{component.source}")
+  .where(group => group.values.len() > 1).map(.key)
+let unknown_licenses = sbom.components.where(.license == "NOASSERTION")
+let report = {
+  valid: missing_identity.is_empty() && duplicate.is_empty(),
+  components: sbom.components.len(),
+  missing_identity: missing_identity,
+  duplicate_identities: duplicate,
+  unknown_license_components: unknown_licenses.map(.name).sort(),
+}
+assert(report.valid, "SBOM validation failed: {report}")
+json.stringify(report, pretty: true).save(output)
+echo "verified {report.components} SBOM components; {unknown_licenses.len()} need license review"

@@ -41,7 +41,31 @@ Source: [`shoal-mcp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoa
 On startup, the facade attempts to connect to the discovered kernel socket. If unavailable, it
 best-effort spawns a detached `shoal-kernel`, polls readiness for about five seconds, then connects.
 `SHOAL_NO_AUTOSTART` opts out for externally supervised kernels. Competing autostarts rely on the
-kernel's socket preparation to leave one winner.
+kernel's socket preparation to leave one winner. The spawned kernel announces readiness on inherited
+stderr and then closes that descriptor, so an outer process capturing the short-lived launcher does
+not retain a pipe until daemon shutdown. Explicit `shoal kernel start` additionally provisions an
+owner-only per-socket `supervisor` bearer. The child blocks on an inherited parent-death gate while
+the launcher durably binds that bearer to the exact spawned PID; only the release byte lets it bind
+and publish the socket. Parent loss before release makes the child revoke the bearer and exit, while
+a concurrent credential replacement makes PID binding fail closed. After readiness, the launcher
+also checks `kernel.status` reports that same PID. `shoal kernel stop` verifies the PID before
+consuming and revoking the credential.
+The per-socket lifecycle lock spans provision through readiness, so a waiting explicit start
+re-probes the socket under serialization and cannot revoke a now-live winner.
+This is a credentialed management path, not an expansion of tokenless public authority.
+
+Two defaults that operate at different layers must not be conflated. A kernel started without
+`--policy` constructs a permissive Leash entry only for its private `uid:<euid>` local-human
+principal. The named public socket cannot select that principal: tokenless MCP attaches as
+`agent:mcp`/`restricted-agent`, which receives no implicit Leash grant. A bearer selects the token's
+machine principal, whose effects likewise require an explicit policy entry. Thus “the kernel has a
+default permissive policy” describes its private-human policy object, not effective public MCP
+authority.
+
+`shoal-mcp` has no public local-human configuration mode. The former `--local-human` flag is retired
+and exits with migration guidance; a hand-crafted `local_auth:"local-human"` attach is independently
+rejected by the named kernel. Use a policy-scoped bearer for automation that needs effects, or the
+private interactive REPL when human-presence authority is actually required.
 
 Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB content limit
 enforced during the read, so an unterminated frame cannot grow the line buffer past the bound plus

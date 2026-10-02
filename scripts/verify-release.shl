@@ -1,0 +1,77 @@
+#!/usr/bin/env shoal
+# Verify release checksums, archive shape, build metadata, and GitHub signatures.
+
+let local_only = !args.is_empty() && args.first().str() == "--local"
+let values = if local_only { args.skip(1) } else { args }
+assert(values.len() == 1 || values.len() == 2, "usage: verify-release.shl [--local] ARCHIVE [OWNER/REPO]")
+let archive = path(values[0].str())
+let repository = if (values.len() == 2) { values[1].str() } else { "alliecatowo/shoal" }
+let checksum = path("{archive}.sha256")
+let sbom_path = path("{archive}.spdx.json")
+assert(archive.is_file, "missing release archive: {archive}")
+assert(checksum.is_file, "missing release checksum manifest: {checksum}")
+assert(sbom_path.is_file, "missing release SBOM: {sbom_path}")
+let signer = "{repository}/.github/workflows/release.yml"
+
+# Authenticate every byte-bearing input before tar/JSON parsing. The later
+# source-ref/digest checks bind these already-authenticated assets to the exact
+# BUILDINFO claims after bounded semantic inspection.
+if !local_only {
+  assert((which gh).out != null, "GitHub CLI is required for signature verification; use --local only for unsigned local fixtures")
+  run("gh", "attestation", "verify", archive, "--repo", repository, "--signer-workflow", signer)
+  run("gh", "attestation", "verify", checksum, "--repo", repository, "--signer-workflow", signer)
+  run("gh", "attestation", "verify", sbom_path, "--repo", repository, "--signer-workflow", signer)
+  run("gh", "attestation", "verify", archive, "--repo", repository, "--signer-workflow", signer, "--predicate-type", "https://spdx.dev/Document/v2.3")
+}
+
+fn sha256(file: path) {
+  let result = if ((which sha256sum).out != null) {
+    run("sha256sum", file)
+  } else {
+    run("shasum", "-a", "256", file)
+  }
+  let fields = result.out.trim().split(" ").where(field => !field.is_empty())
+  assert(!fields.is_empty(), "checksum tool returned no digest for {file}")
+  fields.first()
+}
+
+let checksum_rows = checksum.read.lines().where(line => !line.trim().is_empty()).map(line => {
+  let fields = line.split(" ").where(field => !field.is_empty())
+  assert(fields.len() == 2, "malformed checksum manifest row: {line}")
+  assert(fields[0].match(re"^[0-9a-f]{64}$") != null, "invalid SHA-256 digest: {fields[0]}")
+  {digest: fields[0], name: fields[1]}
+})
+assert(checksum_rows.len() == 2, "checksum manifest must cover exactly archive + SBOM")
+assert(checksum_rows.map(.name).uniq().len() == 2, "checksum manifest contains duplicate subjects")
+let archive_row = checksum_rows.find(.name == archive.name)
+let sbom_row = checksum_rows.find(.name == sbom_path.name)
+assert(archive_row != null && sbom_row != null, "checksum manifest names do not match release assets")
+assert(archive_row.digest == sha256(archive), "archive checksum mismatch: {archive}")
+assert(sbom_row.digest == sha256(sbom_path), "SBOM checksum mismatch: {sbom_path}")
+
+let root = archive.name.replace(".tar.gz", "")
+let release_inspector = "shoal-release-inspect"
+
+let inspector_candidates = [
+  path(root).join(release_inspector),
+  path("target/debug").join(release_inspector),
+  path("target/release").join(release_inspector),
+  path(release_inspector),
+]
+let local_inspector = inspector_candidates.find(candidate => candidate.is_file)
+let inspector = local_inspector ?? ((which shoal-release-inspect).out)
+assert(inspector != null, "shoal-release-inspect is required for semantic archive/SPDX verification")
+let inspection_result = run(inspector, "--json", archive, sbom_path)
+assert(inspection_result.ok, "semantic release inspection failed: {inspection_result.err}")
+let inspection = json.parse(inspection_result.stdout.str())
+
+if !local_only {
+  let source_ref = "refs/tags/{inspection.tag}"
+  run("gh", "attestation", "verify", archive, "--repo", repository, "--signer-workflow", signer, "--source-ref", source_ref, "--source-digest", inspection.commit)
+  run("gh", "attestation", "verify", checksum, "--repo", repository, "--signer-workflow", signer, "--source-ref", source_ref, "--source-digest", inspection.commit)
+  run("gh", "attestation", "verify", sbom_path, "--repo", repository, "--signer-workflow", signer, "--source-ref", source_ref, "--source-digest", inspection.commit)
+  run("gh", "attestation", "verify", archive, "--repo", repository, "--signer-workflow", signer, "--source-ref", source_ref, "--source-digest", inspection.commit, "--predicate-type", "https://spdx.dev/Document/v2.3")
+}
+
+let verification_scope = if local_only { "local structure" } else { "signed provenance" }
+echo "verified release: {archive} (checksums + archive + SBOM + {verification_scope})"

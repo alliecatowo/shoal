@@ -19,7 +19,7 @@ mod keybindings;
 mod prompt;
 mod repl;
 mod repl_state;
-use args::Action;
+use args::{Action, ExecutionHost, ExecutionMode, ExecutionSurface};
 
 fn main() {
     if let Err(error) = run() {
@@ -114,16 +114,16 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             println!("shoal {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
-        Action::Command(src, args) => run_source(&src, None, false, args),
-        Action::Script(path, args) => {
+        Action::Command { source, args, mode } => run_source(&source, None, mode, args),
+        Action::Script { path, args, mode } => {
             let src = args::read_source_path(&path)?;
-            run_source(&src, Some(&path), false, args)
+            run_source(&src, Some(&path), mode, args)
         }
-        Action::Stdin => {
+        Action::Stdin { mode } => {
             let src = args::read_source_stream(io::stdin().lock(), "stdin")?;
-            run_source(&src, Some(Path::new("<stdin>")), false, Vec::new())
+            run_source(&src, Some(Path::new("<stdin>")), mode, Vec::new())
         }
-        Action::Interactive { standalone } => repl::repl(standalone),
+        Action::Interactive { mode } => repl::repl(mode),
         Action::Fmt { check, files } => args::fmt_command(check, files),
         Action::Doctor { json } => {
             let report = shoal_doctor::run(&shoal_doctor::Options::from_env());
@@ -150,7 +150,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
 fn run_source(
     src: &str,
     source: Option<&Path>,
-    interactive: bool,
+    mode: ExecutionMode,
     args: Vec<OsString>,
 ) -> Result<i32, String> {
     // Config loads before the parse attempt (rather than after, as a syntax-
@@ -174,12 +174,13 @@ fn run_source(
         }
     };
     let mut evaluator = Evaluator::new(cwd);
-    let surface = if interactive {
-        shoal_host::Surface::Interactive
-    } else {
-        shoal_host::Surface::NonInteractive
-    };
-    let report = bootstrap.apply(&mut evaluator, surface, "human")?;
+    let host = args::execution_host(
+        mode,
+        ExecutionSurface::NonInteractive,
+        bootstrap.config().kernel.enabled,
+    );
+    debug_assert_eq!(host, ExecutionHost::LocalEvaluator);
+    let report = bootstrap.apply(&mut evaluator, shoal_host::Surface::NonInteractive, "human")?;
     for warning in &report.warnings {
         eprintln!(
             "{}",

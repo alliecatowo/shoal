@@ -93,10 +93,10 @@ fn protocol_outcome(render: Option<&str>, state: &str) -> ProtocolOutcome {
 
 #[test]
 fn explicit_standalone_and_disabled_kernel_never_route_to_protocol() {
-    assert!(!protocol_requested(true, true));
-    assert!(!protocol_requested(true, false));
-    assert!(!protocol_requested(false, false));
-    assert!(protocol_requested(false, true));
+    assert!(!protocol_requested(ExecutionMode::Standalone, true));
+    assert!(!protocol_requested(ExecutionMode::Standalone, false));
+    assert!(!protocol_requested(ExecutionMode::Default, false));
+    assert!(protocol_requested(ExecutionMode::Default, true));
 }
 
 #[test]

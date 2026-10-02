@@ -1,0 +1,25 @@
+#!/usr/bin/env shoal
+# Summarize a journal export by outcome and command head.
+
+assert(args.len() == 2, "usage: journal-summary.shl EXPORT OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "journal export is missing: {input}")
+let export = json.parse(input.read)
+assert(export.schema == 1 && export.records != null, "unsupported journal export")
+let records = export.records
+let outcomes = records.group_by(.status).map(group => ({status: group.key, count: group.values.len()})).sort_by(.status)
+let commands = records.group_by(.command).map(group => ({
+  command: group.key,
+  count: group.values.len(),
+  failures: group.values.where(.status != "ok").len(),
+})).sort_by(row => -row.count)
+let summary = {
+  records: records.len(),
+  successes: records.where(.status == "ok").len(),
+  failures: records.where(.status != "ok").len(),
+  outcomes: outcomes,
+  commands: commands,
+}
+json.stringify(summary, pretty: true).save(output)
+echo "summarized {records.len()} journal records"

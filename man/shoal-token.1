@@ -14,10 +14,57 @@ shoal-token \- manage Shoal capability tokens
 .I id
 .SH DESCRIPTION
 Creates, lists, and revokes credentials used to authenticate kernel clients.
+The bearer secret produced by
+.B create
+is shown exactly once and is not recoverable through
+.BR list .
+.SH COMMANDS
+.TP
+.BI create " PRINCIPAL [PROFILE]"
+Create a token for PRINCIPAL and an optional policy PROFILE.
+.B \-\-cap CAP
+is repeatable;
+.B \-\-ttl SECONDS
+sets an expiry duration.
+.TP
+.B list
+Print token ID, principal, profile, and active or revoked state as tab-separated metadata.
+.TP
+.BI revoke " ID"
+Mark ID revoked so it cannot authenticate a new session.
+.SH OPTIONS
+.TP
+.BI \-\-cap " CAP"
+Grant CAP to a newly created token; repeat for multiple capabilities.
+.TP
+.BI \-\-ttl " SECONDS"
+Expire a new token after the specified duration.
+.TP
+.BR \-h , " \-\-help"
+Print command help and exit.
+.TP
+.BR \-V , " \-\-version"
+Print the version and exit.
+.SH OUTPUT
+.B create
+writes the bearer secret to standard output and the created token ID to standard error.
+.B list
+writes metadata only; revoke is silent on success.
+.SH ERRORS
+Unknown commands or options, missing values, invalid TTLs, unknown revoke IDs,
+and token-store or encryption failures are reported without redisplaying existing secrets.
 .SH ENVIRONMENT
 .TP
 .B SHOAL_TOKEN_STORE
-Override the token database path.
+Override the token database path used by the kernel and token manager.
+.SH EXAMPLES
+.EX
+shoal-token create automation restricted-agent --cap fs.read --ttl 3600
+shoal-token list
+shoal-token revoke TOKEN_ID
+.EE
+.SH EXIT STATUS
+Returns 0 on success and 1 for input, storage, encryption, or token lookup failures.
 .SH SEE ALSO
 .BR shoal-mcp (1),
 .BR shoal-kernel (1)
