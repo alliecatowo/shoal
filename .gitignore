@@ -4,3 +4,11 @@
 *.pdb
 scratch/
 reef.lock
+
+.env
+.env.*
+!.env.example
+/.mcp.json
+*.log
+.DS_Store
+.claude/worktrees/

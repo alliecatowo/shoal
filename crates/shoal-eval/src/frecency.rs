@@ -424,11 +424,11 @@ mod tests {
     fn query_is_case_insensitive_substring() {
         let now = 500;
         let mut store = FrecencyStore::default();
-        store.add(Path::new("/home/allie/Develop/Shoal"), now);
-        store.add(Path::new("/home/allie/downloads"), now);
+        store.add(Path::new("/home/user/Develop/Shoal"), now);
+        store.add(Path::new("/home/user/downloads"), now);
         let hit = store.ranked(Some("shoal"), now);
         assert_eq!(hit.len(), 1);
-        assert_eq!(hit[0].path, PathBuf::from("/home/allie/Develop/Shoal"));
+        assert_eq!(hit[0].path, PathBuf::from("/home/user/Develop/Shoal"));
         // A substring that matches nothing yields no candidates.
         assert!(store.ranked(Some("zzz"), now).is_empty());
     }
