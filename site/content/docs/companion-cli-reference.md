@@ -76,29 +76,85 @@ main binary cannot be updated while its required companions remain stale:
 
 ```bash
 mise install
-mise run install            # staged, verified install with automatic failure rollback
+mise run install            # locked, crash-recoverable install of one managed generation
 mise run install:clean      # remove the managed set, then reinstall transactionally
 mise run install:check      # compare binaries, man pages, and completions
 mise run install:test       # exercise the lifecycle under a temporary prefix
-mise run install:uninstall  # remove only managed Shoal artifacts
+mise run install:uninstall  # remove only unchanged managed Shoal artifacts
+mise run install:uninstall:force # explicitly remove user-replaced managed names
 ```
 
 Executables go to `${CARGO_HOME:-$HOME/.cargo}/bin` and section-1 man pages to
 the sibling `share/man/man1`; set `SHOAL_INSTALL_DIR` or `SHOAL_MAN_DIR` to
-override either destination. Bash, zsh, and fish completions are installed under the prefix's
+override either destination. Both destinations must remain beneath the install prefix; the helper
+rejects an override that would escape it. Bash, zsh, and fish completions are installed under the prefix's
 standard `share/bash-completion`, `share/zsh/site-functions`, and
-`share/fish/vendor_completions.d` directories. The installer stages and validates every input before
-the first destination mutation, replaces each file through a same-directory rename, and restores
-the complete prior managed set if a commit fails. `--uninstall` is source-independent and leaves
-unrelated prefix files untouched.
+`share/fish/vendor_completions.d` directories.
 
-Release archives contain `install.shl` beside the binaries and `man/`. From an extracted archive,
+The installer serializes callers with an owner-only `0600` prefix lock and a bounded ten-second
+wait. It stages and hashes all 23 installed artifacts, records the complete old and intended new
+identities in a private, fsynced journal, durably backs up the old generation, and only then begins
+fd-relative same-directory replacements. A later invocation detects an interrupted transaction
+before doing anything else: a pre-commit crash deterministically restores the complete old
+generation, while a fully committed journal verifies and finalizes the new generation. Set
+`SHOAL_INSTALL_LOCK_TIMEOUT_MS` to a smaller bounded wait for automation.
+
+The owner-only `.shoal-install-manifest.json` records the installed SHA-256, size, mode, and
+generation. `--check` reconciles that manifest with both disk and the selected release. Uninstall
+is source-independent but refuses to remove a managed name whose contents or mode changed after
+installation; review the replacement, then use `--uninstall --force` only when removing it is
+intentional. Unrelated prefix files and shared directories are never owned or removed.
+
+Release archives contain `install.shl` and its narrowly scoped
+`shoal-install-transaction` helper beside the binaries and `man/`. The helper is release bootstrap
+machinery and is not part of the 23-file installed generation. From an extracted archive,
 run it through the included executable with explicit destinations when desired:
 
 ```bash
 SHOAL_RELEASE_DIR="$PWD" SHOAL_INSTALL_DIR="$HOME/.local/bin" \
   ./shoal ./install.shl
 ```
+
+### Verify a release before installation
+
+Each target has three release assets: the `.tar.gz` archive, an SPDX 2.3 `.spdx.json` SBOM, and a
+`.sha256` manifest covering both. The archive, checksum manifest, and SBOM each carry GitHub
+Sigstore-backed build provenance; the archive also carries a signed SBOM attestation. Verification
+must bind the signature to this repository, the release workflow, the tag ref, and the source commit
+rather than merely accepting any valid Sigstore identity.
+
+From a source checkout, download all three same-target assets into one directory and run:
+
+```bash
+shoal scripts/verify-release.shl shoal-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+The verifier first runs `gh attestation verify` for SLSA provenance on all three assets and the SPDX
+predicate on the archive, before feeding any asset to tar or JSON parsers. Its included
+`shoal-release-inspect` helper then reads compressed, expanded, per-entry, entry-count, and SBOM data
+through explicit bounds without extracting the archive. It enforces the exact lexical inventory,
+ordinary-file types, root ownership/names, portable modes, source-epoch mtimes, canonical numeric,
+link, device, reserved-header and padding bytes, and executable hashes rather than trusting
+`BUILDINFO.json`. It structurally validates SPDX document/root identity, every relationship endpoint,
+direction and root reachability, and reconciles every distinct Cargo.lock name/version (source
+duplicates collapse only where SPDX cannot preserve Cargo source identity). A second attestation pass
+binds those authenticated assets to the parsed tag and exact commit. Both passes pin the signer to
+`alliecatowo/shoal/.github/workflows/release.yml`, the declared tag ref, and the 40-character commit
+inside `BUILDINFO.json`. `gh` must be authenticated sufficiently to read public attestations. Use
+`--local` only for repository tests or locally built unsigned packages; it deliberately does not
+establish publisher identity.
+
+For bootstrap verification without a checkout, the equivalent first trust-establishing command is:
+
+```bash
+gh attestation verify ARCHIVE.tar.gz \
+  --repo alliecatowo/shoal \
+  --signer-workflow alliecatowo/shoal/.github/workflows/release.yml
+```
+
+After that signature succeeds, extract the archive and use its attested `verify-release.shl` with the
+included `shoal` binary to apply the complete checksum/SBOM/source-identity policy to the three
+downloaded assets.
 
 Installation does
 not restart an existing durable kernel because that would discard its live
@@ -165,7 +221,11 @@ Readiness is printed to stderr:
 shoal-kernel: ready /path/to/default.sock
 ```
 
-SIGINT/SIGTERM asks the serve loop to stop and removes the bound socket on normal teardown. The kernel is foreground by default; use a user service manager for production lifecycle rather than shell backgrounding.
+Readiness is emitted only after the socket has been privately bound as `0600` and atomically
+published without overwriting a replacement. SIGINT/SIGTERM asks the serve loop to stop and removes
+the exact socket inode published by this process on normal teardown; a later pathname replacement is
+preserved. The kernel is foreground by default; use a user service manager for production lifecycle
+rather than shell backgrounding.
 
 Socket discovery and protocol details are in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md) and [Kernel protocol](@/docs/kernel-protocol.md).
 
@@ -188,6 +248,11 @@ Flags overwrite environment-derived fields. If neither flag nor environment sele
 
 The process uses stdin/stdout exclusively for newline-framed MCP JSON-RPC. Do not pipe logging into stdout. Errors go to stderr; normal fatal exit is status 1, usage is status 2.
 
+The former `--local-human` option is retired and returns status 2 with migration guidance. A named
+or public socket cannot establish human presence, and `shoal-mcp` has no config field that can request
+that upgrade. Give a machine principal explicit policy grants and authenticate with `--token`, or
+use the listener-free private interactive REPL for local-human authority.
+
 ### Autostart
 
 If the socket is not listening, the facade tries:
@@ -196,7 +261,7 @@ If the socket is not listening, the facade tries:
 shoal-kernel --socket <selected-path>
 ```
 
-as a detached process with null standard streams and its own process group, then polls for roughly five seconds. It does not pass MCP's session, token, state directory, or policy as kernel flags. In particular, `--session` selects client attachment/socket derivation; the autostarted kernel still uses its own default state and permissive policy unless separately configured through lifecycle.
+as a detached process with null standard streams and its own process group, then polls for roughly five seconds. It does not pass MCP's session, token, state directory, or policy as kernel flags. In particular, `--session` selects client attachment/socket derivation. The autostarted kernel constructs its default state and a permissive Leash entry for the private `uid:<euid>`/`local-human` principal, but the public MCP connection cannot assume that identity: tokenless attach is `agent:mcp`/`restricted-agent` with no implicit Leash grant. A bearer principal also needs an explicit policy entry. Configure and supervise the kernel explicitly when the agent needs selected effects.
 
 For an explicitly managed secure policy:
 

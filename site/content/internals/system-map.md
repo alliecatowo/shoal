@@ -179,6 +179,16 @@ and isolation bugs.
 | auth tokens and policy | user state directory | filesystem | kernel/policy loaders |
 | secrets | encrypted secret store | filesystem | same-user callers with key access |
 
+The kernel composition root mirrors those lifetime boundaries instead of carrying a flat bag of
+state. `Kernel` owns five typed groups: session runtime resources, connection admission controls,
+persistence, authority, and process lifecycle. `KernelBuilder` is the single allocation path for
+both ephemeral and durable kernels; the daemon supplies durable paths, policy, quotas, listener
+security, and self-ack policy before `build`, and configured limits cannot be mutated afterward.
+The older convenience constructors only select builder options. `server.rs` owns transport serving,
+while plan derivation, event payload construction, and completion have focused owners. Source guards
+keep the root below 400 lines before its audit tests, reject additional construction paths and
+post-build configuration APIs, and classify both `src/**/tests.rs` and crate-level `tests/` as tests.
+
 ```mermaid
 flowchart TB
 accTitle: State ownership

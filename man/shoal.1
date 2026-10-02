@@ -11,24 +11,102 @@ shoal \- run the Shoal language and interactive shell
 .I command
 .RI [ args ...]
 .SH DESCRIPTION
-Shoal is a structured, typed shell language backed by a resident execution kernel.
+Shoal evaluates structured, typed shell programs either in an interactive editor,
+from standard input, from a source file, or from an inline command.
+Interactive mode normally communicates with an isolated private execution kernel;
+.B \-\-standalone
+runs the evaluator in-process without the kernel protocol.
+Scripts, inline commands, and standard-input programs are already local,
+non-interactive evaluator runs; for those modes the option is an explicit,
+idempotent selection.
+Script arguments are exposed to source as the
+.B args
+list, and the source path is exposed as
+.BR script .
 .SH OPTIONS
 .TP
 .BR \-c , " \-\-command " SOURCE
-Evaluate source and exit.
+Evaluate SOURCE instead of reading a file or standard input.
+Remaining arguments populate the Shoal
+.B args
+list.
 .TP
 .B \-\-standalone
-Use an embedded kernel.
+Use local evaluation. This skips the private kernel in interactive mode;
+non-interactive execution is already local. It does not select a separate language.
 .TP
 .BR \-h , " \-\-help"
-Print help.
+Print complete command help and exit.
 .TP
 .BR \-V , " \-\-version"
-Print the version.
+Print the version and exit.
 .SH COMMANDS
-.BR kernel , fmt , doctor , lsp , mcp , completions , prompt .
+.TP
+.B kernel
+Start, inspect, or stop the resident kernel with
+.BR start ,
+.BR status ,
+or
+.BR stop .
+Pass
+.B \-\-json
+after the action for a structured response.
+An explicit start records an owner-only supervisor credential for the matching stop;
+.B SHOAL_TOKEN
+overrides that managed credential when set.
+.TP
+.B fmt
+Format Shoal source or use
+.B \-\-check
+to report whether files would change without writing them.
+.TP
+.B doctor
+Diagnose paths, configuration, platform support, sandboxing, and companions;
+.B \-\-json
+emits the full structured report.
+.TP
+.B lsp
+Launch the
+.BR shoal-lsp (1)
+companion.
+.TP
+.B mcp
+Launch the
+.BR shoal-mcp (1)
+companion.
+.TP
+.B completions
+Generate bash, zsh, or fish completion source.
+.TP
+.B prompt
+Print, explain, or benchmark a configured prompt side.
+.B \-\-side SIDE
+selects left, right, continuation, or transient;
+.B \-\-n N
+sets the benchmark sample count.
+.SH OUTPUT
+Command text and structured values are rendered on standard output.
+Warnings and source-located parse or evaluation diagnostics are written to standard error.
+.SH ERRORS
+Unreadable, non-regular, oversized, or non-UTF-8 source is rejected before evaluation.
+Parse errors return status 2; evaluation errors retain a valid typed status where possible.
+.SH EXAMPLES
+.EX
+shoal
+shoal --standalone -c 'math.sqrt(9)'
+shoal scripts/check.shl release
+shoal doctor --json
+.EE
+.SH EXIT STATUS
+Returns 0 on success and 2 for parse errors.
+Evaluation failures return their typed status when it is between 1 and 255, otherwise 1.
+The Shoal
+.B exit CODE
+builtin returns CODE without rendering a trailing value.
 .SH SEE ALSO
 .BR shoal-kernel (1),
 .BR shoal-history (1),
 .BR shoal-secret (1),
-.BR shoal-token (1)
+.BR shoal-token (1),
+.BR shoal-lsp (1),
+.BR shoal-mcp (1)

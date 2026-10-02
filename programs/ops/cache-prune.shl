@@ -1,0 +1,39 @@
+#!/usr/bin/env shoal
+# Apply a cache prune plan, constrained to one explicit cache root.
+
+assert(args.len() == 2, "usage: cache-prune.shl ROOT PLAN")
+let root = path(args[0].str()).abs()
+let plan_file = path(args[1].str())
+assert(root.is_dir, "cache root is not a directory: {root}")
+assert(plan_file.is_file, "cache prune plan is missing: {plan_file}")
+let plan = json.parse(plan_file.read)
+assert(plan.schema == 2 && plan.remove != null, "unsupported cache prune plan")
+assert((stat (root)).type == "dir", "cache root must not be a symbolic link: {root}")
+let root_prefix = "{root.display()}/"
+let duplicate_paths = plan.remove.group_by(.path).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_paths.is_empty(), "cache prune plan contains duplicate paths: {duplicate_paths}")
+assert(plan.remove.map(.bytes).sum() == plan.reclaim_bytes, "cache prune plan byte accounting is inconsistent")
+var removed = 0
+var reclaimed = 0
+for entry in plan.remove {
+  let segments = entry.path.split("/")
+  assert(!entry.path.is_empty() && !entry.path.starts_with("/") && !(".." in segments) && !("." in segments) && !("" in segments), "prune path is not a clean relative path: {entry.path}")
+  var parent = root
+  for segment in segments.take(segments.len() - 1) {
+    parent = parent.join(segment)
+    assert((stat (parent)).type == "dir", "prune path crosses a non-directory or symbolic link: {entry.path}")
+  }
+  let candidate = root.join(entry.path).abs()
+  assert(candidate.display().starts_with(root_prefix), "prune path escapes cache root: {entry.path}")
+  assert((stat (candidate)).type == "file", "planned cache file is missing, symbolic, or not ordinary: {candidate}")
+  assert(candidate.size / 1b == entry.bytes, "planned cache file changed size: {candidate}")
+  assert(entry.sha256.len() == 64, "planned cache file lacks a SHA-256 identity: {candidate}")
+}
+for entry in plan.remove {
+  let candidate = root.join(entry.path).abs()
+  let deleted = (rm --permanent --expect-sha256=(entry.sha256) --expect-bytes=(entry.bytes) (candidate))
+  removed += 1
+  reclaimed += entry.bytes
+}
+assert(reclaimed == plan.reclaim_bytes, "prune reclaimed byte accounting drift")
+echo "removed {removed} cache files and reclaimed {reclaimed} bytes"

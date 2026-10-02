@@ -83,6 +83,7 @@ impl Kernel {
         let params: BlobGetParams = decode(params)?;
         let hash = params.hash;
         let journal = self
+            .persistence
             .journal
             .lock()
             .map_err(|_| poisoned_subsystem("journal"))?;

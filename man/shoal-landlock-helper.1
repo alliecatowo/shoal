@@ -5,8 +5,26 @@ shoal-landlock-helper \- probe Shoal Landlock enforcement
 .B shoal-landlock-helper
 .I allowed_path denied_path
 .SH DESCRIPTION
-Internal installation diagnostic that verifies an allowed path remains readable while a denied path does not.
-Its exit status is intended for Shoal Doctor rather than interactive use.
+Internal installation diagnostic used by Shoal Doctor.
+It applies a read sandbox, then proves ALLOWED_PATH remains readable and DENIED_PATH does not.
+.SH OPTIONS
+.TP
+.BR \-h , " \-\-help"
+Print the probe contract and exit.
+.TP
+.BR \-V , " \-\-version"
+Print the version and exit.
+.SH OUTPUT
+Produces no output on a successful probe; callers interpret the exit status.
+.SH ERRORS
+Usage, unavailable enforcement, allowed-read failure, and failed denial have distinct statuses.
+.SH EXAMPLES
+.EX
+shoal-landlock-helper ./allowed.txt ./denied.txt
+.EE
+.SH EXIT STATUS
+Returns 0 on success, 64 for invalid usage, 77 when enforcement is unavailable,
+2 when ALLOWED_PATH cannot be read, and 3 when DENIED_PATH remains readable.
 .SH SEE ALSO
 .BR shoal-doctor (1),
 .BR shoal-sandbox-exec (1)

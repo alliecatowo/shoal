@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Redact configured exact secret values from structured log messages.
+
+assert(args.len() == 3, "usage: log-redact.shl LOGS SECRETS OUTPUT")
+let logs_file = path(args[0].str())
+let secrets_file = path(args[1].str())
+let output = path(args[2].str())
+assert(logs_file.is_file && secrets_file.is_file, "log redaction input is missing")
+let secrets = json.parse(secrets_file.read).map(.value)
+let invalid = secrets.where(value => value.len() < 4)
+assert(invalid.is_empty(), "refusing dangerously short redaction values")
+let logs = json.parse(logs_file.read)
+let rows = logs.map(row => {
+  var message = row.message
+  for secret in secrets { message = message.replace(secret, "[REDACTED]") }
+  {level: row.level, message: message}
+})
+let leaked = rows.where(row => secrets.where(secret => row.message.contains(secret)).len() > 0)
+assert(leaked.is_empty(), "redacted log still contains configured secret material")
+json.stringify({records: rows, redactions: secrets.len()}, pretty: true).save(output)
+echo "redacted {logs.len()} log records using {secrets.len()} protected values"

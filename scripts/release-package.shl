@@ -1,5 +1,5 @@
 #!/usr/bin/env shoal
-# Cross-build and package the exact public executable set for one target.
+# Build natively and package the exact public executable set for one target.
 
 assert(args.is_empty() || args.len() == 2, "usage: release-package.shl [TAG TARGET]")
 let tag = (env SHOAL_RELEASE_TAG).out ?? (if (args.len() == 2) { args[0].str() } else { "" })
@@ -16,7 +16,9 @@ let targets = [
 assert(target in targets, "unsupported release target: {target}")
 let name = "shoal-{tag}-{target}"
 let archive = path("{name}.tar.gz")
+let raw_archive = path("{name}.tar")
 let dist = path(name)
+let archive_manifest = path(".{name}.archive-files")
 let binaries = [
   "shoal",
   "shoal-kernel",
@@ -29,6 +31,8 @@ let binaries = [
   "shoal-sandbox-exec",
   "shoal-landlock-helper",
 ]
+let installer_helper = "shoal-install-transaction"
+let release_inspector = "shoal-release-inspect"
 
 fn sha256(file: path) {
   let result = if ((which sha256sum).out != null) {
@@ -47,41 +51,58 @@ if (dist.exists) {
 if (archive.exists) {
   rm --permanent (archive)
 }
+if (raw_archive.exists) {
+  rm --permanent (raw_archive)
+}
+if (archive_manifest.exists) {
+  rm --permanent (archive_manifest)
+}
 let checksum = path("{archive}.sha256")
 if (checksum.exists) {
   rm --permanent (checksum)
 }
 
-if target == "aarch64-unknown-linux-gnu" {
-  let update = run("sudo", "apt-get", "update")
-  assert(update.ok, "apt metadata update failed")
-  run("sudo", "apt-get", "install", "-y", "gcc-aarch64-linux-gnu")
-  env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "aarch64-linux-gnu-gcc"
-}
-
 let locks = (reef lock)
 let cargo_lock = locks.find(.name == "cargo")
 assert(cargo_lock != null && cargo_lock.locked, "release could not lock cargo through Reef: {locks}")
+let rustc_verbose = run("rustc", "-vV").out.str()
+let host_line = rustc_verbose.lines().find(line => line.starts_with("host: "))
+assert(host_line != null, "rustc did not report a host triple")
+let host = host_line.replace("host: ", "")
+assert(host == target, "release runner host {host} does not match target {target}; use the native pinned release runner")
 run("cargo", "build", "--release", "--locked", "--workspace", "--bins", "--target", target)
-mkdir (dist)
+let dist_created = (mkdir (dist))
 
 for binary in binaries {
   let artifact = path("target").join(target).join("release").join(binary)
   assert(artifact.is_file, "missing release executable: {artifact}")
-  cp (artifact) (dist.join(binary))
+  # Optimized binaries can be sparse on the build filesystem. A release tar is
+  # a byte artifact, not a promise to preserve source allocation metadata.
+  run("install", "-m", "0755", artifact, dist.join(binary))
 }
-cp README.md (dist.join("README.md"))
+let helper_artifact = path("target").join(target).join("release").join(installer_helper)
+assert(helper_artifact.is_file, "missing release installer helper: {helper_artifact}")
+run("install", "-m", "0755", helper_artifact, dist.join(installer_helper))
+let inspector_artifact = path("target").join(target).join("release").join(release_inspector)
+assert(inspector_artifact.is_file, "missing release inspector: {inspector_artifact}")
+run("install", "-m", "0755", inspector_artifact, dist.join(release_inspector))
+run("install", "-m", "0644", "README.md", dist.join("README.md"))
+run("install", "-m", "0644", "Cargo.lock", dist.join("Cargo.lock"))
 for license in glob("LICENSE*").expand() {
-  cp (license) (dist.join(license.name))
+  run("install", "-m", "0644", license, dist.join(license.name))
 }
 if (path("man").is_dir) {
-  cp --recursive man (dist.join("man"))
+  mkdir (dist.join("man"))
+  for page in glob("man/*.1").expand() {
+    run("install", "-m", "0644", page, dist.join("man").join(page.name))
+  }
 }
-cp scripts/install.shl (dist.join("install.shl"))
+run("install", "-m", "0755", "scripts/install.shl", dist.join("install.shl"))
+run("install", "-m", "0755", "scripts/verify-release.shl", dist.join("verify-release.shl"))
 
 let metadata_result = run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1")
-let metadata = json.parse(metadata_result.out)
-let artifacts = binaries.map(binary => {
+let metadata = metadata_result.out
+let artifacts = (binaries + [installer_helper, release_inspector]).map(binary => {
   let file = dist.join(binary)
   {name: binary, bytes: file.size, sha256: sha256(file)}
 })
@@ -91,14 +112,52 @@ let provenance = {
   version: version,
   tag: tag,
   target: target,
+  host: host,
   commit: run("git", "rev-parse", "HEAD").out.trim(),
+  source_date_epoch: run("git", "show", "-s", "--format=%ct", "HEAD").out.trim(),
   rustc: run("rustc", "--version").out.trim(),
   cargo: run("cargo", "--version").out.trim(),
   workspace_packages: metadata.packages.len(),
+  archive: {
+    format: "ustar",
+    owner: 0,
+    group: 0,
+    order: "lexical",
+    timestamps: "source_date_epoch",
+    gzip_name_and_time: false,
+    apple_double: false,
+  },
   binaries: artifacts,
 }
 json.stringify(provenance, pretty: true).save(dist.join("BUILDINFO.json"))
 
-run("tar", "czf", archive, dist)
+let source_date_epoch = provenance.source_date_epoch
+let touch_stamp = if (target.ends_with("-apple-darwin")) {
+  run("date", "-u", "-r", source_date_epoch, "+%Y%m%d%H%M.%S").out.trim()
+} else {
+  run("date", "-u", "-d", "@{source_date_epoch}", "+%Y%m%d%H%M.%S").out.trim()
+}
+let archive_files = glob("{name}/**/*", hidden: true).expand().where(file => file.is_file).sort()
+assert(!archive_files.is_empty(), "release archive file inventory is empty")
+for file in archive_files {
+  run("touch", "-t", touch_stamp, file)
+}
+let absolute_root_prefix = "{dist.abs().display()}/"
+let archive_lines = archive_files
+  .map(file => file.display().replace(absolute_root_prefix, "{name}/"))
+  .join("\n")
+"{archive_lines}\n".save(archive_manifest)
+if (target.ends_with("-apple-darwin")) {
+  # bsdtar lacks GNU tar's metadata-normalization switches, so file mtimes are
+  # normalized above and ownership is fixed explicitly here. Suppress macOS
+  # AppleDouble metadata records: release inputs are deliberate portable files.
+  env.COPYFILE_DISABLE = "1"
+  run("tar", "--format", "ustar", "--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root", "-cf", raw_archive, "-T", archive_manifest)
+} else {
+  run("tar", "--format=ustar", "--owner=0", "--group=0", "--numeric-owner", "--sort=name", "--mtime=@{source_date_epoch}", "-cf", raw_archive, "-T", archive_manifest)
+}
+run("gzip", "-n", "-9", raw_archive)
+assert(archive.is_file, "gzip did not produce {archive}")
+let archive_manifest_removed = (rm --permanent (archive_manifest))
 "{sha256(archive)}  {archive.name}\n".save(checksum)
 echo "release package: {archive} + {checksum}"

@@ -44,8 +44,10 @@ fn connection_provenance_controls_local_human_attachment() {
 
 #[test]
 fn mandatory_public_token_mode_rejects_tokenless_attachment() {
-    let kernel = Kernel::new();
-    kernel.configure_listener_security(true, false);
+    let kernel = Kernel::builder()
+        .listener_security(true, false)
+        .build()
+        .unwrap();
     let (mut client, server) = UnixStream::pair().unwrap();
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let worker_kernel = kernel.clone();
@@ -72,8 +74,10 @@ fn mandatory_public_token_mode_rejects_tokenless_attachment() {
 fn named_listener_peer_uid_mode_accepts_the_matching_os_peer() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("peer-bound.sock");
-    let kernel = Kernel::new();
-    kernel.configure_listener_security(false, true);
+    let kernel = Kernel::builder()
+        .listener_security(false, true)
+        .build()
+        .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let server_kernel = kernel.clone();
     let server_stop = stop.clone();

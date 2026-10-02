@@ -1,0 +1,17 @@
+#!/usr/bin/env shoal
+# Calculate service error-budget consumption from request counters.
+
+assert(args.len() == 2, "usage: error-budget-report.shl SERVICES OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "service counters are missing: {input}")
+let services = json.parse(input.read)
+let invalid = services.where(row => row.requests <= 0 || row.target_percent <= 0 || row.target_percent > 100 || row.errors < 0)
+assert(invalid.is_empty(), "service counters are invalid: {invalid}")
+let rows = services.map(row => {
+  let allowed = row.requests * ((100.0 - row.target_percent) / 100.0)
+  {name: row.name, requests: row.requests, errors: row.errors, allowed_errors: allowed, exhausted: row.errors > allowed}
+})
+let report = {services: rows, exhausted: rows.where(.exhausted).map(.name).sort(), healthy: rows.where(.exhausted).is_empty()}
+json.stringify(report, pretty: true).save(output)
+echo "error budgets: {report.exhausted.len()} exhausted of {rows.len()}"

@@ -3,7 +3,7 @@ use serde_json::json;
 use shoal_proto::RpcError;
 use shoal_proto::error_code::{INTERNAL_ERROR, QUOTA_EXCEEDED};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub(crate) const MAX_SESSIONS_PER_PRINCIPAL: usize = 64;
@@ -15,7 +15,7 @@ const IDLE_SESSION_TTL_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 /// happen after the map guard is released.
 pub(crate) struct SessionRegistry {
     entries: Mutex<HashMap<SessionKey, Arc<Session>>>,
-    max_sessions: AtomicUsize,
+    max_sessions: usize,
     /// A logical admission lease serializes get/create/evict decisions, but
     /// its mutex guard is never held while entries, callbacks, constructors,
     /// or Session destructors run.
@@ -51,15 +51,16 @@ impl SessionRegistry {
     pub(crate) fn new(max_sessions: usize) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            max_sessions: AtomicUsize::new(max_sessions),
+            max_sessions,
             lifecycle: Mutex::new(false),
             lifecycle_ready: Condvar::new(),
             quarantined: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn configure(&self, max_sessions: usize) {
-        self.max_sessions.store(max_sessions, Ordering::Relaxed);
+    #[cfg(test)]
+    pub(crate) fn configured_max(&self) -> usize {
+        self.max_sessions
     }
 
     fn unavailable(&self) -> RpcError {
@@ -163,7 +164,7 @@ impl SessionRegistry {
                 }));
             }
 
-            let max_sessions = self.max_sessions.load(Ordering::Relaxed);
+            let max_sessions = self.max_sessions;
             if max_sessions == 0 {
                 return Err(global_quota_exceeded(max_sessions));
             }
@@ -317,7 +318,7 @@ mod poison_tests {
     fn poisoned_lifecycle_rejects_repeated_lookup_without_dropping_held_sessions() {
         let kernel = Kernel::new();
         let held = kernel.session("held", "principal:registry-poison").unwrap();
-        kernel.sessions.poison_lifecycle_for_test();
+        kernel.runtime.sessions.poison_lifecycle_for_test();
         assert_repeated_registry_failure(&kernel, &held);
     }
 
@@ -325,7 +326,7 @@ mod poison_tests {
     fn poisoned_entries_rejects_repeated_lookup_without_recovering_the_map() {
         let kernel = Kernel::new();
         let held = kernel.session("held", "principal:registry-poison").unwrap();
-        kernel.sessions.poison_entries_for_test();
+        kernel.runtime.sessions.poison_entries_for_test();
         assert_repeated_registry_failure(&kernel, &held);
     }
 }

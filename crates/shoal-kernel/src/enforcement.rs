@@ -21,21 +21,25 @@ impl Kernel {
             status.available_tier,
             EnforcementTier::A | EnforcementTier::C
         );
-        let filesystem_requested = self.policy.filesystem_scoping_active(principal);
-        let filesystem_resolved = self.policy.sandbox_for(principal).is_some_and(|sandbox| {
-            !sandbox.fs.read.is_empty()
-                || !sandbox.fs.write.is_empty()
-                || !sandbox.fs.delete.is_empty()
-        });
+        let filesystem_requested = self.authority.policy.filesystem_scoping_active(principal);
+        let filesystem_resolved =
+            self.authority
+                .policy
+                .sandbox_for(principal)
+                .is_some_and(|sandbox| {
+                    !sandbox.fs.read.is_empty()
+                        || !sandbox.fs.write.is_empty()
+                        || !sandbox.fs.delete.is_empty()
+                });
         let filesystem_enforceable = backend_present && filesystem_resolved;
-        let network_scope_requested = self.policy.network_scoping_active(principal);
-        let spawn_pin_requested = self.policy.spawn_pinning_active(principal);
-        let process_limits_requested = self.policy.process_limits_active(principal);
+        let network_scope_requested = self.authority.policy.network_scoping_active(principal);
+        let spawn_pin_requested = self.authority.policy.spawn_pinning_active(principal);
+        let process_limits_requested = self.authority.policy.process_limits_active(principal);
         // The kernel and executor are Unix-only today; the sibling child
         // launcher applies setrlimit immediately before exec across capture,
         // bounded-probe, and PTY surfaces.
         let process_limits_enforceable = process_limits_requested && cfg!(unix);
-        let hermetic = self.policy.hermetic_active(principal);
+        let hermetic = self.authority.policy.hermetic_active(principal);
         let mut limitations = Vec::new();
         if filesystem_requested && !filesystem_resolved {
             limitations.push("filesystem-scope-unresolved".into());

@@ -13,20 +13,22 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
-          - os: macos-latest
+          - runner: macos-15
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -44,10 +46,55 @@ jobs:
           SHOAL_RELEASE_TAG: ${{ github.ref_name }}
           SHOAL_RELEASE_TARGET: ${{ matrix.target }}
         run: target/debug/shoal scripts/release-package.shl
-      - name: Upload to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - name: Generate SPDX SBOM through digest-pinned Syft
+        env:
+          SHOAL_RELEASE_TAG: ${{ github.ref_name }}
+          SHOAL_RELEASE_TARGET: ${{ matrix.target }}
+        run: target/debug/shoal scripts/release-sbom.shl
+      - name: Finalize and locally verify the release set through Shoal
+        env:
+          SHOAL_RELEASE_TAG: ${{ github.ref_name }}
+          SHOAL_RELEASE_TARGET: ${{ matrix.target }}
+        run: target/debug/shoal scripts/release-manifest.shl
+      - name: Attest build provenance for every release asset
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
-          files: |
+          subject-path: |
             shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
             shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.spdx.json
+      - name: Attest the archive SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          sbom-path: shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.spdx.json
+      - name: Stage attested assets for publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.spdx.json
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: publish attested release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the complete attested release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish release assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: release-assets/*
+          fail_on_unmatched_files: true
           generate_release_notes: true

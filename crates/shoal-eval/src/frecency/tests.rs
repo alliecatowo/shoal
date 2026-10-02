@@ -723,7 +723,7 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
             text: "} else if m.is_file() {",
         },
         ExpectedLine {
-            file: "builtins/copy.rs",
+            file: "builtins/copy/path_policy.rs",
             text: "if source_metadata.is_dir() && canonical_destination.starts_with(&canonical_source) {",
         },
         ExpectedLine {
@@ -848,8 +848,11 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
 
     for path in files {
         let relative = path.strip_prefix(&src).unwrap().to_string_lossy();
-        if relative == "tests.rs" || relative.ends_with("/tests.rs") {
-            continue; // the whole file is included only under cfg(test)
+        let is_test_tree = Path::new(relative.as_ref())
+            .components()
+            .any(|component| component.as_os_str() == OsStr::new("tests"));
+        if relative == "tests.rs" || relative.ends_with("/tests.rs") || is_test_tree {
+            continue; // these modules are included only under cfg(test)
         }
         let source = std::fs::read_to_string(&path).unwrap();
         let production = source

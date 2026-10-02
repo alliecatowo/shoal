@@ -70,7 +70,13 @@ For the current release:
 
 ## Socket access is authentication
 
-Default discovery puts the socket under a per-user directory. The kernel creates an owned directory as `0700` and binds the socket as `0600`. It refuses to delete an active listener, another user's stale socket, or a non-socket path.
+Default discovery puts the socket under a per-user directory. The kernel walks and creates missing
+parent components through retained directory descriptors, rejects symbolic-link components, and
+sets each directory it creates to `0700`; it never changes an already-existing explicit/shared
+parent. The socket is first bound unpublished inside a private staging directory, set and verified
+as `0600`, and only then atomically linked at the public name without overwriting anything. Stale
+entries are quarantined before inspection, and live, unowned, or non-socket entries are restored.
+Shutdown removes the exact device/inode the kernel published and preserves a pathname replacement.
 
 This protects against other Unix users when the containing filesystem and ownership behave normally. It does not protect against:
 
@@ -202,7 +208,7 @@ Start a kernel with an explicit file:
 shoal-kernel --policy "$HOME/.config/shoal/leash.toml"
 ```
 
-An explicit missing or malformed policy is fatal to kernel startup. Without `--policy`, the kernel constructs a permissive policy for its local-human `uid:<euid>` principal; token principals are not implicitly added.
+An explicit missing or malformed policy is fatal to kernel startup. Without `--policy`, the kernel constructs a permissive policy entry only for its local-human `uid:<euid>` principal. That is a private-REPL convenience, not public authority: a named/public socket cannot assert local-human, tokenless attach becomes `agent:mcp` with the `restricted-agent` profile, and bearer principals are not implicitly added. Both kinds of machine principal need explicit policy grants for effects.
 
 Example:
 
@@ -266,9 +272,17 @@ The plan layer matches normalized planned paths against full glob patterns. The 
 **/secrets         ->  no concrete root
 ```
 
-Only existing roots are installed. Nonexistent roots are dropped rather than causing sandbox setup to fail. This is fail-closed for access to that root, but it means a policy intended to permit creation under a path must have an existing concrete ancestor grant.
+Only existing roots are installed. Both the semantic glob's concrete prefix and the OS root are
+canonicalized to the same filesystem object. A parent grant therefore does not escape through a
+child symlink; explicitly granting a symlink grants its canonical target. Nonexistent roots are
+dropped rather than causing sandbox setup to fail. This is fail-closed for access to that root, but
+it means a policy intended to permit creation under a path must have an existing concrete ancestor
+grant.
 
-Parent components are lexically normalized; this is not a proof against every symlink/race edge. OS sandbox behavior remains the final filesystem boundary when active.
+Parent components are lexically normalized before the deepest existing prefix is canonicalized;
+not-yet-created suffixes remain attached to that resolved prefix. Canonicalization and the later
+operation are still separate events, so this is not a proof against every replacement race. OS
+sandbox behavior remains the final filesystem boundary when active.
 
 ### Network grant syntax
 
@@ -308,7 +322,7 @@ Shoal can derive these semantic effect variants:
 | --- | --- |
 | `fs_read` | path list |
 | `fs_write` | path list |
-| `fs_delete` | path list |
+| `fs_delete` | path list and `permanent` boolean (omitted/false for recoverable trash, true for destructive deletion) |
 | `proc_spawn` | binary content hash and argv0 |
 | `net_connect` | host and port |
 | `net_listen` | port |
@@ -321,6 +335,11 @@ Shoal can derive these semantic effect variants:
 | `opaque` | analysis gap |
 
 Effects describe the planner's understanding. They are not a complete behavior proof for arbitrary native programs. An adapter can declare that `curl URL` connects to a host and writes an output path, but a compromised `curl` binary can attempt more. OS enforcement is what constrains attempted filesystem operations; unimplemented dimensions remain policy/advisory.
+
+Shoal's ordinary `rm` is trash-backed and plans as reversible. `rm --permanent` preserves
+`permanent: true` in the effect stored by the kernel and exposed through MCP, so it plans as
+irreversible. Both modes require the same `fs.delete` path grant; the flag changes rollback truth,
+not authority scope. Old effect JSON without `permanent` remains valid and means recoverable mode.
 
 ## Plan/approval integrity
 

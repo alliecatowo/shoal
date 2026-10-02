@@ -1,0 +1,24 @@
+#!/usr/bin/env shoal
+# Catalog verified backup directories without reading their payload bytes.
+
+assert(args.len() == 2, "usage: backup-catalog.shl ROOT OUTPUT")
+let root = path(args[0].str())
+let output = path(args[1].str())
+assert(root.is_dir, "backup catalog root is missing: {root}")
+let manifests = glob(root.join("*/manifest.json").display(), hidden: true).expand().sort()
+let candidates = manifests.map(file => ({file: file, manifest: json.parse(file.read)}))
+  .where(item => "source" in item.manifest.keys() && "files" in item.manifest.keys() && "total_bytes" in item.manifest.keys())
+let backups = candidates.map(item => {
+  let file = item.file
+  let manifest = item.manifest
+  assert(manifest.schema == 1 && manifest.files != null, "invalid backup manifest: {file}")
+  {
+    name: file.parent.name,
+    source: manifest.source,
+    files: manifest.files.len(),
+    bytes: manifest.total_bytes,
+  }
+}).sort_by(.name)
+let report = {backups: backups, count: backups.len(), files: backups.map(.files).sum(), bytes: backups.map(.bytes).sum()}
+json.stringify(report, pretty: true).save(output)
+echo "cataloged {backups.len()} backups"

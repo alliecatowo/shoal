@@ -1,0 +1,31 @@
+#!/usr/bin/env shoal
+# Create a restorable tree snapshot plus an integrity manifest.
+
+assert(args.len() == 2, "usage: backup-create.shl SOURCE BACKUP")
+let source = path(args[0].str())
+let backup = path(args[1].str())
+assert(source.is_dir, "backup source is not a directory: {source}")
+assert(!backup.exists, "backup destination already exists: {backup}")
+let backup_created = (mkdir (backup))
+let data_copied = (cp --recursive (source) (backup.join("data")))
+
+fn digest(file: path) {
+  let result = if ((which sha256sum).out != null) { run("sha256sum", file) } else { run("shasum", "-a", "256", file) }
+  assert(result.ok, "checksum failed for {file}: {result.err}")
+  result.out.str().words().first()
+}
+let data = backup.join("data")
+let prefix = "{data.abs().display()}/"
+let files = glob(data.join("**/*").display(), hidden: true).expand()
+  .where(.is_file)
+  .map(file => ({path: file.abs().display().replace(prefix, ""), bytes: file.size / 1b, sha256: digest(file)}))
+  .sort_by(.path)
+let manifest = {
+  schema: 1,
+  source: source.abs().display(),
+  files: files,
+  total_bytes: files.map(.bytes).sum(),
+}
+json.stringify(manifest, pretty: true).save(backup.join("manifest.json"))
+assert(backup.join("manifest.json").is_file, "backup manifest is missing")
+echo "backed up {files.len()} files to {backup}"

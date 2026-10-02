@@ -258,7 +258,7 @@ impl Kernel {
         jump_store: Option<PathBuf>,
     ) -> Result<Arc<Session>, RpcError> {
         let key = SessionKey::new_scoped(principal, name, authority_scope);
-        self.sessions.get_or_try_insert_with(
+        self.runtime.sessions.get_or_try_insert_with(
             key.clone(),
             || {
                 let cwd = std::env::current_dir().map_err(internal)?;
@@ -277,7 +277,7 @@ impl Kernel {
                 // prevent stale identity. Configured aliases/environment are
                 // already seeded by `apply`; only the inherited private-human
                 // interactive profile may run `init.files` below.
-                evaluator.set_leash_policy(self.policy.clone(), key.principal.clone());
+                evaluator.set_leash_policy(self.authority.policy.clone(), key.principal.clone());
                 // Durable jump history is a host-owned authority choice. A
                 // stable authenticated scope receives only its partition;
                 // tokenless restricted agents receive no durable reads or
@@ -295,13 +295,13 @@ impl Kernel {
                 // never runs, so the in-language `history`/`journal` builtin is inert
                 // in every kernel session — even though `handle_exec` already
                 // records the same statement in the kernel's own separate,
-                // coarser exec-level journal (`self.journal` above, unaffected by
+                // coarser exec-level journal (`self.persistence.journal` above, unaffected by
                 // this change).
                 //
                 // `Journal::open` here opens a SECOND, independent handle onto the
-                // exact same on-disk state dir `self.journal` was opened against
+                // exact same on-disk state dir `self.persistence.journal` was opened against
                 // (SQLite/WAL supports concurrent handles on one store fine) — never
-                // a divergent path: `self.state_dir` is `Some` only when this
+                // a divergent path: `self.persistence.state_dir` is `Some` only when this
                 // `Kernel` was itself built via `Kernel::open`/`open_with_policy`
                 // against that same dir. An ephemeral in-memory kernel
                 // (`Kernel::new`/`with_policy`, what most unit tests use) has no
@@ -314,7 +314,7 @@ impl Kernel {
                 // disabled, the same way an interactive REPL degrades when its own
                 // journal can't be opened.
                 if bootstrap.config().journal.enabled
-                    && let Some(state_dir) = &self.state_dir
+                    && let Some(state_dir) = &self.persistence.state_dir
                 {
                     match Journal::open(state_dir) {
                         Ok(journal) => evaluator.set_journal(journal, name, principal),
@@ -331,7 +331,7 @@ impl Kernel {
                 // source reaches `events.subscribe`/`resources/subscribe` clients.
                 // The evaluator forwards only `user.*` (its own guard), so language
                 // code cannot spoof kernel-owned semantic channels.
-                let wire_bus = self.events.clone();
+                let wire_bus = self.runtime.events.clone();
                 let wire_owner = key.owner();
                 evaluator.set_event_forwarder(Box::new(move |channel, payload| {
                     let json = serde_json::to_value(crate::wire::wire_value(payload))
@@ -357,10 +357,10 @@ impl Kernel {
                 }))
             },
             |owner| {
-                self.events.remove_owner(owner);
-                self.tasks.remove_terminal_owner(owner);
-                self.ptys.remove_terminal_owner(owner);
-                self.plans.remove_owner(owner);
+                self.runtime.events.remove_owner(owner);
+                self.runtime.tasks.remove_terminal_owner(owner);
+                self.runtime.ptys.remove_terminal_owner(owner);
+                self.runtime.plans.remove_owner(owner);
             },
         )
     }
@@ -475,7 +475,7 @@ impl Kernel {
             });
         }
         if connection_trust == ConnectionTrust::Public
-            && self.require_public_token.load(Ordering::SeqCst)
+            && self.authority.require_public_token.load(Ordering::SeqCst)
             && params.token.is_none()
         {
             return Err(RpcError {
@@ -513,7 +513,7 @@ impl Kernel {
         }
         let (who, token_caps, profile, local_human, auth_mode, bearer) =
             if let Some(token) = params.token {
-                let auth = self.auth.as_ref().ok_or_else(|| RpcError {
+                let auth = self.authority.auth.as_ref().ok_or_else(|| RpcError {
                     code: AUTH_FAILED,
                     message: "bearer tokens unavailable in ephemeral kernel".into(),
                     data: None,
@@ -582,7 +582,7 @@ impl Kernel {
         // Subscriptions belong to the previous owner and must not silently
         // follow the socket into the new attachment.
         if attached.is_some() {
-            self.events.remove_conn(client);
+            self.runtime.events.remove_conn(client);
         }
         *attached = Some(Attachment {
             session,
@@ -607,7 +607,7 @@ impl Kernel {
         let mut result = serde_json::to_value(AttachResult {
             session: name,
             principal: who.clone(),
-            caps: json!({"enforced":caps_enforced,"tier":tier,"available_tier":tier,"policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.policy.evaluate_effect(&who, &Effect::Opaque))}),
+            caps: json!({"enforced":caps_enforced,"tier":tier,"available_tier":tier,"policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.authority.policy.evaluate_effect(&who, &Effect::Opaque))}),
             cwd: WirePath::encode(&cwd),
             env_hash: "local".into(),
             ast_version: AST_VERSION,
@@ -661,7 +661,7 @@ impl Kernel {
         };
         let mut names: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
         names.sort();
-        let granted = self.policy.evaluate_effect(
+        let granted = self.authority.policy.evaluate_effect(
             &attachment.principal,
             &Effect::EnvRead {
                 names: names.clone(),

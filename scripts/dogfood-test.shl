@@ -1,0 +1,650 @@
+#!/usr/bin/env shoal
+# Exercise the functional operations programs against disposable real fixtures.
+
+assert(args.is_empty(), "usage: dogfood-test.shl")
+let executable = path((env SHOAL_DOGFOOD_SHOAL).out ?? "target/debug/shoal").abs()
+assert(executable.is_file, "Shoal executable is missing: {executable}")
+let temporary_result = run("mktemp", "-d")
+assert(temporary_result.ok, "could not create dogfood fixture root: {temporary_result.err}")
+let root = path(temporary_result.out.str().trim())
+let programs = path("programs/ops").abs()
+var executed_programs = []
+
+fn execute(name, arguments) {
+  let program = programs.join(name)
+  assert(program.is_file, "dogfood program is missing: {program}")
+  let count = arguments.len()
+  let result = if (count == 1) {
+    run(executable, "--standalone", program, arguments[0])
+  } else if (count == 2) {
+    run(executable, "--standalone", program, arguments[0], arguments[1])
+  } else if (count == 3) {
+    run(executable, "--standalone", program, arguments[0], arguments[1], arguments[2])
+  } else if (count == 4) {
+    run(executable, "--standalone", program, arguments[0], arguments[1], arguments[2], arguments[3])
+  } else if (count == 5) {
+    run(executable, "--standalone", program, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4])
+  } else if (count == 6) {
+    run(executable, "--standalone", program, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5])
+  } else if (count == 7) {
+    run(executable, "--standalone", program, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5], arguments[6])
+  } else {
+    null
+  }
+  assert(result != null, "unsupported dogfood argument count for {name}")
+  assert(result.ok, "{name} failed: {result.err}")
+  executed_programs = executed_programs + [name]
+  result
+}
+
+# Exercise the ordinary noninteractive CLI path too. Scripts deliberately use
+# the local evaluator whether or not `--standalone` is explicit; only an
+# interactive default REPL selects the private embedded kernel.
+fn execute_default_noninteractive(name, arguments) {
+  let program = programs.join(name)
+  assert(program.is_file, "dogfood program is missing: {program}")
+  assert(arguments.len() == 5, "default noninteractive dogfood currently expects five arguments")
+  let result = run(executable, program, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4])
+  assert(result.ok, "{name} failed through the default noninteractive CLI: {result.err}")
+  executed_programs = executed_programs + [name]
+  result
+}
+
+# Filesystem inventory and backup/restore workflows.
+let source = root.join("source")
+let source_created = (mkdir (source))
+let source_nested_created = (mkdir (source.join("nested")))
+"alpha\n".save(source.join("alpha.txt"))
+"beta payload\n".save(source.join("nested/beta.txt"))
+let artifact_inventory = root.join("artifact-inventory.json")
+execute("artifact-inventory.shl", [source, artifact_inventory])
+assert(json.parse(artifact_inventory.read).files.len() == 2, "artifact inventory omitted fixture files")
+let backup = root.join("backup")
+execute("backup-create.shl", [source, backup])
+execute("backup-verify.shl", [backup])
+let restored = root.join("restored")
+execute("backup-restore.shl", [backup, restored])
+assert(restored.join("nested/beta.txt").read == "beta payload\n", "backup restore changed file content")
+let rejected_restore_destination = root.join("rejected-restored")
+let rejected_restore = run(
+  "env",
+  "SHOAL_DOGFOOD_RESTORE_MUTATE_RELATIVE=nested/beta.txt",
+  "SHOAL_DOGFOOD_RESTORE_MUTATE_CONTENT=wrong payload",
+  executable,
+  "--standalone",
+  programs.join("backup-restore.shl"),
+  backup,
+  rejected_restore_destination,
+)
+assert(!rejected_restore.ok, "backup restore reported success after its verified source changed")
+assert(!rejected_restore_destination.exists, "backup restore retained output that failed post-copy manifest verification")
+
+# Journal export, aggregation, and retention planning.
+let journal = root.join("journal.json")
+json.stringify([
+  {seq: 1, command: "build", status: "ok"},
+  {seq: 2, command: "test", status: "failed"},
+  {seq: 3, command: "test", status: "ok"},
+  {seq: 4, command: "publish", status: "ok"},
+], pretty: true).save(journal)
+let journal_export = root.join("journal-export.json")
+execute("journal-export.shl", [journal, "2", "4", journal_export])
+let journal_summary = root.join("journal-summary.json")
+execute("journal-summary.shl", [journal_export, journal_summary])
+assert(json.parse(journal_summary.read).failures == 1, "journal failure aggregation is wrong")
+let retention = root.join("retention.json")
+execute("journal-retention-plan.shl", [journal, "3", retention])
+assert(json.parse(retention.read).remove_sequences == [1, 2], "journal retention boundary is wrong")
+
+# Cache inventory, bounded prune planning, and constrained deletion.
+let cache = root.join("cache")
+let cache_created = (mkdir (cache))
+let compiler_cache_created = (mkdir (cache.join("compiler")))
+let docs_cache_created = (mkdir (cache.join("docs")))
+"1234567890".save(cache.join("compiler/large.bin"))
+"12345".save(cache.join("compiler/small.bin"))
+"123".save(cache.join("docs/page.cache"))
+let cache_inventory = root.join("cache-inventory.json")
+execute("cache-inventory.shl", [cache, cache_inventory])
+assert(json.parse(cache_inventory.read).bytes == 18, "cache byte inventory is wrong")
+let prune_plan = root.join("cache-prune.json")
+execute("cache-prune-plan.shl", [cache_inventory, "8", prune_plan])
+execute("cache-prune.shl", [cache, prune_plan])
+assert(!cache.join("compiler/large.bin").exists, "cache prune retained the selected largest file")
+assert(cache.join("compiler/small.bin").is_file, "cache prune removed an unselected file")
+let drift_cache = root.join("drift-cache")
+let drift_cache_created = (mkdir (drift_cache))
+"original".save(drift_cache.join("entry.bin"))
+let drift_inventory = root.join("drift-cache-inventory.json")
+execute("cache-inventory.shl", [drift_cache, drift_inventory])
+let drift_plan = root.join("drift-cache-prune.json")
+execute("cache-prune-plan.shl", [drift_inventory, "0", drift_plan])
+"replaced".save(drift_cache.join("entry.bin"))
+let rejected_drift = run(executable, "--standalone", programs.join("cache-prune.shl"), drift_cache, drift_plan)
+assert(!rejected_drift.ok, "cache prune accepted same-size content drift")
+assert(drift_cache.join("entry.bin").read == "replaced", "cache prune deleted or changed the replacement file")
+let outside_cache = root.join("outside-cache.txt")
+"must survive\n".save(outside_cache)
+let escape_plan = root.join("cache-escape.json")
+json.stringify({schema: 2, reclaim_bytes: 13, remove: [{path: "../outside-cache.txt", bytes: 13, sha256: "0000000000000000000000000000000000000000000000000000000000000000"}]}, pretty: true).save(escape_plan)
+let rejected_escape = run(executable, "--standalone", programs.join("cache-prune.shl"), cache, escape_plan)
+assert(!rejected_escape.ok, "cache prune accepted a root-escaping plan")
+assert(outside_cache.read == "must survive\n", "cache prune touched a file outside its root")
+let linked_cache = cache.join("linked")
+run("ln", "-s", root, linked_cache)
+let symlink_plan = root.join("cache-symlink.json")
+json.stringify({schema: 2, reclaim_bytes: 13, remove: [{path: "linked/outside-cache.txt", bytes: 13, sha256: "0000000000000000000000000000000000000000000000000000000000000000"}]}, pretty: true).save(symlink_plan)
+let rejected_symlink = run(executable, "--standalone", programs.join("cache-prune.shl"), cache, symlink_plan)
+assert(!rejected_symlink.ok, "cache prune accepted an intermediate symbolic link")
+assert(outside_cache.read == "must survive\n", "cache prune followed a symbolic link outside its root")
+let linked_cache_removed = (rm --permanent (linked_cache))
+
+# Release notes and state/config/data transformations.
+let changes = root.join("changes.json")
+json.stringify([
+  {id: "S-2", category: "fix", summary: "Preserve executable modes"},
+  {id: "S-1", category: "feature", summary: "Add typed operations"},
+  {id: "S-3", category: "security", summary: "Constrain filesystem effects"},
+], pretty: true).save(changes)
+let changelog = root.join("CHANGELOG.md")
+execute("changelog-generate.shl", [changes, "0.2.0", changelog])
+assert(changelog.read.contains("## SECURITY"), "changelog omitted a populated category")
+
+let state_v1 = root.join("state-v1.json")
+json.stringify({schema: 1, entries: [{id: "a", value: 1}, {id: "b", value: 2}]}, pretty: true).save(state_v1)
+let migration_plan = root.join("migration-plan.json")
+execute("migration-plan.shl", [state_v1, migration_plan])
+let state_v2 = root.join("state-v2.json")
+execute("migration-apply.shl", [state_v1, migration_plan, state_v2])
+assert(json.parse(state_v2.read).items.len() == 2, "migration lost state entries")
+let rejected_migration_replace = run(executable, "--standalone", programs.join("migration-apply.shl"), state_v1, migration_plan, state_v2)
+assert(!rejected_migration_replace.ok, "migration replaced an existing destination")
+assert(json.parse(state_v2.read).items.len() == 2, "rejected migration changed its destination")
+
+let config_base = root.join("config-base.json")
+let config_override = root.join("config-override.json")
+json.stringify([{key: "color", value: "blue"}, {key: "jobs", value: 2}], pretty: true).save(config_base)
+json.stringify([{key: "jobs", value: 8}, {key: "trace", value: true}], pretty: true).save(config_override)
+let config_result = root.join("config-result.json")
+execute("config-overlay.shl", [config_base, config_override, config_result])
+let resolved_jobs = json.parse(config_result.read).resolved.find(.key == "jobs")
+assert(resolved_jobs.value == 8 && resolved_jobs.source_layer == 1, "configuration overlay precedence is wrong")
+
+let dataset_before_raw = root.join("dataset-before-raw.json")
+let dataset_after_raw = root.join("dataset-after-raw.json")
+json.stringify([{id: "b", value: 2}, {id: "a", value: 1}, {id: "b", value: 3}], pretty: true).save(dataset_before_raw)
+json.stringify([{id: "b", value: 4}, {id: "c", value: 5}], pretty: true).save(dataset_after_raw)
+let dataset_before = root.join("dataset-before.json")
+let dataset_after = root.join("dataset-after.json")
+execute("dataset-normalize.shl", [dataset_before_raw, dataset_before])
+execute("dataset-normalize.shl", [dataset_after_raw, dataset_after])
+let dataset_diff = root.join("dataset-diff.json")
+execute("dataset-diff.shl", [dataset_before, dataset_after, dataset_diff])
+let diff = json.parse(dataset_diff.read)
+assert(diff.added.len() == 1 && diff.removed.len() == 1 && diff.changed.len() == 1, "dataset diff classification is wrong")
+
+# Release manifest verification includes real checksums and detects exact bytes.
+let release = root.join("release")
+let release_created = (mkdir (release))
+let release_man_created = (mkdir (release.join("man")))
+"binary bytes\n".save(release.join("shoal"))
+"manual bytes\n".save(release.join("man/shoal.1"))
+let release_manifest = root.join("release-manifest.json")
+execute("release-manifest.shl", [release, "0.2.0", release_manifest])
+execute("release-verify.shl", [release, release_manifest])
+assert(json.parse(release_manifest.read).files.len() == 2, "release manifest omitted artifacts")
+"tampered bytes\n".save(release.join("shoal"))
+let rejected_release = run(executable, "--standalone", programs.join("release-verify.shl"), release, release_manifest)
+assert(!rejected_release.ok, "release verifier accepted a modified artifact")
+
+# SBOM generation/verification from a realistic Cargo metadata subset.
+let metadata = root.join("cargo-metadata.json")
+json.stringify({packages: [
+  {name: "shoal", version: "0.2.0", source: null, license: "MIT OR Apache-2.0"},
+  {name: "serde", version: "1.0.0", source: "registry", license: "MIT OR Apache-2.0"},
+]}, pretty: true).save(metadata)
+let sbom = root.join("sbom.json")
+let sbom_report = root.join("sbom-report.json")
+execute("sbom-generate.shl", [metadata, sbom])
+execute("sbom-verify.shl", [sbom, sbom_report])
+assert(json.parse(sbom_report.read).valid, "generated SBOM did not verify")
+
+# Adapter inventory/conformance uses executable adapter manifests, not mock output rows.
+let adapters = root.join("adapters")
+let adapters_created = (mkdir (adapters))
+"[cmd.alpha]\nbin = \"alpha\"\nclass = \"cli\"\nok_codes = [0]\n[cmd.alpha.sub.check]\ninvoke = [\"check\"]\n".save(adapters.join("alpha.toml"))
+"[cmd.beta]\nbin = \"beta\"\nclass = \"interpreter\"\nok_codes = [0, 2]\ninvoke = [\"-c\"]\n".save(adapters.join("beta.toml"))
+let adapter_inventory = root.join("adapter-inventory.json")
+let adapter_report = root.join("adapter-report.json")
+execute("adapter-inventory.shl", [adapters, adapter_inventory])
+execute("adapter-conformance.shl", [adapters, adapter_report])
+assert(json.parse(adapter_inventory.read).adapters == 2, "adapter inventory count is wrong")
+
+# The CLI's owner-only supervisor bearer proves captured start/status/MCP
+# initialize/managed stop without touching the user's running kernel or state.
+let lifecycle_root = root.join("kernel-lifecycle")
+let lifecycle_report = root.join("kernel-lifecycle.json")
+execute("kernel-mcp-lifecycle.shl", [
+  executable,
+  path("target/debug/shoal-mcp").abs(),
+  lifecycle_root,
+  lifecycle_report,
+])
+let lifecycle = json.parse(lifecycle_report.read)
+assert(lifecycle.mcp_server == "shoal-mcp" && lifecycle.managed_shutdown, "kernel/MCP lifecycle did not complete")
+assert(lifecycle.kernel_principal == "agent:mcp" && lifecycle.status_authority == "restricted-agent", "lifecycle mislabeled tokenless public status authority")
+
+# Benchmark regression analysis/dashboard and duration-balanced test sharding.
+let baseline = root.join("baseline.json")
+let current = root.join("current.json")
+json.stringify([{name: "parse", median_ms: 10.0}, {name: "eval", median_ms: 20.0}], pretty: true).save(baseline)
+json.stringify([{name: "parse", median_ms: 11.0}, {name: "eval", median_ms: 18.0}], pretty: true).save(current)
+let comparison = root.join("comparison.json")
+let dashboard = root.join("benchmark.md")
+execute("benchmark-compare.shl", [baseline, current, "5", comparison])
+execute("benchmark-dashboard.shl", [comparison, dashboard])
+assert(json.parse(comparison.read).regressions.len() == 1, "benchmark regression classification is wrong")
+assert(dashboard.read.contains("REGRESSION"), "benchmark dashboard omitted regression status")
+
+let tests = root.join("tests.json")
+json.stringify([
+  {name: "slow", estimated_ms: 100}, {name: "medium", estimated_ms: 60},
+  {name: "quick-a", estimated_ms: 20}, {name: "quick-b", estimated_ms: 20},
+], pretty: true).save(tests)
+let shards = root.join("shards.json")
+execute("test-shard-plan.shl", [tests, "2", shards])
+assert(json.parse(shards.read).tests == 4, "test shard plan lost cases")
+
+# Reef repair planning and incident collection complete the operational lifecycle.
+let reef_findings = root.join("reef-findings.json")
+json.stringify([
+  {name: "cargo", status: "ok"},
+  {name: "zola", status: "drift"},
+  {name: "actionlint", status: "missing"},
+], pretty: true).save(reef_findings)
+let repair = root.join("reef-repair.json")
+execute("reef-repair-plan.shl", [reef_findings, repair])
+assert(json.parse(repair.read).actions.len() == 2, "Reef repair plan omitted actionable findings")
+
+let logs = root.join("logs")
+let logs_created = (mkdir (logs))
+"kernel started\nrequest complete\n".save(logs.join("kernel.log"))
+"adapter timeout\n".save(logs.join("adapter.log"))
+let incident_metadata = root.join("incident-metadata.json")
+json.stringify({id: "INC-42", severity: "high", owner: "shell-team"}, pretty: true).save(incident_metadata)
+let incident = root.join("incident")
+execute("incident-bundle.shl", [logs, incident_metadata, incident])
+assert(json.parse(incident.join("manifest.json").read).log_files == 2, "incident bundle omitted logs")
+
+# Operational reporting, planning, drift, and recovery workflows.
+let access_logs = root.join("access-logs.json")
+json.stringify([
+  {route: "/health", status: 200, duration_ms: 2},
+  {route: "/jobs", status: 200, duration_ms: 15},
+  {route: "/jobs", status: 503, duration_ms: 40},
+], pretty: true).save(access_logs)
+let access_summary = root.join("access-summary.json")
+execute("access-log-summary.shl", [access_logs, access_summary])
+assert(json.parse(access_summary.read).errors == 1, "access-log summary lost server errors")
+
+"new artifact\n".save(source.join("nested/new.txt"))
+let artifact_inventory_after = root.join("artifact-inventory-after.json")
+execute("artifact-inventory.shl", [source, artifact_inventory_after])
+let artifact_diff = root.join("artifact-diff.json")
+execute("artifact-diff.shl", [artifact_inventory, artifact_inventory_after, artifact_diff])
+assert(json.parse(artifact_diff.read).added.len() == 1, "artifact diff missed an added file")
+
+let backup_catalog = root.join("backup-catalog.json")
+execute("backup-catalog.shl", [root, backup_catalog])
+assert(json.parse(backup_catalog.read).count == 1, "backup catalog missed the created backup")
+
+let risk_report = root.join("change-risk.json")
+execute("change-risk-report.shl", [changes, risk_report])
+assert(json.parse(risk_report.read).level == "high", "change risk report misclassified the release")
+
+let expected_config = root.join("expected-config.json")
+let actual_config = root.join("actual-config.json")
+json.stringify([{key: "color", value: "blue"}, {key: "jobs", value: 4}], pretty: true).save(expected_config)
+json.stringify([{key: "jobs", value: 8}, {key: "trace", value: true}], pretty: true).save(actual_config)
+let config_drift = root.join("config-drift.json")
+execute("config-drift.shl", [expected_config, actual_config, config_drift])
+let drift = json.parse(config_drift.read)
+assert(drift.missing.len() == 1 && drift.unexpected.len() == 1 && drift.changed.len() == 1, "configuration drift classification is wrong")
+
+let dependencies_before = root.join("dependencies-before.json")
+let dependencies_after = root.join("dependencies-after.json")
+json.stringify({packages: [{name: "alpha", version: "1.0"}, {name: "gone", version: "1.0"}]}, pretty: true).save(dependencies_before)
+json.stringify({packages: [{name: "alpha", version: "2.0"}, {name: "new", version: "1.0"}]}, pretty: true).save(dependencies_after)
+let dependency_diff = root.join("dependency-diff.json")
+execute("dependency-diff.shl", [dependencies_before, dependencies_after, dependency_diff])
+let dependency_changes = json.parse(dependency_diff.read)
+assert(dependency_changes.added.len() == 1 && dependency_changes.removed.len() == 1 && dependency_changes.updated.len() == 1, "dependency diff classification is wrong")
+
+let deployment_hosts = root.join("deployment-hosts.json")
+json.stringify([
+  {name: "staging-1", environment: "staging"},
+  {name: "production-1", environment: "production"},
+], pretty: true).save(deployment_hosts)
+let deployment_plan = root.join("deployment-plan.json")
+execute("deployment-plan.shl", [release_manifest, deployment_hosts, deployment_plan])
+let observations = root.join("deployment-observations.json")
+json.stringify([
+  {host: "staging-1", version: "0.2.0", status: "healthy"},
+  {host: "production-1", version: "0.2.0", status: "healthy"},
+], pretty: true).save(observations)
+let deployment_report = root.join("deployment-report.json")
+execute("deployment-verify.shl", [deployment_plan, observations, deployment_report])
+assert(json.parse(deployment_report.read).verified, "deployment verification rejected healthy hosts")
+
+let disk_roots = root.join("disk-roots.json")
+json.stringify([{name: "source", path: source.display()}, {name: "cache", path: cache.display()}], pretty: true).save(disk_roots)
+let disk_report = root.join("disk-usage.json")
+execute("disk-usage-report.shl", [disk_roots, disk_report])
+assert(json.parse(disk_report.read).files >= 3, "disk usage report omitted fixture files")
+
+let service_counters = root.join("service-counters.json")
+json.stringify([
+  {name: "api", requests: 1000, errors: 2, target_percent: 99.9},
+  {name: "worker", requests: 1000, errors: 0, target_percent: 99.0},
+], pretty: true).save(service_counters)
+let budget_report = root.join("error-budget.json")
+execute("error-budget-report.shl", [service_counters, budget_report])
+assert(json.parse(budget_report.read).exhausted == ["api"], "error budget report missed exhaustion")
+
+let features = root.join("features.json")
+json.stringify([
+  {name: "parser", status: "implemented"},
+  {name: "remote execution", status: "planned"},
+  {name: "windows sandbox", status: "blocked"},
+], pretty: true).save(features)
+let feature_report = root.join("feature-status.json")
+execute("feature-status-report.shl", [features, feature_report])
+assert(json.parse(feature_report.read).blocked == ["windows sandbox"], "feature status report lost blocked work")
+
+let duplicate_inventory = root.join("duplicate-inventory.json")
+json.stringify({files: [
+  {path: "a.bin", bytes: 5, sha256: "same"},
+  {path: "copies/a.bin", bytes: 5, sha256: "same"},
+  {path: "unique.bin", bytes: 2, sha256: "unique"},
+]}, pretty: true).save(duplicate_inventory)
+let deduplicate_plan = root.join("deduplicate-plan.json")
+execute("file-deduplicate-plan.shl", [duplicate_inventory, deduplicate_plan])
+assert(json.parse(deduplicate_plan.read).reclaim_bytes == 5, "deduplicate plan byte accounting is wrong")
+
+let incident_events = root.join("incident-events.json")
+json.stringify([
+  {timestamp_ns: 120, source: "kernel", message: "recovered"},
+  {timestamp_ns: 100, source: "monitor", message: "alerted"},
+], pretty: true).save(incident_events)
+let incident_timeline = root.join("incident-timeline.json")
+execute("incident-timeline.shl", [incident_events, incident_timeline])
+assert(json.parse(incident_timeline.read).duration_ns == 20, "incident timeline duration is wrong")
+
+let sensitive_logs = root.join("sensitive-logs.json")
+let redaction_values = root.join("redaction-values.json")
+json.stringify([{level: "error", message: "request used token-secrecy-value"}], pretty: true).save(sensitive_logs)
+json.stringify([{name: "token", value: "secrecy-value"}], pretty: true).save(redaction_values)
+let redacted_logs = root.join("redacted-logs.json")
+execute("log-redact.shl", [sensitive_logs, redaction_values, redacted_logs])
+assert(json.parse(redacted_logs.read).records.first().message == "request used token-[REDACTED]", "log redaction retained protected text")
+
+let maintenance_tasks = root.join("maintenance-tasks.json")
+json.stringify([
+  {name: "database", minutes: 30, priority: 10},
+  {name: "cache", minutes: 15, priority: 5},
+  {name: "optional", minutes: 30, priority: 1},
+], pretty: true).save(maintenance_tasks)
+let maintenance_plan = root.join("maintenance-plan.json")
+execute("maintenance-window-plan.shl", [maintenance_tasks, "50", maintenance_plan])
+assert(json.parse(maintenance_plan.read).deferred == ["optional"], "maintenance planner exceeded its window")
+
+let components = root.join("components.json")
+json.stringify([
+  {name: "parser", owner: "language", status: "healthy"},
+  {name: "release", owner: "operations", status: "degraded"},
+  {name: "legacy", owner: "unowned", status: "healthy"},
+], pretty: true).save(components)
+let ownership_report = root.join("ownership.json")
+execute("ownership-report.shl", [components, ownership_report])
+assert(json.parse(ownership_report.read).unowned == ["legacy"], "ownership report missed an unowned component")
+
+let resources = root.join("resources.json")
+json.stringify([
+  {name: "cas", used: 110, limit: 100, warn_percent: 80},
+  {name: "journal", used: 85, limit: 100, warn_percent: 80},
+  {name: "sessions", used: 2, limit: 10, warn_percent: 80},
+], pretty: true).save(resources)
+let quota_report = root.join("quota.json")
+execute("quota-report.shl", [resources, quota_report])
+let quota = json.parse(quota_report.read)
+assert(quota.exceeded == ["cas"] && quota.warnings == ["journal"], "quota report thresholds are wrong")
+
+let readiness_checks = root.join("readiness-checks.json")
+json.stringify([
+  {name: "tests", status: "pass"},
+  {name: "docs", status: "pass"},
+  {name: "migration", status: "waived"},
+], pretty: true).save(readiness_checks)
+let readiness_report = root.join("readiness.json")
+execute("release-readiness-report.shl", [readiness_checks, readiness_report])
+assert(json.parse(readiness_report.read).ready, "release readiness rejected a passing gate")
+
+let task_failures = root.join("task-failures.json")
+json.stringify([
+  {task: "fetch", code: "timeout", attempts: 1},
+  {task: "publish", code: "rate_limited", attempts: 3},
+  {task: "compile", code: "invalid_input", attempts: 1},
+], pretty: true).save(task_failures)
+let retry_plan = root.join("retry-plan.json")
+execute("retry-plan.shl", [task_failures, "3", retry_plan])
+let retries = json.parse(retry_plan.read)
+assert(retries.retry.len() == 1 && retries.exhausted == ["publish"] && retries.terminal == ["compile"], "retry plan classification is wrong")
+
+let deployment_history = root.join("deployment-history.json")
+json.stringify([
+  {sequence: 1, host: "staging-1", previous_version: "0.1.0", status: "completed"},
+  {sequence: 2, host: "production-1", previous_version: "0.1.0", status: "completed"},
+], pretty: true).save(deployment_history)
+let rollback_plan = root.join("rollback-plan.json")
+execute("rollback-plan.shl", [deployment_history, rollback_plan])
+assert(json.parse(rollback_plan.read).steps.first().host == "production-1", "rollback plan is not reverse ordered")
+
+let credentials = root.join("credentials.json")
+json.stringify([
+  {name: "registry", age_days: 100, compromised: false},
+  {name: "deploy", age_days: 2, compromised: true},
+  {name: "monitor", age_days: 5, compromised: false},
+], pretty: true).save(credentials)
+let rotation_plan = root.join("rotation-plan.json")
+execute("secret-rotation-plan.shl", [credentials, "90", rotation_plan])
+assert(json.parse(rotation_plan.read).rotate.len() == 2, "secret rotation plan omitted due credentials")
+
+let probes = root.join("service-probes.json")
+json.stringify([
+  {service: "kernel", component: "rpc", status: "ok"},
+  {service: "kernel", component: "journal", status: "degraded"},
+  {service: "site", component: "http", status: "ok"},
+], pretty: true).save(probes)
+let health_report = root.join("service-health.json")
+execute("service-health-summary.shl", [probes, health_report])
+assert(json.parse(health_report.read).unhealthy == ["kernel"], "service health summary missed degradation")
+
+let test_results = root.join("test-results.json")
+json.stringify([
+  {name: "parser-a", owner: "language", status: "failed", signature: "parse-eof"},
+  {name: "parser-b", owner: "language", status: "failed", signature: "parse-eof"},
+  {name: "kernel-a", owner: "runtime", status: "passed", signature: ""},
+], pretty: true).save(test_results)
+let triage_report = root.join("test-triage.json")
+execute("test-failure-triage.shl", [test_results, triage_report])
+assert(json.parse(triage_report.read).groups.first().count == 2, "test failure triage did not group signatures")
+
+# A complete continuity drill invokes six cooperating operational programs,
+# persists intermediate evidence, restores into a fresh tree, and verifies the
+# round trip. Run it through the ordinary noninteractive CLI path without the
+# redundant explicit `--standalone` selector.
+let continuity_workspace = root.join("continuity-workspace")
+let continuity_report = root.join("continuity-report.json")
+execute_default_noninteractive("workspace-continuity.shl", [
+  executable,
+  programs,
+  source,
+  continuity_workspace,
+  continuity_report,
+])
+let continuity = json.parse(continuity_report.read)
+assert(continuity.recoverable, "workspace continuity drill did not certify recovery")
+assert(continuity.phase_count == 8, "workspace continuity drill omitted an operational phase")
+assert(continuity.integrity.source_equals_backup, "workspace continuity source and backup differ")
+assert(continuity.integrity.backup_equals_restore, "workspace continuity backup and restore differ")
+assert(continuity_workspace.join("restored/nested/new.txt").read == "new artifact\n", "continuity restore lost the newest workspace artifact")
+assert(continuity_workspace.join("evidence/round-trip-diff.json").is_file, "continuity drill omitted its durable diff evidence")
+let refused_continuity_replace = run(
+  executable,
+  programs.join("workspace-continuity.shl"),
+  executable,
+  programs,
+  source,
+  continuity_workspace,
+  root.join("second-continuity-report.json"),
+)
+assert(!refused_continuity_replace.ok, "continuity drill replaced an existing evidence workspace")
+assert(continuity_workspace.join("restored/nested/new.txt").read == "new artifact\n", "rejected continuity retry changed prior recovery evidence")
+
+# Reconcile independently produced CI evidence into one release decision. The
+# fixture includes an allowed artifact addition and a meaningful performance
+# improvement, then proves that all required checks remain decisive.
+let ci_tests = root.join("ci-evidence-tests.json")
+json.stringify([
+  {name: "parser::accepts_program", owner: "language", status: "passed", signature: "", duration_ms: 12},
+  {name: "cli::default_noninteractive", owner: "runtime", status: "passed", signature: "", duration_ms: 31},
+  {name: "ops::continuity", owner: "operations", status: "passed", signature: "", duration_ms: 48},
+  {name: "site::links", owner: "documentation", status: "skipped", signature: "platform-exempt", duration_ms: 0},
+], pretty: true).save(ci_tests)
+let ci_checks = root.join("ci-evidence-checks.json")
+json.stringify([
+  {name: "format", required: true, status: "pass"},
+  {name: "clippy", required: true, status: "pass"},
+  {name: "workspace-tests", required: true, status: "pass"},
+  {name: "macos-smoke", required: false, status: "pass"},
+], pretty: true).save(ci_checks)
+let ci_evidence_report = root.join("ci-evidence-report.json")
+execute("ci-evidence-auditor.shl", [
+  ci_tests,
+  baseline,
+  current,
+  artifact_inventory,
+  artifact_inventory_after,
+  ci_checks,
+  ci_evidence_report,
+])
+let ci_evidence = json.parse(ci_evidence_report.read)
+assert(ci_evidence.ready, "passing CI evidence was classified as blocked")
+assert(ci_evidence.tests.total == 4 && ci_evidence.tests.passed == 3, "CI evidence test accounting is wrong")
+assert(ci_evidence.tests.owners.len() == 4, "CI evidence lost an owning team")
+assert(ci_evidence.benchmarks.compared == 2, "CI evidence omitted benchmark comparisons")
+assert(ci_evidence.benchmarks.regressions.is_empty(), "CI evidence invented a benchmark regression")
+assert(ci_evidence.artifacts.added.len() == 1, "CI evidence missed the new artifact")
+assert(ci_evidence.artifacts.removed.is_empty(), "CI evidence invented an artifact removal")
+assert(ci_evidence.checks.required_passed.len() == 3, "CI evidence lost required check outcomes")
+let blocked_ci_tests = root.join("blocked-ci-tests.json")
+json.stringify([
+  {name: "cli::default_noninteractive", owner: "runtime", status: "failed", signature: "execution-timeout", duration_ms: 75},
+], pretty: true).save(blocked_ci_tests)
+let blocked_ci_checks = root.join("blocked-ci-checks.json")
+json.stringify([
+  {name: "format", required: true, status: "pass"},
+  {name: "workspace-tests", required: true, status: "pending"},
+], pretty: true).save(blocked_ci_checks)
+let blocked_ci_report = root.join("blocked-ci-report.json")
+let blocked_ci_result = run(
+  executable,
+  "--standalone",
+  programs.join("ci-evidence-auditor.shl"),
+  blocked_ci_tests,
+  baseline,
+  current,
+  artifact_inventory,
+  artifact_inventory_after,
+  blocked_ci_checks,
+  blocked_ci_report,
+)
+assert(blocked_ci_result.ok, "CI auditor failed to persist an intentionally blocked decision: {blocked_ci_result.err}")
+let blocked_ci = json.parse(blocked_ci_report.read)
+assert(!blocked_ci.ready, "CI auditor accepted failing tests and a pending required check")
+assert("test-failures" in blocked_ci.blockers && "required-checks-pending" in blocked_ci.blockers, "CI auditor omitted expected blockers")
+
+# Assemble a command-center directory from heterogeneous incident evidence,
+# with secret redaction, severity derivation, prioritized response work, and
+# independently inspectable health/traffic/timeline artifacts.
+let command_probes = root.join("command-center-probes.json")
+json.stringify([
+  {service: "kernel", component: "rpc", status: "down"},
+  {service: "kernel", component: "journal", status: "degraded"},
+  {service: "site", component: "http", status: "ok"},
+], pretty: true).save(command_probes)
+let command_access = root.join("command-center-access.json")
+json.stringify([
+  {route: "/health", status: 200, duration_ms: 2},
+  {route: "/jobs", status: 503, duration_ms: 45},
+  {route: "/jobs", status: 503, duration_ms: 51},
+], pretty: true).save(command_access)
+let command_events = root.join("command-center-events.json")
+json.stringify([
+  {timestamp_ns: 100, source: "monitor", kind: "alert", message: "kernel unavailable"},
+  {timestamp_ns: 120, source: "operator", kind: "action", message: "isolated rpc listener"},
+  {timestamp_ns: 145, source: "kernel", kind: "observation", message: "journal remained readable"},
+], pretty: true).save(command_events)
+let command_logs = root.join("command-center-logs.json")
+json.stringify([
+  {timestamp_ns: 101, level: "error", source: "kernel", message: "token incident-secret rejected"},
+  {timestamp_ns: 121, level: "warn", source: "gateway", message: "rpc unavailable for tenant-red"},
+  {timestamp_ns: 146, level: "info", source: "kernel", message: "journal probe complete"},
+], pretty: true).save(command_logs)
+let command_secrets = root.join("command-center-secrets.json")
+json.stringify([{name: "token", value: "incident-secret"}], pretty: true).save(command_secrets)
+let command_metadata = root.join("command-center-metadata.json")
+json.stringify({id: "INC-9001", owner: "shell-team", started_at_ns: 100, objective: "restore private RPC without losing journal evidence"}, pretty: true).save(command_metadata)
+let command_center = root.join("command-center")
+execute("incident-command-center.shl", [
+  command_probes,
+  command_access,
+  command_events,
+  command_logs,
+  command_secrets,
+  command_metadata,
+  command_center,
+])
+let command_summary = json.parse(command_center.join("summary.json").read)
+let redacted_command_logs = command_center.join("evidence/redacted-logs.json").read
+assert(command_summary.severity == "critical", "incident command center understated the fixture severity")
+assert(!command_summary.recovered, "incident command center invented recovery evidence")
+assert(command_summary.services.down == 1, "incident command center lost the down service")
+assert(command_summary.traffic.server_errors == 2, "incident command center lost server errors")
+assert(command_summary.response_actions.len() >= 4, "incident command center omitted response work")
+assert(redacted_command_logs.contains("[REDACTED:token]"), "incident command center did not record its redaction")
+assert(!redacted_command_logs.contains("incident-secret"), "incident command center leaked protected log content")
+assert(command_center.join("action-plan.json").is_file, "incident command center omitted its durable action plan")
+let unsafe_command_secrets = root.join("unsafe-command-center-secrets.json")
+json.stringify([{name: "unsafe", value: "x"}], pretty: true).save(unsafe_command_secrets)
+let rejected_command_center = run(
+  executable,
+  "--standalone",
+  programs.join("incident-command-center.shl"),
+  command_probes,
+  command_access,
+  command_events,
+  command_logs,
+  unsafe_command_secrets,
+  command_metadata,
+  root.join("unsafe-command-center"),
+)
+assert(!rejected_command_center.ok, "incident command center accepted a dangerously short redaction value")
+assert(!root.join("unsafe-command-center").exists, "rejected incident command center published partial evidence")
+
+let program_count = glob(programs.join("*.shl").display()).expand().len()
+assert(program_count >= 50, "functional operations program count regressed: {program_count}")
+let executed_program_count = executed_programs.uniq().len()
+assert(executed_program_count == program_count, "dogfood runner executed {executed_program_count} distinct programs but ships {program_count}")
+let fixture_removed = (rm --permanent --recursive (root))
+echo "dogfood gate passed: {program_count} operational programs, {executed_programs.len()} asserted program invocations"

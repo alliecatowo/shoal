@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Compute an identifier-aware diff between two normalized datasets.
+
+assert(args.len() == 3, "usage: dataset-diff.shl BEFORE AFTER OUTPUT")
+let before_file = path(args[0].str())
+let after_file = path(args[1].str())
+let output = path(args[2].str())
+assert(before_file.is_file && after_file.is_file, "dataset input is missing")
+let before = json.parse(before_file.read).records
+let after = json.parse(after_file.read).records
+let before_ids = before.map(row => row.id.str())
+let after_ids = after.map(row => row.id.str())
+let added = after.where(row => !(row.id.str() in before_ids))
+let removed = before.where(row => !(row.id.str() in after_ids))
+let changed = after.where(row => {
+  let old = before.find(candidate => candidate.id.str() == row.id.str())
+  old != null && json.stringify(old) != json.stringify(row)
+})
+let diff = {added: added, removed: removed, changed: changed, unchanged: after.len() - added.len() - changed.len()}
+json.stringify(diff, pretty: true).save(output)
+echo "dataset diff: +{added.len()} -{removed.len()} ~{changed.len()}"

@@ -82,9 +82,16 @@ The journal probe uses a temporary subdirectory, so it proves SQLite/CAS prerequ
 polluting normal history. Config and policy file probes call the authoritative bounded core loaders;
 typed schema errors, structural limits, and policy-specific admission therefore match production.
 
+`scripts/source-audit.shl` treats both unit-test modules and crate-level `tests/` trees as test code.
+Test files are capped at 1,250 lines workspace-wide, production files at 1,200,
+and kernel production files at 1,050; the kernel's own root guard is stricter at 400 pre-audit
+lines. The same audit asserts that
+the daemon selects limits and listener security on `KernelBuilder` and that the removed post-build
+configuration methods do not return.
+
 ## Normative conformance corpus
 
-`spec/cases/` contains 79 TOML suite files and 1,364 `[[case]]` records. Cases declare globally named
+`spec/cases/` contains 79 TOML suite files and 1,379 `[[case]]` records. Cases declare globally named
 source, expected rendered value or stable error code, optional message substring, parse-error
 expectation, filesystem fixtures, and an explicit skip reason.
 
@@ -210,22 +217,19 @@ cargo bench -p shoal-journal --bench journal
 cargo bench -p shoal-exec --bench spawn
 ```
 
-The table benchmark retains one million rows and the journal benchmark seeds 100,000 entries, so
-these are review jobs rather than ordinary unit tests. The inherited performance budgets are:
-
-`table_1m_where_sort` (HR-F5, deep audit I12) now builds a real `shoal_value::Value::Table` and
-drives it through the actual `shoal_value::methods::call_method` dispatcher — the same `where`/
-`sort` entry point `shoal-eval` calls for every language-level `.where(...)`/`.sort(...)` — instead
-of hand-filtering/sorting a bare `Vec<i64>` with plain Rust code, which is what it did before and
-which measured nothing about table-method performance. Closure evaluation itself is stood in by a
-small bench-local `CallCtx` (mirroring `shoal-value`'s own unit-test harness) because interpreting a
-real AST closure needs `shoal-eval`, which sits above `shoal-value` in the dependency graph; the
-bench file's own doc comment states exactly what is and is not measured.
+The journal benchmark seeds 100,000 entries, and the value benchmark drives both a 16,384-row eager
+table and a one-million-row lazy stream, so these are review jobs rather than ordinary unit tests.
+`table_16k_where_sort` stays inside the public eager-materialization ceiling while exercising the
+real `where`/`sort` method dispatcher. `stream_1m_where_each` exercises the real lazy stream filter
+and incremental sink across one million rows without materializing them. Both use a bench-local
+`CallCtx` for their fixed closures because AST interpretation belongs to the higher-level
+`shoal-eval` crate; the benchmark source states that boundary explicitly.
 
 | Workload | Review budget |
 |---|---:|
 | reparse a 10 kB interactive buffer | p99 below 1 ms |
-| one-million-row `where` plus sort | below 150 ms |
+| 16,384-row eager `where` plus sort | pinned-runner baseline |
+| one-million-row streaming `where` plus `each` | pinned-runner baseline |
 | query a 100,000-entry journal | below 50 ms |
 | Shoal spawn overhead | within 5% of direct `execve` |
 | cold CLI startup | below 15 ms |
@@ -249,13 +253,28 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --release
 ```
 
+The gate also runs `scripts/dogfood-test.shl`. That harness executes all 51 standalone programs in
+`programs/ops/` against disposable, non-network fixtures and asserts their produced files and
+mutation boundaries. The workload covers backup/restore, journal export/retention, cache planning and
+pruning, state migration, configuration drift, dataset and dependency diffs, release checksums, SBOM
+and adapter validation, an isolated restricted-status/MCP plus credentialed-stop kernel lifecycle, deployment/rollback/retry
+planning, service health and quota analysis, test triage, Reef repair planning, and incident collection. See
+[Operational programs](@/docs/operations-programs.md) for invocation and the explicit host bootstrap
+boundary.
+
 GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the conformance harness,
 checks fmt/Clippy, and performs release builds. Each native release-build job also recreates an
-archive-shaped directory, installs it into a disposable prefix, byte-checks all ten executables and
-man pages, exercises the installed Reef command, validates bash/zsh/fish completions, injects a
-mid-commit failure to prove rollback, performs a clean reinstall, and proves scoped uninstall leaves
-unrelated files intact. Release automation produces binaries for x86_64 and AArch64 on Linux and
-macOS; archives carry the same `install.shl` used by this gate.
+archive-shaped directory and installs it into a disposable prefix. The install gate byte-checks all
+ten executables and man pages, exercises the installed Reef command, validates bash/zsh/fish
+completions, serializes two concurrent installers, bounds lock contention, and injects both handled
+failure and real `SIGKILL` after each of the 23 artifact commits plus manifest publication. Each
+crash must recover the exact old generation without transaction leaks. The same gate rejects a
+symlinked destination parent, cleans a staging assertion failure, and requires explicit force before
+uninstalling a user-replaced managed name while preserving unrelated files. Release automation
+produces binaries for x86_64 and AArch64 on Linux and macOS; archives carry the same `install.shl`
+and fd-relative recovery helper used by this gate. The native release jobs also package
+the same build twice, require identical SHA-256 archive digests, synthesize an SPDX fixture, and drive
+the complete local archive/checksum/SBOM verifier before a tag workflow can be trusted to publish.
 
 ### Workflow supply-chain policy
 
@@ -269,9 +288,28 @@ Workflow-installed Rust tools are version-pinned as well (`cargo-fuzz` 0.13.2 an
 release.
 
 Workflow token permissions default to read-only or empty. CI and fuzz receive only `contents: read`;
-the Pages build/deploy jobs receive Pages and OIDC rights only where used; the release job alone gets
-`contents: write` to create and upload a tag release. New jobs must declare the smallest permission
+the Pages build/deploy jobs receive Pages and OIDC rights only where used. Tag-release matrix jobs can
+read contents and mint the short-lived OIDC identity needed for GitHub artifact attestations, but
+cannot create or modify a release. A single downstream publish job receives `contents: write` only
+after all native builds, SPDX generation, checksum finalization, and signed provenance/SBOM
+attestations succeed. It cannot mint OIDC attestations. New jobs must declare the smallest permission
 set their API calls require instead of inheriting write authority at workflow scope.
+
+Release runners are architecture-native (`ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel`, and
+`macos-15`) and the packager refuses a Rust host/target mismatch. This removes mutable `apt`/`cross`
+tool installation from the release path. Archives use ustar, lexical file order, UID/GID zero,
+source-commit timestamps, and timestamp/name-free gzip headers. Pinned Syft emits the external SPDX
+asset; pinned `actions/attest` signs SLSA provenance for the archive/checksum/SBOM set and an SPDX
+predicate for the archive through GitHub's Sigstore-backed attestation service. The consumer verifier
+authenticates all byte-bearing assets to the expected workflow before parsing them, then checks
+bounded content/archive shape before binding the signatures to the repository, tag, exact source
+commit, and `.github/workflows/release.yml` signer.
+The packaged `shoal-release-inspect` helper parses gzip/ustar headers without extraction and proves
+those normalization properties from bytes, then parses SPDX JSON and the packaged Cargo.lock to
+require the release-root package, root-reachable directed dependency relationships with valid
+endpoints, and complete name/version coverage. Mutation tests corrupt order, type, canonical header
+fields, ownership, mode, mtime, BUILDINFO truth, SPDX identity, locked-package coverage, and
+relationship direction/reachability; each must be rejected semantically.
 
 ### Supply-chain advisories (HR-F6)
 

@@ -1,0 +1,15 @@
+#!/usr/bin/env shoal
+# Summarize implemented, experimental, planned, and blocked features.
+
+assert(args.len() == 2, "usage: feature-status-report.shl FEATURES OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "feature inventory is missing: {input}")
+let features = json.parse(input.read)
+let statuses = ["implemented", "experimental", "planned", "blocked"]
+let invalid = features.where(row => row.name == null || !(row.status in statuses))
+assert(invalid.is_empty(), "feature inventory contains invalid rows: {invalid}")
+let counts = statuses.map(status => ({status: status, count: features.where(.status == status).len()}))
+let report = {features: features.len(), counts: counts, blocked: features.where(.status == "blocked").map(.name).sort()}
+json.stringify(report, pretty: true).save(output)
+echo "feature inventory: {features.len()} entries, {report.blocked.len()} blocked"

@@ -100,7 +100,8 @@ impl Kernel {
     }
 
     fn lock_token_store(&self) -> Result<std::sync::MutexGuard<'_, TokenStore>, RpcError> {
-        self.auth
+        self.authority
+            .auth
             .as_ref()
             .ok_or_else(|| RpcError {
                 code: AUTH_FAILED,

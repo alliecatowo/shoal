@@ -1,0 +1,46 @@
+#!/usr/bin/env shoal
+# Build the native release twice and prove deterministic packaging + local verification.
+
+assert(args.is_empty(), "usage: release-package-test.shl")
+let manifest = toml.parse(path("Cargo.toml").read)
+let version = manifest.workspace["package"].version
+let tag = "v{version}"
+let rustc_verbose = run("rustc", "-vV").out.str()
+let host_line = rustc_verbose.lines().find(line => line.starts_with("host: "))
+assert(host_line != null, "rustc did not report a host triple")
+let target = host_line.replace("host: ", "")
+let supported = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+assert(target in supported, "release package smoke does not support host {target}")
+let root = path("shoal-{tag}-{target}")
+let archive = path("{root}.tar.gz")
+let checksum = path("{archive}.sha256")
+let sbom = path("{archive}.spdx.json")
+
+fn sha256(file: path) {
+  let result = if ((which sha256sum).out != null) {
+    run("sha256sum", file)
+  } else {
+    run("shasum", "-a", "256", file)
+  }
+  result.out.trim().split(" ").where(field => !field.is_empty()).first()
+}
+
+run("target/debug/shoal", "scripts/release-package.shl", tag, target)
+let first_digest = sha256(archive)
+run("target/debug/shoal", "scripts/release-package.shl", tag, target)
+let second_digest = sha256(archive)
+assert(first_digest == second_digest, "normalized release archive is not reproducible: {first_digest} != {second_digest}")
+
+run("target/debug/shoal", "scripts/release-sbom.shl", tag, target)
+run("target/debug/shoal", "scripts/release-manifest.shl", tag, target)
+
+let root_removed = (rm --permanent --recursive (root))
+let archive_removed = (rm --permanent (archive))
+let checksum_removed = (rm --permanent (checksum))
+let sbom_removed = (rm --permanent (sbom))
+echo "release package smoke passed: deterministic {target} archive + local verifier"

@@ -1,0 +1,18 @@
+#!/usr/bin/env shoal
+# Aggregate component ownership and surface unowned operational areas.
+
+assert(args.len() == 2, "usage: ownership-report.shl COMPONENTS OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "component inventory is missing: {input}")
+let components = json.parse(input.read)
+let invalid = components.where(row => row.name == null || row.owner == null)
+assert(invalid.is_empty(), "component ownership rows are malformed: {invalid}")
+let owners = components.group_by(.owner).map(group => ({
+  owner: group.key,
+  components: group.values.map(.name).sort(),
+  unhealthy: group.values.where(row => row.status != "healthy").map(.name).sort(),
+})).sort_by(.owner)
+let report = {components: components.len(), owners: owners, unowned: components.where(.owner == "unowned").map(.name).sort()}
+json.stringify(report, pretty: true).save(output)
+echo "mapped {components.len()} components to {owners.len()} owners"

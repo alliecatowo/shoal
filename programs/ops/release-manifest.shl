@@ -1,0 +1,22 @@
+#!/usr/bin/env shoal
+# Generate a checksum manifest over a staged release directory.
+
+assert(args.len() == 3, "usage: release-manifest.shl DIRECTORY VERSION OUTPUT")
+let root = path(args[0].str())
+let version = args[1].str()
+let output = path(args[2].str())
+assert(root.is_dir && !version.is_empty(), "release directory/version is invalid")
+fn digest(file: path) {
+  let result = if ((which sha256sum).out != null) { run("sha256sum", file) } else { run("shasum", "-a", "256", file) }
+  assert(result.ok, "checksum failed for {file}: {result.err}")
+  result.out.str().words().first()
+}
+let prefix = "{root.abs().display()}/"
+let files = glob(root.join("**/*").display(), hidden: true).expand().where(.is_file)
+  .where(file => file.abs() != output.abs())
+  .map(file => ({path: file.abs().display().replace(prefix, ""), bytes: file.size / 1b, sha256: digest(file)}))
+  .sort_by(.path)
+assert(!files.is_empty(), "release directory contains no files")
+let manifest = {schema: 1, version: version, files: files, total_bytes: files.map(.bytes).sum()}
+json.stringify(manifest, pretty: true).save(output)
+echo "manifested {files.len()} release files for {version}"

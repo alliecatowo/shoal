@@ -111,3 +111,49 @@ value = "[false, true]"
 name = "plan-pure-expression-derives-no-effects"
 src = '(plan { 1 + 2 }).effects.is_empty()'
 value = "true"
+
+[[case]]
+name = "plan-trash-rm-is-recoverable"
+src = '''
+let r = (plan { rm old })
+[r.reversible, r.effects.contains("trash {pwd}/old")]
+'''
+value = "[true, true]"
+
+[[case]]
+name = "plan-permanent-rm-is-irreversible"
+src = '''
+let r = (plan { rm --permanent old })
+[r.reversible, r.effects.contains("permanently delete {pwd}/old")]
+'''
+value = "[false, true]"
+
+[[case]]
+name = "plan-option-terminator-keeps-permanent-filename-recoverable"
+src = '''
+let r = (plan { rm -- --permanent })
+[r.reversible, r.effects.contains("trash {pwd}/--permanent")]
+'''
+value = "[true, true]"
+
+[[case]]
+name = "plan-alias-call-preserves-permanent-flag"
+src = '''
+let r = (plan {
+  alias purge = rm --recursive
+  purge --permanent old
+})
+[r.reversible, r.effects.contains("permanently delete {pwd}/old")]
+'''
+value = "[false, true]"
+
+# A stored/dynamic callable is opaque rather than optimistically borrowing
+# recoverable-rm semantics from an invocation spelling the planner cannot see.
+[[case]]
+name = "plan-dynamic-delete-callable-is-not-reported-reversible"
+src = '''
+fn destroy() { rm --permanent old }
+let r = (plan { destroy() })
+[r.reversible, r.effects.join(" ").contains("opaque")]
+'''
+value = "[false, true]"

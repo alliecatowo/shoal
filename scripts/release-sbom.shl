@@ -1,0 +1,54 @@
+#!/usr/bin/env shoal
+# Generate SPDX from the exact staged tree with a digest-pinned Syft binary.
+
+assert(args.is_empty() || args.len() == 2, "usage: release-sbom.shl [TAG TARGET]")
+let tag = (env SHOAL_RELEASE_TAG).out ?? (if (args.len() == 2) { args[0].str() } else { "" })
+let target = (env SHOAL_RELEASE_TARGET).out ?? (if (args.len() == 2) { args[1].str() } else { "" })
+assert(!tag.is_empty() && !target.is_empty(), "release tag and target are required")
+let project = toml.parse(path("Cargo.toml").read)
+let project_version = project.workspace["package"].version
+assert(tag == "v{project_version}", "release tag {tag} does not match workspace version v{project_version}")
+let syft_version = "1.48.0"
+let distributions = {
+  "x86_64-unknown-linux-gnu": {platform: "linux", arch: "amd64", sha256: "6cef9a7f37220d9067eaf9cfaaa2fce986e9f320a8d42cbc36658c99af78ea04"},
+  "aarch64-unknown-linux-gnu": {platform: "linux", arch: "arm64", sha256: "6865a3d97c4e28b4b38571c17a2bf512da4494ef1d37613c3122fce0d67e63b0"},
+  "x86_64-apple-darwin": {platform: "darwin", arch: "amd64", sha256: "dc7b2135fa5591003596df4ddb3408f499b68174f5e7dc1c77a373b753463182"},
+  "aarch64-apple-darwin": {platform: "darwin", arch: "arm64", sha256: "fef3e6d5df336a0a4c3e421e503119d1e221cf82a3ef5e426a791fcd81667e87"},
+}
+let distribution = distributions[target]
+assert(distribution != null, "unsupported release target: {target}")
+let name = "shoal-{tag}-{target}"
+let staged = path(name)
+let archive = path("{name}.tar.gz")
+let sbom = path("{archive}.spdx.json")
+assert(staged.is_dir && archive.is_file, "release package must exist before SBOM generation")
+
+fn sha256(file: path) {
+  let result = if ((which sha256sum).out != null) {
+    run("sha256sum", file)
+  } else {
+    run("shasum", "-a", "256", file)
+  }
+  result.out.trim().split(" ").where(field => !field.is_empty()).first()
+}
+
+let temporary = path(run("mktemp", "-d").out.trim())
+let syft_archive_name = "syft_{syft_version}_{distribution.platform}_{distribution.arch}.tar.gz"
+let syft_archive = temporary.join(syft_archive_name)
+let syft = temporary.join("syft")
+let url = "https://github.com/anchore/syft/releases/download/v{syft_version}/{syft_archive_name}"
+run("curl", "--fail", "--location", "--proto", "=https", "--tlsv1.2", "--output", syft_archive, url)
+assert(sha256(syft_archive) == distribution.sha256, "Syft release digest mismatch for {syft_archive_name}")
+run("tar", "xzf", syft_archive, "-C", temporary, "syft")
+assert(syft.is_file, "verified Syft archive did not contain its executable")
+env.SYFT_CHECK_FOR_APP_UPDATE = "false"
+run(syft, "scan", "dir:{staged.abs().display()}", "--source-name", name, "--source-version", project_version, "--quiet", "--output", "spdx-json={sbom.abs().display()}")
+# A full Cargo graph exceeds Shoal's intentional 16,384-node eager value wall.
+# Keep validation bounded here; actions/attest performs the full JSON/SPDX parse.
+let document = sbom.read.trim()
+assert(document.starts_with("\{") && document.ends_with("\}"), "Syft output is not a JSON object")
+assert(document.contains("\"spdxVersion\":\"SPDX-2.3\""), "Syft did not emit SPDX 2.3")
+assert(document.contains("\"SPDXID\":\"SPDXRef-DOCUMENT\""), "Syft output lacks an SPDX document identity")
+assert(document.contains("\"packages\":[\{"), "Syft output contains no packages")
+let temporary_removed = (rm --permanent --recursive (temporary))
+echo "release SBOM: {sbom} (Syft v{syft_version}, digest pinned)"

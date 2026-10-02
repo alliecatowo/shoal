@@ -6,12 +6,14 @@ use super::*;
 
 use crate::plan_effects::push_effect;
 
+mod aliases;
 mod attribution;
 mod commands;
 mod inputs;
 mod statements;
 mod value_effects;
 
+use aliases::merged;
 use attribution::{cmd_arg_str_literal, str_literal};
 
 type Functions = std::collections::HashMap<String, Block>;
@@ -40,9 +42,11 @@ impl Evaluator {
         for stmt in &program.stmts {
             self.plan_stmt(stmt, &functions, &aliases, &mut effects, 0)?;
         }
-        let reversibility = if effects
+        let reversibility = if effects.iter().any(Effect::is_permanent_delete) {
+            Reversibility::Irreversible
+        } else if effects
             .iter()
-            .any(|e| matches!(e, Effect::Opaque | Effect::FsDelete { .. }))
+            .any(|effect| matches!(effect, Effect::Opaque))
         {
             Reversibility::Unknown
         } else {

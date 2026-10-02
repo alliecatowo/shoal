@@ -19,12 +19,14 @@ use crate::{
     io_to_sql, now_ns,
 };
 
+pub(crate) mod read;
+pub use read::{CAS_MATERIALIZE_MAX_BYTES, Cas, CasReadError};
+
 /// zstd compression level for CAS blobs (3 = the zstd default: fast, good ratio).
 const ZSTD_LEVEL: i32 = 3;
 /// Absolute allocation ceiling of the journal's generic range API. Kernel raw
 /// pages use a smaller protocol wall; this protects direct embedders too.
 pub const BLOB_RANGE_MAX_BYTES: usize = 64 * 1024;
-
 const DEFAULT_OUTPUT_HARD_CAP: usize = 256 * 1024 * 1024;
 /// A completion has a small, fixed output vocabulary in every current host.
 /// Keep the aggregate API bounded so a direct embedder cannot turn one commit
@@ -284,23 +286,19 @@ impl Journal {
         if hex_bytes(hash).is_err() {
             return Ok(None);
         }
-        let compressed = match fs::read(self.blob_path(hash)) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_to_sql(e)),
+        let expected_len = self.blob_len(hash)?;
+        let read = match expected_len {
+            Some(expected_len) => self.cas().read_exact(hash, expected_len),
+            // Preserve the historical ability to inspect a crash orphan that
+            // reached disk before its metadata transaction. The DB-independent
+            // path still has a hard materialization/decompression ceiling.
+            None => self.cas().read(hash),
         };
-        let bytes = zstd::decode_all(compressed.as_slice()).map_err(io_to_sql)?;
-        // Integrity: content-addressed bytes MUST re-hash to their key.
-        if !blake3::hash(&bytes)
-            .to_hex()
-            .as_str()
-            .eq_ignore_ascii_case(hash)
-        {
-            return Err(io_to_sql(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("CAS blob {hash} failed integrity check: content hash mismatch"),
-            )));
-        }
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_to_sql(error)),
+        };
         if let Ok(raw) = hex_bytes(hash) {
             self.touch_blob(&raw);
         }
@@ -331,7 +329,10 @@ impl Journal {
         };
         let offset = offset.min(total);
         let wanted = total.saturating_sub(offset).min(length as u64) as usize;
-        let mut reader = self.cas().open_verified(hash).map_err(io_to_sql)?;
+        let mut reader = self
+            .cas()
+            .open_verified_exact(hash, total)
+            .map_err(io_to_sql)?;
         let skipped =
             io::copy(&mut reader.by_ref().take(offset), &mut io::sink()).map_err(io_to_sql)?;
         if skipped != offset {
@@ -645,91 +646,5 @@ impl<R: io::Read> io::Read for HashingReader<R> {
             .ok_or_else(|| io::Error::other("capture spill length overflow"))?;
         self.hasher.update(&buf[..read]);
         Ok(read)
-    }
-}
-
-/// A DB-independent handle to a CAS directory (see [`Journal::cas`]). Cloning is
-/// cheap (one `PathBuf`); reads are pure filesystem work and content-verified,
-/// so a lazy [`shoal_value`]-side value can hold one as its loader without any
-/// SQLite connection or lifetime tie to the owning [`Journal`].
-#[derive(Debug, Clone)]
-pub struct Cas {
-    root: PathBuf,
-}
-
-impl Cas {
-    fn blob_path(&self, hex: &str) -> PathBuf {
-        self.root
-            .join(&hex[0..2])
-            .join(&hex[2..4])
-            .join(format!("{hex}.zst"))
-    }
-
-    /// Read and decompress the CAS blob addressed by `hash`, verifying the
-    /// decompressed bytes re-hash to `hash` (the same integrity guard as
-    /// [`Journal::read_blob`]). A missing blob or malformed hash is a
-    /// `NotFound` error; a hash mismatch is `InvalidData`.
-    pub fn read(&self, hash: &str) -> io::Result<Vec<u8>> {
-        if hex_bytes(hash).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{hash} does not address a CAS blob"),
-            ));
-        }
-        let compressed = fs::read(self.blob_path(hash))?;
-        let bytes = zstd::decode_all(compressed.as_slice())?;
-        if !blake3::hash(&bytes)
-            .to_hex()
-            .as_str()
-            .eq_ignore_ascii_case(hash)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("CAS blob {hash} failed integrity check: content hash mismatch"),
-            ));
-        }
-        Ok(bytes)
-    }
-
-    /// Open a streaming decoder after verifying the full decompressed content
-    /// hash in a bounded-memory first pass. Verification precedes delivery, so
-    /// a consumer that intentionally stops early never observes bytes from a
-    /// corrupt content-addressed blob. The second pass trades additional disk
-    /// and decompression work for bounded memory and fail-closed integrity.
-    pub fn open_verified(&self, hash: &str) -> io::Result<Box<dyn io::Read + Send>> {
-        let mut verify = self.open_decoder(hash)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            let n = verify.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&chunk[..n]);
-        }
-        if !hasher
-            .finalize()
-            .to_hex()
-            .as_str()
-            .eq_ignore_ascii_case(hash)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("CAS blob {hash} failed integrity check: content hash mismatch"),
-            ));
-        }
-        self.open_decoder(hash)
-    }
-
-    fn open_decoder(&self, hash: &str) -> io::Result<Box<dyn io::Read + Send>> {
-        if hex_bytes(hash).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{hash} does not address a CAS blob"),
-            ));
-        }
-        let file = fs::File::open(self.blob_path(hash))?;
-        let decoder = zstd::Decoder::new(io::BufReader::new(file))?;
-        Ok(Box::new(decoder))
     }
 }

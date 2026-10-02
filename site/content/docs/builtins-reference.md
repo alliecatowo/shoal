@@ -72,7 +72,7 @@ callable-shadow resolution and before expansion or effects, so `rm --help FILE`,
 | `pwd` | `pwd` | `path` |
 | `quit` | `quit [STATUS]` | host exit request |
 | `reef` | `reef [SUBCOMMAND]` | `outcome<table|record>` |
-| `rm` | `rm [--permanent] [-r|--recursive] PATH...` | `outcome<list>` |
+| `rm` | `rm [--permanent] [-r|--recursive] [--expect-sha256=HEX --expect-bytes=N] PATH...` | `outcome<list>` |
 | `run` | `run TARGET [ARG...]` | script or command result |
 | `save` | `save PATH VALUE` | original value |
 | `sleep` | `sleep DURATION` | `outcome<null>` |
@@ -236,6 +236,9 @@ Errors include:
 - `arg_error` when a directory is copied without recursion;
 - `arg_error` when source and destination identify the same file (including a hard-link alias), or
   when a recursive destination resolves inside its source through lexical or symlinked parents;
+- `arg_error` when two source jobs resolve to the same, aliased, or ancestor/descendant destination;
+- `builtin_work_limit` when the complete plan would retain more filesystem descriptors than the
+  process's `RLIMIT_NOFILE` budget permits after safety headroom;
 - a filesystem error for read/write failures.
 
 Recursive copy inventories every source before the first filesystem mutation. The shared plan is
@@ -244,6 +247,30 @@ limited to 16,384 pending/final operations, 16 MiB of retained path state, and 6
 both entry count and aggregate encoded path bytes while reading. A preflight failure leaves every
 destination untouched. This is an allocation/effect-order guarantee, not an atomicity guarantee for
 an I/O failure that occurs after execution begins.
+
+The planner also inventories every destination job before execution and rejects duplicate paths,
+lexical aliases, existing hard-link aliases, and ancestor/descendant overlaps. Descriptor-backed
+admission tracks the handles each source, destination root, and existing destination retains. On
+Unix the standard adapter derives a finite budget from `RLIMIT_NOFILE` and the current open-handle
+count, reserves 32 descriptors for traversal/publication and unrelated process work, and reports a
+typed `builtin_work_limit` before the plan can consume that reserve.
+
+On Linux and macOS, both sides of an admitted copy remain capability-pinned from inventory through
+execution. Source directories are traversed fd-relative and files are read from retained handles.
+The destination is rooted at its deepest existing directory descriptor; missing descendants use
+no-follow `mkdirat`, directory modes use the verified opened directory, and file bytes are written to
+a randomly named, create-exclusive sibling before conditional atomic publication. An existing file is replaced only when its
+identity and single-link status still match preflight; a missing leaf uses an atomic no-replace
+rename. Ancestor swaps, raced symlinks, file replacements, and raced hard links therefore fail or
+remain attached to the originally admitted directory instead of redirecting/truncating another
+object. Filesystem adapters and platforms without equivalent source, destination, and conditional
+rename capabilities fail closed as `unsupported`.
+
+Each retained regular file is checked again after streaming. A change in identity, length,
+modification time, or change time—or a byte count inconsistent with the admitted length—fails the
+copy instead of publishing the temporary. This detects ordinary concurrent in-place writes; no
+filesystem metadata sampling contract can detect a hostile writer that restores every sampled
+field exactly.
 
 The copy tree has an explicit portable metadata contract:
 
@@ -289,7 +316,8 @@ Successful journaled moves may record a move-back inverse. Cross-device or platf
 ### `rm`
 
 ```text
-rm [--permanent] [-r | -R | --recursive] PATH...
+rm [--permanent] [-r | -R | --recursive]
+   [--expect-sha256=HEX --expect-bytes=N] PATH...
 -> outcome<list<record<{path, trash}>>>  # default
 -> outcome<list<path>>                   # --permanent
 ```
@@ -300,6 +328,7 @@ Default `rm` is a session-temporary trash move. It renames each target into a pr
 rm scratch.txt
 rm --recursive build
 rm --permanent --recursive build
+rm --permanent --expect-sha256=(digest) --expect-bytes=(bytes) cache.key
 ```
 
 Safety behavior:
@@ -309,15 +338,36 @@ Safety behavior:
   `rm_path_duplicate` before any trash directory or deletion is created;
 - a directory together with any descendant raises `rm_path_overlap` in either argument order;
 - permanent directory removal requires a recursive flag;
+- permanent files and symbolic links receive a second conditional contained-name commit before
+  unlink, so replacing an entry after its outer quarantine move does not redirect deletion;
+- permanent recursive removal admits a bounded complete descendant manifest, pins the root, uses
+  no-follow fd-relative traversal, and atomically contains each child under a random private sibling
+  name before verifying its identity and mount and unlinking it. A raced replacement is restored
+  without overwrite when possible or left contained for inspection; either case refuses with
+  `rm_path_changed` rather than deleting the replacement;
+- a recursive-removal manifest outside its work bounds raises `builtin_work_limit` before any
+  target is moved;
+- complete pre-commit drift validation causes no partial deletion; a descendant created during the
+  commit is preserved and can stop a later directory removal after earlier admitted siblings have
+  already been deleted, leaving the quarantined root for inspection;
 - non-permanent directory removal is implemented as a rename and does not require recursion;
 - journaled trash moves can be undone while the trash target is intact;
 - trash storage is temporary, not a desktop trash protocol and not durable archival storage.
 
-`--permanent` bypasses the trash and is normally irreversible.
+`--permanent` bypasses the trash and is irreversible; plans preserve that mode explicitly.
+`--expect-sha256=HEX` and `--expect-bytes=N` form one inseparable conditional-delete contract:
+both must be present with `--permanent`, without a recursive flag, and with exactly one regular file
+or symbolic-link target. `HEX` is a lowercase 64-character SHA-256 digest and `N` is a non-negative
+byte count. Shoal opens and hashes the admitted target, then commits deletion only if its digest and
+length still match. Content or identity drift returns `rm_path_changed` and restores or retains the
+raced object instead of deleting it. These options are designed for manifest-driven cache pruning;
+they are not a substitute for recoverable trash when the caller cannot prove the expected content.
+The flag is recognized only before the `--` option terminator, so `rm -- --permanent` removes a
+file literally named `--permanent` through recoverable trash.
 Identity uses the injected filesystem port's canonicalization. The final component of a symbolic
 link is deliberately not followed because `rm link` removes the link, while symbolic-link aliases
-in parent components are resolved. These checks eliminate deterministic input overlap; they do not
-eliminate a hostile filesystem race between preflight and rename/removal.
+in parent components are resolved. Linux and macOS use no-follow, fd-relative guarded mutation;
+other filesystem adapters must provide equivalent recursive-removal capabilities or fail closed.
 
 ### `ln`
 
@@ -364,14 +414,14 @@ open PATH
 -> null
 ```
 
-Launches `xdg-open PATH` detached with null stdio and returns after spawn. The current default opener is Linux-oriented; on macOS it does not automatically substitute `open`.
+Launches the platform desktop handler detached with null stdio and returns after spawn: `xdg-open PATH` on Linux and `open PATH` on macOS. Other platforms return a typed `unsupported` error before spawning anything. Desktop dispatch has a shared four-process admission ceiling; temporary saturation returns `resource_busy`. Shoal owns each launcher's process group, kills the group after 30 seconds, and reaps the leader, so hung helpers and their descendants cannot accumulate without bound.
 
 ```shoal
 open README.md
 open(path("target/doc/index.html"))
 ```
 
-Exactly one path/string is required. Spawn failure raises `custom`.
+Exactly one path/string is required. An unsupported host raises `unsupported`; a launcher or reaper failure raises `custom`.
 
 ## Navigation and directory stack
 

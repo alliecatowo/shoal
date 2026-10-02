@@ -1,0 +1,28 @@
+#!/usr/bin/env shoal
+# Inventory Reef adapter manifests and their execution capabilities.
+
+assert(args.len() == 2, "usage: adapter-inventory.shl DIRECTORY OUTPUT")
+let root = path(args[0].str())
+let output = path(args[1].str())
+assert(root.is_dir, "adapter directory is missing: {root}")
+let files = glob(root.join("*.toml").display()).expand().sort()
+assert(!files.is_empty(), "adapter directory contains no TOML manifests")
+let adapters = files.map(file => {
+  let document = toml.parse(file.read)
+  let names = document.cmd.keys()
+  assert(names.len() == 1, "adapter must declare exactly one top-level command: {file}")
+  let name = names.first()
+  let command = document.cmd[name]
+  {
+    file: file.name,
+    name: name,
+    class: command.class,
+    executable: command.bin,
+    subcommands: if ("sub" in command.keys()) { command["sub"].keys().len() } else { 0 },
+  }
+}).sort_by(.name)
+let duplicate = adapters.group_by(.name).where(group => group.values.len() > 1).map(.key)
+assert(duplicate.is_empty(), "duplicate adapter names: {duplicate}")
+let report = {adapters: adapters.len(), executables: adapters.map(.executable).uniq().sort(), manifests: adapters}
+json.stringify(report, pretty: true).save(output)
+echo "inventoried {adapters.len()} adapters"

@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(crate) struct ConnectionRegistry {
     next_client: AtomicU64,
     active: Arc<AtomicUsize>,
-    max: AtomicUsize,
-    frame_read_timeout_ms: AtomicU64,
+    max: usize,
+    frame_read_timeout_ms: u64,
 }
 
 impl ConnectionRegistry {
@@ -16,15 +16,9 @@ impl ConnectionRegistry {
         Self {
             next_client: AtomicU64::new(1),
             active: Arc::new(AtomicUsize::new(0)),
-            max: AtomicUsize::new(max),
-            frame_read_timeout_ms: AtomicU64::new(frame_read_timeout_ms),
+            max,
+            frame_read_timeout_ms,
         }
-    }
-
-    pub(crate) fn configure(&self, max: usize, frame_read_timeout_ms: u64) {
-        self.max.store(max, Ordering::Relaxed);
-        self.frame_read_timeout_ms
-            .store(frame_read_timeout_ms, Ordering::Relaxed);
     }
 
     pub(crate) fn next_client(&self) -> u64 {
@@ -32,11 +26,11 @@ impl ConnectionRegistry {
     }
 
     pub(crate) fn max(&self) -> usize {
-        self.max.load(Ordering::Relaxed)
+        self.max
     }
 
     pub(crate) fn frame_read_timeout_ms(&self) -> u64 {
-        self.frame_read_timeout_ms.load(Ordering::Relaxed)
+        self.frame_read_timeout_ms
     }
 
     pub(crate) fn reserve(&self) -> Result<ConnectionPermit, ()> {

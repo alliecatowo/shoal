@@ -146,7 +146,14 @@ fn effect_str(e: &Effect) -> String {
     match e {
         Effect::FsRead { paths } => format!("read {}", join_paths(paths)),
         Effect::FsWrite { paths } => format!("write {}", join_paths(paths)),
-        Effect::FsDelete { paths } => format!("delete {}", join_paths(paths)),
+        Effect::FsDelete {
+            paths,
+            permanent: false,
+        } => format!("trash {}", join_paths(paths)),
+        Effect::FsDelete {
+            paths,
+            permanent: true,
+        } => format!("permanently delete {}", join_paths(paths)),
         Effect::ProcSpawn { argv0, .. } => format!("spawn {argv0}"),
         Effect::NetConnect { host, port } => format!("connect {host}:{port}"),
         Effect::NetListen { port } => format!("listen {port}"),

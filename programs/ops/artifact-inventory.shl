@@ -1,0 +1,36 @@
+#!/usr/bin/env shoal
+# Build a deterministic size and checksum inventory for an artifact tree.
+
+assert(args.len() == 2, "usage: artifact-inventory.shl ROOT OUTPUT")
+let root = path(args[0].str())
+let output = path(args[1].str())
+assert(root.is_dir, "artifact root is not a directory: {root}")
+
+fn digest(file: path) {
+  let result = if ((which sha256sum).out != null) {
+    run("sha256sum", file)
+  } else {
+    run("shasum", "-a", "256", file)
+  }
+  assert(result.ok, "checksum failed for {file}: {result.err}")
+  result.out.str().words().first()
+}
+
+let prefix = "{root.abs().display()}/"
+let files = glob(root.join("**/*").display(), hidden: true).expand()
+  .where(.is_file)
+  .map(file => ({
+    path: file.abs().display().replace(prefix, ""),
+    bytes: file.size / 1b,
+    sha256: digest(file),
+  }))
+  .sort_by(.path)
+let manifest = {
+  schema: 1,
+  root: root.abs().display(),
+  files: files,
+  total_bytes: files.map(.bytes).sum(),
+}
+json.stringify(manifest, pretty: true).save(output)
+assert(output.is_file, "inventory was not written: {output}")
+echo "inventoried {files.len()} artifacts ({manifest.total_bytes} bytes)"

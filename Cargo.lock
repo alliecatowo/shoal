@@ -2497,7 +2497,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "shoal"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crossterm",
+ "getrandom 0.4.3",
  "libc",
  "nu-ansi-term",
  "portable-pty",
@@ -2507,6 +2509,7 @@ dependencies = [
  "shell-words",
  "shoal-adapters",
  "shoal-ast",
+ "shoal-auth",
  "shoal-config",
  "shoal-doctor",
  "shoal-eval",
@@ -2606,6 +2609,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "sha2",
  "shoal-adapters",
  "shoal-ast",
  "shoal-exec",
@@ -2667,6 +2671,19 @@ dependencies = [
  "shoal-syntax",
  "shoal-value",
  "tempfile",
+]
+
+[[package]]
+name = "shoal-installer"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml 1.1.3+spec-1.1.0",
 ]
 
 [[package]]

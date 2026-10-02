@@ -1,0 +1,18 @@
+#!/usr/bin/env shoal
+# Combine component probes into one per-service health classification.
+
+assert(args.len() == 2, "usage: service-health-summary.shl PROBES OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "service probes are missing: {input}")
+let probes = json.parse(input.read)
+let invalid = probes.where(row => row.service == null || row.component == null || !(row.status in ["ok", "degraded", "down"]))
+assert(invalid.is_empty(), "service probes contain invalid rows: {invalid}")
+let services = probes.group_by(.service).map(group => {
+  let down = group.values.where(.status == "down").len()
+  let degraded = group.values.where(.status == "degraded").len()
+  {service: group.key, components: group.values.len(), status: if (down > 0) { "down" } else if (degraded > 0) { "degraded" } else { "ok" }}
+}).sort_by(.service)
+let report = {services: services, unhealthy: services.where(.status != "ok").map(.service).sort()}
+json.stringify(report, pretty: true).save(output)
+echo "service health: {report.unhealthy.len()} unhealthy of {services.len()}"

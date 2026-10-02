@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Report missing, unexpected, and changed resolved configuration keys.
+
+assert(args.len() == 3, "usage: config-drift.shl EXPECTED ACTUAL OUTPUT")
+let expected_file = path(args[0].str())
+let actual_file = path(args[1].str())
+let output = path(args[2].str())
+assert(expected_file.is_file && actual_file.is_file, "configuration input is missing")
+let expected = json.parse(expected_file.read)
+let actual = json.parse(actual_file.read)
+let expected_keys = expected.map(.key)
+let actual_keys = actual.map(.key)
+let missing = expected.where(row => !(row.key in actual_keys))
+let unexpected = actual.where(row => !(row.key in expected_keys))
+let changed = actual.where(row => {
+  let wanted = expected.find(candidate => candidate.key == row.key)
+  wanted != null && json.stringify(wanted.value) != json.stringify(row.value)
+})
+let report = {clean: missing.is_empty() && unexpected.is_empty() && changed.is_empty(), missing: missing, unexpected: unexpected, changed: changed}
+json.stringify(report, pretty: true).save(output)
+echo "configuration drift: {missing.len()} missing, {unexpected.len()} unexpected, {changed.len()} changed"

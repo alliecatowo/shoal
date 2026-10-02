@@ -1,0 +1,29 @@
+#!/usr/bin/env shoal
+# Verify every staged release artifact against a checksum manifest.
+
+assert(args.len() == 2, "usage: release-verify.shl DIRECTORY MANIFEST")
+let root = path(args[0].str()).abs()
+let manifest_file = path(args[1].str())
+assert(root.is_dir && manifest_file.is_file, "release directory or manifest is missing")
+let manifest = json.parse(manifest_file.read)
+assert(manifest.schema == 1 && manifest.files != null, "unsupported release manifest")
+let prefix = "{root.display()}/"
+let actual_paths = glob(root.join("**/*").display(), hidden: true).expand().where(.is_file)
+  .map(file => file.abs().display().replace(prefix, "")).sort()
+let expected_paths = manifest.files.map(.path).sort()
+assert(actual_paths == expected_paths, "release file set drift: expected {expected_paths}, found {actual_paths}")
+fn digest(file: path) {
+  let result = if ((which sha256sum).out != null) { run("sha256sum", file) } else { run("shasum", "-a", "256", file) }
+  assert(result.ok, "checksum failed for {file}: {result.err}")
+  result.out.str().words().first()
+}
+var total = 0
+for entry in manifest.files {
+  let file = root.join(entry.path)
+  assert(file.is_file, "release artifact is missing: {entry.path}")
+  assert(file.size / 1b == entry.bytes, "release artifact size drift: {entry.path}")
+  assert(digest(file) == entry.sha256, "release artifact checksum drift: {entry.path}")
+  total += file.size / 1b
+}
+assert(total == manifest.total_bytes, "release byte total drift")
+echo "verified {manifest.files.len()} release artifacts for {manifest.version}"

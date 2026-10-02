@@ -40,6 +40,7 @@ impl ApprovalGrantReservation {
 
     fn commit(&mut self, completed: ApprovalRecord) -> Result<(), RpcError> {
         self.kernel
+            .runtime
             .plans
             .transaction(|plans| -> Result<(), RpcError> {
                 let stored = plans.get_mut(&self.plan_ref).ok_or_else(|| {
@@ -69,7 +70,7 @@ impl ApprovalGrantReservation {
         // Drop may run during another unwind. A poisoned plan mutex is already
         // quarantined by dispatch; never turn best-effort rollback into abort.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _ = kernel.plans.transaction(|plans| {
+            let _ = kernel.runtime.plans.transaction(|plans| {
                 if let Some(stored) = plans.get_mut(&plan_ref) {
                     let restore = match &stored.authorization {
                         PlanAuthorization::Granting {
@@ -107,7 +108,7 @@ impl Kernel {
         let session = &attachment.session;
         let owner = session.key.owner();
         self.reap_finished_tasks(&owner);
-        let tasks = self.tasks.snapshot_owner(&owner)?;
+        let tasks = self.runtime.tasks.snapshot_owner(&owner)?;
         let records = tasks
             .iter()
             .map(task_record)
@@ -321,7 +322,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
-        self.plans.transaction(|plans| {
+        self.runtime.plans.transaction(|plans| {
             if plans.get(&p.plan_ref).is_some_and(plan_expired) {
                 plans.remove(&p.plan_ref);
             }
@@ -344,7 +345,10 @@ impl Kernel {
             // The source parsed cleanly when the plan was stored, so this succeeds;
             // an `ast: null` is an honest gap, never a fabricated tree.
             let ast = shoal_syntax::parse(&stored.src).ok();
-            let verdict = self.policy.evaluate_plan(&stored.principal, &stored.plan);
+            let verdict = self
+                .authority
+                .policy
+                .evaluate_plan(&stored.principal, &stored.plan);
             encode(json!({
             "ast_version": AST_VERSION,
             "ast": ast,
@@ -373,13 +377,13 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
-        self.plans.transaction(|plans| {
+        self.runtime.plans.transaction(|plans| {
             plans.retain(|_, stored| !plan_expired(stored));
             let records: Vec<Json> = plans
                 .values()
                 .filter(|sp| sp.session == session.id && sp.principal == attachment.principal)
                 .map(|sp| {
-                    let verdict = self.policy.evaluate_plan(&sp.principal, &sp.plan);
+                    let verdict = self.authority.policy.evaluate_plan(&sp.principal, &sp.plan);
                     json!({
                         "plan_ref": sp.plan.plan_ref,
                         "effects": sp.plan.effects,
@@ -405,6 +409,7 @@ impl Kernel {
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
         let src = self
+            .runtime
             .plans
             .transaction(|plans| -> Result<String, RpcError> {
                 if plans.get(&p.plan_ref).is_some_and(plan_expired) {
@@ -425,6 +430,7 @@ impl Kernel {
                 match &stored.authorization {
                     PlanAuthorization::PolicyAllowed
                         if self
+                            .authority
                             .policy
                             .evaluate_plan(&attachment.principal, &stored.plan)
                             == Verdict::Allow => {}
@@ -537,23 +543,22 @@ impl Kernel {
         // lock. Durable journal I/O deliberately happens after this
         // transaction; `Granting` excludes concurrent grants and applies.
         let grant_lease = Arc::new(());
-        let prepared =
-            self.plans
-                .transaction(|plans| -> Result<ApprovalPreparation, RpcError> {
-                    if plans.get(&plan_ref).is_some_and(plan_expired) {
-                        plans.remove(&plan_ref);
-                    }
-                    let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
-                        code: UNKNOWN_PLAN,
-                        message: "unknown plan_ref".into(),
-                        data: None,
-                    })?;
+        let prepared = self.runtime.plans.transaction(
+            |plans| -> Result<ApprovalPreparation, RpcError> {
+                if plans.get(&plan_ref).is_some_and(plan_expired) {
+                    plans.remove(&plan_ref);
+                }
+                let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
+                    code: UNKNOWN_PLAN,
+                    message: "unknown plan_ref".into(),
+                    data: None,
+                })?;
 
-                    let requester = stored.principal.clone();
-                    let self_ack =
-                        approver == requester && self.allow_self_ack.load(Ordering::SeqCst);
-                    if approver == requester && !self_ack {
-                        return Err(RpcError {
+                let requester = stored.principal.clone();
+                let self_ack =
+                    approver == requester && self.authority.allow_self_ack.load(Ordering::SeqCst);
+                if approver == requester && !self_ack {
+                    return Err(RpcError {
                         code: LEASH_DENIED,
                         message:
                             "self-approval is not permitted: a plan's approver must differ from \
@@ -565,114 +570,119 @@ impl Kernel {
                             "approver": approver,
                         })),
                     });
+                }
+                if approver != requester && !can_approve {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "approver is not authorized: use the embedded human trust root, \
+                              supervisor profile, or plan.approve capability"
+                            .into(),
+                        data: Some(json!({
+                            "plan_ref": plan_ref,
+                            "requester": requester,
+                            "approver": approver,
+                        })),
+                    });
+                }
+                if self
+                    .authority
+                    .policy
+                    .evaluate_plan(&stored.principal, &stored.plan)
+                    == Verdict::Deny
+                {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "policy denies requested effects".into(),
+                        data: None,
+                    });
+                }
+
+                let plan_effect_kinds = stored
+                    .plan
+                    .effects
+                    .iter()
+                    .map(effect_kind)
+                    .collect::<Vec<_>>();
+                if !requested.is_empty() {
+                    let missing: Vec<String> = plan_effect_kinds
+                        .iter()
+                        .filter(|k| !requested.contains(&norm_effect(k)))
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        return Ok(Err(json!({
+                            "grant": "approval_pending",
+                            "plan_ref": plan_ref,
+                            "why": "requested effect scope does not cover the plan",
+                            "uncovered_effects": missing,
+                        })));
                     }
-                    if approver != requester && !can_approve {
+                }
+
+                match &stored.authorization {
+                    PlanAuthorization::Pending => {}
+                    PlanAuthorization::Granting { .. } => {
                         return Err(RpcError {
                             code: LEASH_DENIED,
-                            message:
-                                "approver is not authorized: use the embedded human trust root, \
-                              supervisor profile, or plan.approve capability"
-                                    .into(),
+                            message: "approval grant is already in progress".into(),
+                            data: Some(json!({"plan_ref": plan_ref})),
+                        });
+                    }
+                    PlanAuthorization::Approved(_) | PlanAuthorization::Claimed(_) => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "plan already has an approval".into(),
+                            data: Some(json!({"plan_ref": plan_ref})),
+                        });
+                    }
+                    PlanAuthorization::Consumed(record) => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "approval was already consumed; create a new plan".into(),
                             data: Some(json!({
                                 "plan_ref": plan_ref,
-                                "requester": requester,
-                                "approver": approver,
+                                "consumed_by": record.consumed_by,
                             })),
                         });
                     }
-                    if self.policy.evaluate_plan(&stored.principal, &stored.plan) == Verdict::Deny {
+                    PlanAuthorization::Denied => {
                         return Err(RpcError {
                             code: LEASH_DENIED,
                             message: "policy denies requested effects".into(),
                             data: None,
                         });
                     }
+                    // A caller may still request an explicit, auditable one-shot
+                    // approval for a plan policy would allow directly. This keeps
+                    // cap.request useful as an acknowledgement/audit operation.
+                    PlanAuthorization::PolicyAllowed => {}
+                }
 
-                    let plan_effect_kinds = stored
-                        .plan
-                        .effects
-                        .iter()
-                        .map(effect_kind)
-                        .collect::<Vec<_>>();
-                    if !requested.is_empty() {
-                        let missing: Vec<String> = plan_effect_kinds
-                            .iter()
-                            .filter(|k| !requested.contains(&norm_effect(k)))
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() {
-                            return Ok(Err(json!({
-                                "grant": "approval_pending",
-                                "plan_ref": plan_ref,
-                                "why": "requested effect scope does not cover the plan",
-                                "uncovered_effects": missing,
-                            })));
-                        }
-                    }
-
-                    match &stored.authorization {
-                        PlanAuthorization::Pending => {}
-                        PlanAuthorization::Granting { .. } => {
-                            return Err(RpcError {
-                                code: LEASH_DENIED,
-                                message: "approval grant is already in progress".into(),
-                                data: Some(json!({"plan_ref": plan_ref})),
-                            });
-                        }
-                        PlanAuthorization::Approved(_) | PlanAuthorization::Claimed(_) => {
-                            return Err(RpcError {
-                                code: LEASH_DENIED,
-                                message: "plan already has an approval".into(),
-                                data: Some(json!({"plan_ref": plan_ref})),
-                            });
-                        }
-                        PlanAuthorization::Consumed(record) => {
-                            return Err(RpcError {
-                                code: LEASH_DENIED,
-                                message: "approval was already consumed; create a new plan".into(),
-                                data: Some(json!({
-                                    "plan_ref": plan_ref,
-                                    "consumed_by": record.consumed_by,
-                                })),
-                            });
-                        }
-                        PlanAuthorization::Denied => {
-                            return Err(RpcError {
-                                code: LEASH_DENIED,
-                                message: "policy denies requested effects".into(),
-                                data: None,
-                            });
-                        }
-                        // A caller may still request an explicit, auditable one-shot
-                        // approval for a plan policy would allow directly. This keeps
-                        // cap.request useful as an acknowledgement/audit operation.
-                        PlanAuthorization::PolicyAllowed => {}
-                    }
-
-                    let restore_policy_allowed =
-                        matches!(stored.authorization, PlanAuthorization::PolicyAllowed);
-                    let record = ApprovalRecord {
-                        requester: requester.clone(),
-                        approver: approver.clone(),
-                        plan_ref: stored.plan.plan_ref.clone(),
-                        plan_hash: stored.plan_hash.clone(),
-                        source_hash: stored.source_hash.clone(),
-                        session: stored.session.clone(),
-                        // Record the exact immutable plan scope, never a caller-supplied
-                        // superset that could overstate what was actually approved.
-                        scope: plan_effect_kinds.clone(),
-                        approved_at_ns: now_ns(),
-                        grant_audit_id: 0,
-                        consumed_by: None,
-                    };
-                    stored.authorization = PlanAuthorization::Granting {
-                        record: record.clone(),
-                        restore_policy_allowed,
-                        started_at: Instant::now(),
-                        lease: Arc::downgrade(&grant_lease),
-                    };
-                    Ok(Ok((record, plan_effect_kinds, requester, grant_lease)))
-                })??;
+                let restore_policy_allowed =
+                    matches!(stored.authorization, PlanAuthorization::PolicyAllowed);
+                let record = ApprovalRecord {
+                    requester: requester.clone(),
+                    approver: approver.clone(),
+                    plan_ref: stored.plan.plan_ref.clone(),
+                    plan_hash: stored.plan_hash.clone(),
+                    source_hash: stored.source_hash.clone(),
+                    session: stored.session.clone(),
+                    // Record the exact immutable plan scope, never a caller-supplied
+                    // superset that could overstate what was actually approved.
+                    scope: plan_effect_kinds.clone(),
+                    approved_at_ns: now_ns(),
+                    grant_audit_id: 0,
+                    consumed_by: None,
+                };
+                stored.authorization = PlanAuthorization::Granting {
+                    record: record.clone(),
+                    restore_policy_allowed,
+                    started_at: Instant::now(),
+                    lease: Arc::downgrade(&grant_lease),
+                };
+                Ok(Ok((record, plan_effect_kinds, requester, grant_lease)))
+            },
+        )??;
         let (mut record, plan_effect_kinds, requester, grant_lease) = match prepared {
             Ok(approved) => approved,
             Err(response) => return encode(response),
@@ -718,17 +728,19 @@ mod task_poison_tests {
 
     #[test]
     fn request_repairs_poisoned_task_and_releases_both_leases() {
-        let kernel = Kernel::new();
-        kernel.configure_limits(Limits {
-            max_tasks_per_session: 1,
-            ..Limits::default()
-        });
+        let kernel = Kernel::builder()
+            .limits(Limits {
+                max_tasks_per_session: 1,
+                ..Limits::default()
+            })
+            .build()
+            .unwrap();
         let principal = principal();
         let session = kernel.session("task-request-poison", &principal).unwrap();
         let owner = session.key.owner();
         let baseline = Arc::strong_count(&session);
         let task_ref = Ref::new("task", 9_001);
-        let permit = kernel.tasks.reserve(&owner).unwrap();
+        let permit = kernel.runtime.tasks.reserve(&owner).unwrap();
         let task = Arc::new(TaskEntry {
             task: task_ref.clone(),
             owner: owner.clone(),
@@ -749,7 +761,7 @@ mod task_poison_tests {
             deadline_ms: None,
             deadline_exceeded: AtomicBool::new(false),
         });
-        kernel.tasks.insert_checked(task.clone()).unwrap();
+        kernel.runtime.tasks.insert_checked(task.clone()).unwrap();
         assert_eq!(Arc::strong_count(&session), baseline + 1);
         let poisoner = task.clone();
         let thread = std::thread::spawn(move || {
@@ -785,6 +797,7 @@ mod task_poison_tests {
         );
 
         let replacement = kernel
+            .runtime
             .tasks
             .reserve(&owner)
             .expect("reconstruction released the active quota permit");

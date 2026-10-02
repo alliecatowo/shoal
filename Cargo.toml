@@ -58,7 +58,7 @@ explicit_iter_loop = "warn"
 
 [workspace.metadata.lints]
 status = """
-[workspace.lints] above is wired to every workspace member (HR-F1): each of the 22 crates under
+[workspace.lints] above is wired to every workspace member (HR-F1): each of the 25 crates under
 crates/*/Cargo.toml adds `[lints] workspace = true`. `cargo +stable clippy --workspace --all-targets
 --locked -- -D warnings` was re-verified zero-warning with the opt-in in place; no per-crate
 `#![allow(...)]` was needed. A crate's own `#![allow(...)]` still takes precedence per lint over the

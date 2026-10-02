@@ -190,7 +190,8 @@ memory, CPU, file roots, and kernel-wide quotas.
 
 | Effect | Payload |
 |---|---|
-| `FsRead`, `FsWrite`, `FsDelete` | concrete path list |
+| `FsRead`, `FsWrite` | concrete path list |
+| `FsDelete` | concrete path list and a backward-compatible `permanent` boolean (absent means recoverable) |
 | `ProcSpawn` | binary hash and argv0 |
 | `NetConnect` | host and port |
 | `NetListen` | port |
@@ -206,6 +207,11 @@ optional byte/item estimates. The Leash value's short content fingerprint covers
 fields. The kernel's externally returned plan object ref is stronger: it binds source, canonical AST,
 effects/estimates, Session, and principal with a full BLAKE3 digest plus a unique per-kernel suffix.
 It is an ephemeral owner-scoped object id, not a transferable authorization token.
+
+The delete-mode attribute is semantic, not a new grant kind: recoverable trash removal and
+permanent removal both require the existing `fs.delete` path authority. It prevents
+`rm --permanent` from receiving the recoverable mode's reversibility classification or automatic
+application under an `auto_apply = "reversible"` policy.
 
 ## Principal policy schema
 
@@ -252,9 +258,11 @@ accDescr: Individual effect grants roll up into a plan verdict; denied effects s
   PlanDeny --> Stop
 ```
 
-Filesystem paths are lexically normalized before glob matching; `..` pops a component. Leading `~/`
-uses `HOME`. Pattern compilation failure denies. The check does not canonicalize the effect path, so
-symlink resolution and lexical grant semantics must not be conflated.
+Filesystem paths are lexically normalized, then the deepest existing prefix is canonicalized before
+glob matching; `..` pops a component and a not-yet-created suffix stays below the resolved prefix.
+Leading `~/` uses `HOME`. Grant prefixes are canonicalized by the same rule, so a parent grant cannot
+escape through a child symlink and an explicit symlink grant names its canonical target. Pattern or
+canonicalization failure denies. The resolution check and later operation remain a TOCTOU boundary.
 
 Name grants require every requested name to equal a grant or `*`. Spawn grants match exact hash,
 full argv0, or argv0 basename. Network grants match host/port according to `host_grant`, including
@@ -324,15 +332,18 @@ another principal with filters or a colliding visible Session name.
 
 The user policy path is `$XDG_CONFIG_HOME/shoal/leash.toml` or
 `~/.config/shoal/leash.toml`. `load_user_or_permissive` returns an all-access policy for the requested
-principal when the file is missing **or malformed**. This prevents a broken local config from
-bricking a human shell, but it is a fail-open choice.
+principal only when the convenience file is genuinely absent. A present-but-unreadable, malformed,
+oversized, or non-regular policy is authority corruption and quarantines to deny-all.
 
 Kernel startup with an explicit policy can use the fallible loader. Agent-facing hosts should not
 silently reuse the local-human convenience loader unless fail-open authority is intentional and
 observable.
 
 The built-in permissive policy grants root read/write/delete, wildcard env, session/journal/time,
-opaque allow, and in-grant auto-apply. It does not enable spawn pinning.
+opaque allow, and in-grant auto-apply to its named principal. It does not enable spawn pinning and
+does not grant unknown principals. In particular, the zero-flag durable kernel builds that entry for
+the private local-human UID, while its tokenless public connection attaches as the separate
+`agent:mcp` restricted principal.
 
 ## Lowering glob policy to OS roots
 
@@ -345,9 +356,11 @@ each filesystem grant to its longest concrete leading path:
 **/private           → no concrete root
 ```
 
-It lexically removes `.`/`..`, drops roots that do not currently exist, sorts/deduplicates, and
-returns no sandbox when all dimensions are empty. A root-wide grant in every fs dimension is also
-considered unrestricted and returns no sandbox.
+It lexically removes `.`/`..`, canonicalizes every existing concrete root, drops roots that do not
+currently exist, sorts/deduplicates, and returns no sandbox when all dimensions are empty. Semantic
+matching canonicalizes the same grant prefix and effect-path prefix, preventing the Landlock object
+grant from being broader than the policy verdict through a symlink alias. A root-wide grant in every
+fs dimension is also considered unrestricted and returns no sandbox.
 
 ```mermaid
 flowchart TD
@@ -420,8 +433,9 @@ explicitly grants networking only for `Unrestricted` and adds canonical subpath 
 - write grants allow read and write;
 - delete grants allow metadata read and unlink.
 
-Every grant must canonicalize and be UTF-8 encodable without control characters. Backslashes and
-quotes are escaped. These restrictions can reject policy paths that semantic glob matching accepted.
+Every lowered grant is already canonical and must be UTF-8 encodable without control characters.
+Backslashes and quotes are escaped. These encoding restrictions can still reject a path accepted by
+semantic glob matching.
 
 Seatbelt is reported as tier C filesystem enforcement and reports coarse network denial when that
 deny-by-default profile was requested.

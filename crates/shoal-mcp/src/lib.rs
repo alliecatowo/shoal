@@ -12,11 +12,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod client;
+mod launch_gate;
 mod resources;
 mod subscriptions;
 mod tools;
 
-pub use client::{BridgeError, Config, KernelClient, LocalAuthMode, discover_socket};
+pub use client::{BridgeError, Config, KernelClient, discover_socket};
 pub use tools::tools;
 
 /// All facade subscriptions share one kernel connection and forwarding thread.
@@ -73,6 +74,12 @@ impl Facade {
             _autostart: autostart,
         })
     }
+
+    /// Security metadata returned by the kernel for this MCP attachment.
+    pub fn attachment(&self) -> &Value {
+        &self.kernel.attach
+    }
+
     pub fn handle(&mut self, request: &Value) -> Option<Value> {
         let id = request.get("id").cloned();
         let method = request.get("method").and_then(Value::as_str);
@@ -170,6 +177,14 @@ impl KernelAutostart {
         self.child.take()
     }
 
+    /// PID of the exact process this guard owns, if this call spawned one.
+    ///
+    /// A supervisor uses this to distinguish its daemon from a concurrent
+    /// socket winner before transferring ownership or retaining credentials.
+    pub fn owned_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     fn terminate(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
@@ -199,7 +214,7 @@ impl KernelAutostart {
 
     #[cfg(test)]
     fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
+        self.owned_pid()
     }
 }
 
@@ -255,6 +270,55 @@ pub fn start_kernel(config: &Config) -> KernelAutostart {
     )
 }
 
+/// Start a kernel whose public listener is gated on an external lifecycle
+/// commit. The child receives an inherited parent-death pipe and cannot bind
+/// or publish its socket until `commit` durably binds authority to its exact
+/// PID. If the supervisor dies or commit fails, EOF makes the child revoke the
+/// nominated token and exit before socket publication.
+pub fn start_managed_kernel(
+    config: &Config,
+    credential_id: &str,
+    commit: impl FnOnce(u32) -> Result<(), String>,
+) -> Result<KernelAutostart, String> {
+    if UnixStream::connect(&config.socket).is_ok() {
+        return Err("a kernel is already listening before managed launch".into());
+    }
+    if !autostart_config_admitted(config) {
+        return Err("managed kernel configuration exceeds autostart bounds".into());
+    }
+    let program = kernel_program();
+    let mut command = kernel_command(config, &program);
+    let mut gate = launch_gate::LaunchGate::attach(&mut command, credential_id)
+        .map_err(|error| format!("cannot create managed kernel launch gate: {error}"))?;
+    command.process_group(0);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("cannot spawn managed kernel: {error}"))?;
+    gate.spawned();
+    let pid = child.id();
+    let mut ownership = KernelAutostart::new(child);
+    if let Err(error) = commit(pid) {
+        // Closing the unreleased gate makes the child revoke authority and
+        // exit. Group termination is a bounded fallback if it cannot do so.
+        drop(gate);
+        ownership.terminate();
+        return Err(error);
+    }
+    if let Err(error) = gate.release() {
+        ownership.terminate();
+        return Err(format!(
+            "cannot release managed kernel launch gate: {error}"
+        ));
+    }
+    wait_for_kernel(
+        config,
+        ownership,
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    )
+    .ok_or_else(|| "managed kernel exited or timed out before readiness".into())
+}
+
 fn start_kernel_command(
     config: &Config,
     command: &mut Command,
@@ -268,23 +332,33 @@ fn start_kernel_command(
         // Not on PATH / cannot exec — Facade::connect surfaces the real error.
         return KernelAutostart::empty();
     };
-    let mut ownership = KernelAutostart::new(child);
+    let ownership = KernelAutostart::new(child);
+    wait_for_kernel(config, ownership, readiness_timeout, poll_interval)
+        .unwrap_or_else(KernelAutostart::empty)
+}
+
+fn wait_for_kernel(
+    config: &Config,
+    mut ownership: KernelAutostart,
+    readiness_timeout: Duration,
+    poll_interval: Duration,
+) -> Option<KernelAutostart> {
     let start = Instant::now();
     loop {
         if UnixStream::connect(&config.socket).is_ok() {
-            return ownership;
+            return Some(ownership);
         }
         let child_state = ownership.child.as_mut().map(std::process::Child::try_wait);
         match child_state {
             Some(Ok(Some(_))) | Some(Err(_)) | None => {
                 ownership.terminate();
-                return KernelAutostart::empty();
+                return None;
             }
             Some(Ok(None)) => {}
         }
         if start.elapsed() >= readiness_timeout {
             ownership.terminate();
-            return KernelAutostart::empty();
+            return None;
         }
         std::thread::sleep(poll_interval.min(readiness_timeout.saturating_sub(start.elapsed())));
     }
@@ -312,7 +386,12 @@ fn kernel_command(config: &Config, program: &Path) -> Command {
     cmd.arg("--socket")
         .arg(&config.socket)
         .arg("--state-dir")
-        .arg(paths.state_dir());
+        .arg(paths.state_dir())
+        // The readiness line and every pre-listen failure stay visible to the
+        // supervisor. Once ready, the daemon closes the inherited descriptor
+        // so a caller capturing this short-lived supervisor does not wait for
+        // the long-lived kernel to exit.
+        .arg("--detach-stderr-after-ready");
     if let Some(session) = &config.session {
         cmd.arg("--session").arg(session);
     }
@@ -332,8 +411,10 @@ fn kernel_command(config: &Config, program: &Path) -> Command {
         // itself or an independently supervised kernel.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        // Keep stderr inherited: startup/policy failures must remain diagnosable
-        // instead of becoming a bare connection-refused five seconds later.
+        // Keep stderr inherited through the kernel's deterministic readiness
+        // announcement. `--detach-stderr-after-ready` closes it in the daemon
+        // immediately afterwards, preserving diagnostics without retaining a
+        // capturing caller's pipe for the daemon lifetime.
         .stderr(Stdio::inherit())
         .process_group(0);
     cmd
@@ -503,7 +584,6 @@ mod tests {
             socket: path,
             session: Some("s".into()),
             token: Some("tok".into()),
-            local_auth: LocalAuthMode::RestrictedAgent,
         };
         (d, c, h)
     }
@@ -612,7 +692,6 @@ mod tests {
             socket: path,
             session: None,
             token: None,
-            local_auth: LocalAuthMode::RestrictedAgent,
         };
         // Returns immediately because the connect probe succeeds; a hang or a
         // stray spawn would show up as a test timeout / leaked process.
@@ -630,7 +709,6 @@ mod tests {
             socket: dir.path().join("never-ready.sock"),
             session: None,
             token: None,
-            local_auth: LocalAuthMode::RestrictedAgent,
         };
         let script = format!("echo $$ > '{}'; sleep 30", pid_path.display());
         let mut command = Command::new("/bin/sh");
@@ -661,7 +739,6 @@ mod tests {
             socket: socket.clone(),
             session: None,
             token: None,
-            local_auth: LocalAuthMode::RestrictedAgent,
         };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let listener_thread = thread::spawn(move || {
@@ -694,6 +771,7 @@ mod tests {
         let pid = child.id();
         let guard = KernelAutostart::new(child);
 
+        assert_eq!(guard.owned_pid(), Some(pid));
         let mut child = guard.into_child().expect("spawned child transfers");
         assert!(!process_is_gone(pid));
         child.kill().unwrap();
@@ -767,7 +845,6 @@ mod tests {
             socket: dir.path().join("kernel.sock"),
             session: Some("test".into()),
             token: Some("must-not-reach-kernel".into()),
-            local_auth: LocalAuthMode::RestrictedAgent,
         };
         let command = kernel_command(&config, &sibling);
         assert_eq!(command.get_program(), sibling.as_os_str());
@@ -777,6 +854,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--session", "test"]));
         assert!(args.iter().any(|arg| arg == "--state-dir"));
+        assert!(args.iter().any(|arg| arg == "--detach-stderr-after-ready"));
         assert!(
             command.get_envs().any(|(key, value)| {
                 key == std::ffi::OsStr::new("SHOAL_TOKEN") && value.is_none()
@@ -816,7 +894,6 @@ mod tests {
             socket: PathBuf::from("/tmp/kernel.sock"),
             session: Some("s".repeat(MAX_AUTOSTART_SESSION_BYTES + 1)),
             token: None,
-            local_auth: LocalAuthMode::RestrictedAgent,
         };
         assert!(!autostart_config_admitted(&config));
     }

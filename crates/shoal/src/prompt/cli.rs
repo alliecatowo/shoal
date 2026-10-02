@@ -19,14 +19,24 @@ pub fn parse_action(mut args: impl Iterator<Item = String>) -> Result<PromptActi
     let sub = args.next().unwrap_or_else(|| "explain".into());
     let mut side = Side::Left;
     let mut n = 10_000usize;
+    let mut saw_side = false;
+    let mut saw_n = false;
     let mut rest = args.peekable();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--side" => {
+                if saw_side {
+                    return Err("--side may be specified only once".into());
+                }
+                saw_side = true;
                 let v = rest.next().ok_or("--side requires a value")?;
                 side = parse_side(&v)?;
             }
             "--n" => {
+                if saw_n {
+                    return Err("--n may be specified only once".into());
+                }
+                saw_n = true;
                 let v = rest.next().ok_or("--n requires a value")?;
                 n = v.parse().map_err(|_| "--n expects a number".to_string())?;
             }
@@ -34,8 +44,10 @@ pub fn parse_action(mut args: impl Iterator<Item = String>) -> Result<PromptActi
         }
     }
     match sub.as_str() {
+        "explain" if saw_n => Err("--n applies only to `prompt bench`".into()),
         "explain" => Ok(PromptAction::Explain { side }),
         "bench" => Ok(PromptAction::Bench { n, side }),
+        "print" if saw_n => Err("--n applies only to `prompt bench`".into()),
         "print" => Ok(PromptAction::Print { side }),
         other => Err(format!(
             "unknown prompt subcommand `{other}`; expected explain, bench, or print"
@@ -201,4 +213,30 @@ fn bench_fixture(facts: &StaticFacts) -> PromptContext {
         degraded: false,
     });
     ctx
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn words<'a>(values: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
+        values.iter().map(|value| (*value).to_string())
+    }
+
+    #[test]
+    fn action_specific_options_are_not_silently_ignored() {
+        assert!(parse_action(words(&["bench", "--n", "5", "--side", "right"])).is_ok());
+        assert_eq!(
+            parse_action(words(&["print", "--n", "5"])).unwrap_err(),
+            "--n applies only to `prompt bench`"
+        );
+        assert_eq!(
+            parse_action(words(&["explain", "--side", "left", "--side", "right"])).unwrap_err(),
+            "--side may be specified only once"
+        );
+        assert_eq!(
+            parse_action(words(&["bench", "--n", "5", "--n", "6"])).unwrap_err(),
+            "--n may be specified only once"
+        );
+    }
 }

@@ -1,0 +1,170 @@
+#!/usr/bin/env shoal
+# Reconcile tests, benchmarks, artifacts, and required checks into one CI decision.
+
+assert(args.len() == 7, "usage: ci-evidence-auditor.shl TESTS BASELINE CURRENT BEFORE_INVENTORY AFTER_INVENTORY CHECKS OUTPUT")
+let tests_file = path(args[0].str()).abs()
+let baseline_file = path(args[1].str()).abs()
+let current_file = path(args[2].str()).abs()
+let before_file = path(args[3].str()).abs()
+let after_file = path(args[4].str()).abs()
+let checks_file = path(args[5].str()).abs()
+let output = path(args[6].str()).abs()
+
+for input in [tests_file, baseline_file, current_file, before_file, after_file, checks_file] {
+  assert(input.is_file, "CI evidence input is missing: {input}")
+}
+assert(!output.exists, "CI evidence output already exists: {output}")
+
+let tests = json.parse(tests_file.read)
+let baseline = json.parse(baseline_file.read)
+let current = json.parse(current_file.read)
+let before = json.parse(before_file.read)
+let after = json.parse(after_file.read)
+let checks = json.parse(checks_file.read)
+
+let invalid_tests = tests.where(row => row.name == null || row.owner == null || !(row.status in ["passed", "failed", "skipped"]) || row.duration_ms == null || row.duration_ms < 0)
+assert(invalid_tests.is_empty(), "test evidence contains malformed rows: {invalid_tests}")
+let duplicate_tests = tests.group_by(.name).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_tests.is_empty(), "test evidence contains duplicate names: {duplicate_tests}")
+let failed_tests = tests.where(.status == "failed")
+let skipped_tests = tests.where(.status == "skipped")
+let passed_tests = tests.where(.status == "passed")
+let test_duration_ms = tests.map(.duration_ms).sum()
+let failure_groups = failed_tests.group_by(row => "{row.owner}:{row.signature}").map(group => ({
+  key: group.key,
+  owner: group.values.first().owner,
+  signature: group.values.first().signature,
+  count: group.values.len(),
+  tests: group.values.map(.name).sort(),
+  duration_ms: group.values.map(.duration_ms).sum(),
+})).sort_by(row => -row.count)
+let owner_outcomes = tests.group_by(.owner).map(group => ({
+  owner: group.key,
+  total: group.values.len(),
+  passed: group.values.where(.status == "passed").len(),
+  failed: group.values.where(.status == "failed").len(),
+  skipped: group.values.where(.status == "skipped").len(),
+  duration_ms: group.values.map(.duration_ms).sum(),
+})).sort_by(.owner)
+let slowest_tests = tests.sort_by(row => -row.duration_ms).take(10).map(row => ({name: row.name, owner: row.owner, duration_ms: row.duration_ms}))
+
+let invalid_baseline = baseline.where(row => row.name == null || row.median_ms == null || row.median_ms <= 0)
+let invalid_current = current.where(row => row.name == null || row.median_ms == null || row.median_ms <= 0)
+assert(invalid_baseline.is_empty(), "benchmark baseline contains invalid rows: {invalid_baseline}")
+assert(invalid_current.is_empty(), "current benchmarks contain invalid rows: {invalid_current}")
+let duplicate_baseline = baseline.group_by(.name).where(group => group.values.len() > 1).map(.key)
+let duplicate_current = current.group_by(.name).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_baseline.is_empty(), "benchmark baseline contains duplicate names: {duplicate_baseline}")
+assert(duplicate_current.is_empty(), "current benchmark evidence contains duplicate names: {duplicate_current}")
+let omitted_benchmarks = baseline.where(old => current.find(now => now.name == old.name) == null).map(.name).sort()
+assert(omitted_benchmarks.is_empty(), "current benchmark evidence omitted baseline cases: {omitted_benchmarks}")
+let new_benchmarks = current.where(now => baseline.find(old => old.name == now.name) == null).map(.name).sort()
+let benchmark_rows = current.where(now => baseline.find(old => old.name == now.name) != null).map(now => {
+  let old = baseline.find(candidate => candidate.name == now.name)
+  let change_percent = ((now.median_ms - old.median_ms) / old.median_ms) * 100.0
+  {
+    name: now.name,
+    baseline_ms: old.median_ms,
+    current_ms: now.median_ms,
+    change_percent: change_percent,
+    regression: change_percent > 10.0,
+    improvement: change_percent < -10.0,
+  }
+}).sort_by(row => -row.change_percent)
+let benchmark_regressions = benchmark_rows.where(.regression)
+let benchmark_improvements = benchmark_rows.where(.improvement)
+
+assert(before.schema == 1 && after.schema == 1, "artifact inventories use an unsupported schema")
+let invalid_before = before.files.where(row => row.path == null || row.bytes == null || row.sha256 == null)
+let invalid_after = after.files.where(row => row.path == null || row.bytes == null || row.sha256 == null)
+assert(invalid_before.is_empty(), "before inventory contains invalid artifacts: {invalid_before}")
+assert(invalid_after.is_empty(), "after inventory contains invalid artifacts: {invalid_after}")
+let duplicate_before = before.files.group_by(.path).where(group => group.values.len() > 1).map(.key)
+let duplicate_after = after.files.group_by(.path).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_before.is_empty(), "before inventory contains duplicate artifact paths: {duplicate_before}")
+assert(duplicate_after.is_empty(), "after inventory contains duplicate artifact paths: {duplicate_after}")
+let added_artifacts = after.files.where(row => before.files.find(old => old.path == row.path) == null).map(row => ({path: row.path, bytes: row.bytes, sha256: row.sha256})).sort_by(.path)
+let removed_artifacts = before.files.where(row => after.files.find(now => now.path == row.path) == null).map(row => ({path: row.path, bytes: row.bytes, sha256: row.sha256})).sort_by(.path)
+let changed_artifacts = after.files.map(now => {
+  let old = before.files.find(candidate => candidate.path == now.path)
+  if (old != null && (old.bytes != now.bytes || old.sha256 != now.sha256)) {
+    {path: now.path, before_bytes: old.bytes, after_bytes: now.bytes, before_sha256: old.sha256, after_sha256: now.sha256}
+  } else {
+    null
+  }
+}).where(row => row != null).sort_by(.path)
+let unchanged_artifacts = after.files.where(now => {
+  let old = before.files.find(candidate => candidate.path == now.path)
+  old != null && old.bytes == now.bytes && old.sha256 == now.sha256
+}).map(.path).sort()
+let artifact_delta_bytes = after.total_bytes - before.total_bytes
+
+let invalid_checks = checks.where(row => row.name == null || row.required == null || !(row.status in ["pass", "fail", "waived", "pending"]))
+assert(invalid_checks.is_empty(), "check evidence contains malformed rows: {invalid_checks}")
+let duplicate_checks = checks.group_by(.name).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_checks.is_empty(), "check evidence contains duplicate names: {duplicate_checks}")
+let failed_required_checks = checks.where(row => row.required && row.status == "fail")
+let pending_required_checks = checks.where(row => row.required && row.status == "pending")
+let waived_required_checks = checks.where(row => row.required && row.status == "waived")
+let passing_required_checks = checks.where(row => row.required && row.status == "pass")
+let optional_failures = checks.where(row => !row.required && row.status == "fail")
+
+var blockers = []
+if (!failed_tests.is_empty()) { blockers = blockers + ["test-failures"] }
+if (!benchmark_regressions.is_empty()) { blockers = blockers + ["benchmark-regressions"] }
+if (!failed_required_checks.is_empty()) { blockers = blockers + ["required-check-failures"] }
+if (!pending_required_checks.is_empty()) { blockers = blockers + ["required-checks-pending"] }
+if (!removed_artifacts.is_empty()) { blockers = blockers + ["artifacts-removed"] }
+var warnings = []
+if (!skipped_tests.is_empty()) { warnings = warnings + ["tests-skipped"] }
+if (!waived_required_checks.is_empty()) { warnings = warnings + ["required-checks-waived"] }
+if (!optional_failures.is_empty()) { warnings = warnings + ["optional-check-failures"] }
+if (!changed_artifacts.is_empty()) { warnings = warnings + ["artifacts-changed"] }
+let ready = blockers.is_empty()
+
+let report = {
+  schema: 1,
+  operation: "ci-evidence-audit",
+  ready: ready,
+  blockers: blockers,
+  warnings: warnings,
+  tests: {
+    total: tests.len(),
+    passed: passed_tests.len(),
+    failed: failed_tests.len(),
+    skipped: skipped_tests.len(),
+    duration_ms: test_duration_ms,
+    failure_groups: failure_groups,
+    owners: owner_outcomes,
+    slowest: slowest_tests,
+  },
+  benchmarks: {
+    compared: benchmark_rows.len(),
+    regressions: benchmark_regressions,
+    improvements: benchmark_improvements,
+    new_cases: new_benchmarks,
+    omitted_cases: omitted_benchmarks,
+  },
+  artifacts: {
+    before_files: before.files.len(),
+    after_files: after.files.len(),
+    delta_bytes: artifact_delta_bytes,
+    added: added_artifacts,
+    removed: removed_artifacts,
+    changed: changed_artifacts,
+    unchanged: unchanged_artifacts,
+  },
+  checks: {
+    total: checks.len(),
+    required_passed: passing_required_checks.map(.name).sort(),
+    required_failed: failed_required_checks.map(.name).sort(),
+    required_pending: pending_required_checks.map(.name).sort(),
+    required_waived: waived_required_checks.map(.name).sort(),
+    optional_failed: optional_failures.map(.name).sort(),
+  },
+}
+json.stringify(report, pretty: true).save(output)
+assert(output.is_file, "CI evidence report was not persisted")
+let persisted = json.parse(output.read)
+assert(persisted.ready == ready, "persisted CI decision disagrees with the computed decision")
+echo "CI evidence: {if (ready) { "ready" } else { "blocked" }}; {tests.len()} tests, {benchmark_rows.len()} benchmarks, {after.files.len()} artifacts, {checks.len()} checks"

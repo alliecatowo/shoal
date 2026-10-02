@@ -1,0 +1,28 @@
+#!/usr/bin/env shoal
+# Finalize the checksum set after CI has generated the per-archive SPDX SBOM.
+
+assert(args.is_empty() || args.len() == 2, "usage: release-manifest.shl [TAG TARGET]")
+let tag = (env SHOAL_RELEASE_TAG).out ?? (if (args.len() == 2) { args[0].str() } else { "" })
+let target = (env SHOAL_RELEASE_TARGET).out ?? (if (args.len() == 2) { args[1].str() } else { "" })
+assert(!tag.is_empty() && !target.is_empty(), "release tag and target are required")
+let archive = path("shoal-{tag}-{target}.tar.gz")
+let checksum = path("{archive}.sha256")
+let sbom = path("{archive}.spdx.json")
+assert(archive.is_file, "missing release archive: {archive}")
+assert(sbom.is_file, "missing release SBOM: {sbom}")
+
+fn sha256(file: path) {
+  let result = if ((which sha256sum).out != null) {
+    run("sha256sum", file)
+  } else {
+    run("shasum", "-a", "256", file)
+  }
+  let fields = result.out.trim().split(" ").where(field => !field.is_empty())
+  assert(!fields.is_empty(), "checksum tool returned no digest for {file}")
+  fields.first()
+}
+
+let manifest = "{sha256(archive)}  {archive.name}\n{sha256(sbom)}  {sbom.name}\n"
+manifest.save(checksum)
+run("target/debug/shoal", "scripts/verify-release.shl", "--local", archive)
+echo "release manifest: {checksum} covers archive + SBOM"

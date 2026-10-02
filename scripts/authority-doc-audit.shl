@@ -1,0 +1,53 @@
+#!/usr/bin/env shoal
+# Keep the kernel's constructed policy distinct from effective connection authority.
+
+let kernel_sources = glob("crates/shoal-kernel/src/**/*.rs").expand().map(.read).join("\n")
+assert(kernel_sources.contains('Policy::permissive(&principal())'), "kernel default-policy source changed; review the authority matrix")
+assert(kernel_sources.contains('"agent:mcp".into()'), "public fallback principal changed; review the authority matrix")
+assert(kernel_sources.contains('"restricted-agent".into()'), "public fallback profile changed; review the authority matrix")
+
+let mcp_client = path("crates/shoal-mcp/src/client.rs").read
+let mcp_cli = path("crates/shoal-mcp/src/main.rs").read
+assert(!mcp_client.contains("pub local_auth:"), "public MCP Config regained a caller-selected authority mode")
+assert(mcp_client.contains("LocalAuthMode::RestrictedAgent"), "public MCP attach no longer declares its restricted identity")
+assert(mcp_client.contains("from_embedded_human_stream"), "private-human transport must remain explicit and separate")
+assert(mcp_cli.contains("--local-human was removed"), "retired MCP authority flag lost its migration error")
+assert(!mcp_cli.contains("Request explicit unrestricted local-human authentication"), "MCP help advertises an impossible public authority upgrade")
+
+let canonical_docs = [
+  path("site/content/docs/agents-kernel-mcp.md"),
+  path("site/content/docs/security.md"),
+  path("site/content/docs/companion-cli-reference.md"),
+  path("site/content/internals/agent-mcp.md"),
+]
+for document in canonical_docs {
+  let prose = document.read
+  assert(prose.contains("agent:mcp"), "{document} omits the public fallback principal")
+  assert(prose.contains("restricted-agent"), "{document} omits the public fallback profile")
+  assert(prose.contains("local-human"), "{document} omits the separate private-human authority")
+  assert(prose.contains("permissive"), "{document} omits the constructed-policy distinction")
+}
+
+let live_internals = [
+  path("site/content/internals/security-threat-model.md"),
+  path("site/content/internals/effects-plans-security.md"),
+].map(.read).join("\n")
+assert(!live_internals.contains("missing **or malformed**"), "live policy docs still claim malformed authority fails open")
+
+let public_mcp_docs = [
+  path("site/content/docs/agents-kernel-mcp.md"),
+  path("site/content/docs/companion-cli-reference.md"),
+  path("site/content/docs/troubleshooting.md"),
+  path("site/content/internals/agent-mcp.md"),
+]
+for document in public_mcp_docs {
+  let prose = document.read
+  assert(prose.contains("--local-human"), "{document} omits the retired public authority flag")
+  assert(prose.contains("retired"), "{document} does not say the public authority flag is retired")
+}
+let mcp_man = path("man/shoal-mcp.1").read
+assert(mcp_man.contains("local-human"), "shoal-mcp(1) omits the retired public authority flag")
+assert(mcp_man.contains("retired"), "shoal-mcp(1) does not say the public authority flag is retired")
+assert(!mcp_man.contains("Request explicit unrestricted"), "shoal-mcp(1) advertises an impossible public authority upgrade")
+
+echo "authority doc audit: source defaults, MCP config, and public authority docs agree"

@@ -1,0 +1,24 @@
+#!/usr/bin/env shoal
+# Export an inclusive journal sequence window into a portable JSON document.
+
+assert(args.len() == 4, "usage: journal-export.shl INPUT FROM_SEQ TO_SEQ OUTPUT")
+let input = path(args[0].str())
+let from_seq = args[1].str().parse_int()
+let to_seq = args[2].str().parse_int()
+let output = path(args[3].str())
+assert(input.is_file, "journal input is missing: {input}")
+assert(from_seq >= 0 && to_seq >= from_seq, "invalid journal sequence window")
+let rows = json.parse(input.read)
+assert(rows.len() >= 0, "journal input must be a JSON sequence")
+let selected = rows.where(row => row.seq >= from_seq && row.seq <= to_seq).sort_by(.seq)
+let duplicate_sequences = selected.group_by(.seq).where(group => group.values.len() > 1).map(.key)
+assert(duplicate_sequences.is_empty(), "duplicate journal sequences: {duplicate_sequences}")
+let export = {
+  schema: 1,
+  from_seq: from_seq,
+  to_seq: to_seq,
+  records: selected,
+  count: selected.len(),
+}
+json.stringify(export, pretty: true).save(output)
+echo "exported {selected.len()} journal records"

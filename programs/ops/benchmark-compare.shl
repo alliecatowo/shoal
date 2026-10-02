@@ -1,0 +1,23 @@
+#!/usr/bin/env shoal
+# Compare benchmark medians against a baseline and enforce a regression budget.
+
+assert(args.len() == 4, "usage: benchmark-compare.shl BASELINE CURRENT MAX_REGRESSION_PERCENT OUTPUT")
+let baseline_file = path(args[0].str())
+let current_file = path(args[1].str())
+let budget = args[2].str().parse_float()
+let output = path(args[3].str())
+assert(baseline_file.is_file && current_file.is_file, "benchmark input is missing")
+assert(budget >= 0.0, "regression budget must be non-negative")
+let baseline = json.parse(baseline_file.read)
+let current = json.parse(current_file.read)
+let rows = current.map(now => {
+  let old = baseline.find(candidate => candidate.name == now.name)
+  assert(old != null && old.median_ms > 0, "benchmark has no valid baseline: {now.name}")
+  let percent = ((now.median_ms - old.median_ms) / old.median_ms) * 100.0
+  {name: now.name, baseline_ms: old.median_ms, current_ms: now.median_ms, change_percent: percent, regression: percent > budget}
+}).sort_by(row => -row.change_percent)
+let missing = baseline.where(old => current.find(now => now.name == old.name) == null).map(.name)
+assert(missing.is_empty(), "current benchmark run omitted cases: {missing}")
+let report = {budget_percent: budget, benchmarks: rows, regressions: rows.where(.regression)}
+json.stringify(report, pretty: true).save(output)
+echo "compared {rows.len()} benchmarks; {report.regressions.len()} exceed budget"

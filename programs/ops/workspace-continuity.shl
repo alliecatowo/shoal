@@ -1,0 +1,171 @@
+#!/usr/bin/env shoal
+# Run a complete, checksum-verified workspace backup and recovery exercise.
+
+assert(args.len() == 5, "usage: workspace-continuity.shl SHOAL PROGRAM_DIRECTORY SOURCE WORKSPACE REPORT")
+let shoal = path(args[0].str()).abs()
+let programs = path(args[1].str()).abs()
+let source = path(args[2].str()).abs()
+let workspace = path(args[3].str()).abs()
+let report_file = path(args[4].str()).abs()
+
+assert(shoal.is_file, "Shoal executable is missing: {shoal}")
+assert(programs.is_dir, "operations program directory is missing: {programs}")
+assert(source.is_dir, "continuity source is not a directory: {source}")
+assert(!workspace.exists, "continuity workspace already exists: {workspace}")
+assert(!report_file.exists, "continuity report already exists: {report_file}")
+assert(!workspace.display().starts_with("{source.display()}/"), "workspace must not be nested below its source")
+assert(!source.display().starts_with("{workspace.display()}/"), "source must not be nested below its workspace")
+
+let required_programs = [
+  "artifact-inventory.shl",
+  "artifact-diff.shl",
+  "backup-create.shl",
+  "backup-verify.shl",
+  "backup-restore.shl",
+  "backup-catalog.shl",
+]
+for name in required_programs {
+  assert(programs.join(name).is_file, "continuity dependency is missing: {name}")
+}
+
+fn invoke1(name, first) {
+  let result = run(shoal, "--standalone", programs.join(name), first)
+  assert(result.ok, "{name} failed: {result.err}")
+  {program: name, ok: result.ok, output: result.out.str().trim()}
+}
+
+fn invoke2(name, first, second) {
+  let result = run(shoal, "--standalone", programs.join(name), first, second)
+  assert(result.ok, "{name} failed: {result.err}")
+  {program: name, ok: result.ok, output: result.out.str().trim()}
+}
+
+let workspace_created = (mkdir (workspace))
+let evidence = workspace.join("evidence")
+let evidence_created = (mkdir (evidence))
+let backup = workspace.join("snapshot")
+let restored = workspace.join("restored")
+let source_inventory_file = evidence.join("source-inventory.json")
+let backup_inventory_file = evidence.join("backup-inventory.json")
+let restored_inventory_file = evidence.join("restored-inventory.json")
+let round_trip_diff_file = evidence.join("round-trip-diff.json")
+let catalog_file = evidence.join("backup-catalog.json")
+
+var phases = []
+phases = phases + [invoke2("artifact-inventory.shl", source, source_inventory_file)]
+let source_inventory = json.parse(source_inventory_file.read)
+assert(source_inventory.schema == 1, "source inventory has an unsupported schema")
+assert(source_inventory.files.len() > 0, "refusing to certify an empty workspace")
+assert(source_inventory.total_bytes > 0, "refusing to certify a zero-byte workspace")
+let source_duplicate_paths = source_inventory.files.group_by(.path)
+  .where(group => group.values.len() > 1)
+  .map(.key)
+assert(source_duplicate_paths.is_empty(), "source inventory contains duplicate paths: {source_duplicate_paths}")
+let source_invalid_paths = source_inventory.files
+  .where(row => row.path.starts_with("/") || row.path.split("/").where(segment => segment in ["", ".", ".."]).len() > 0)
+assert(source_invalid_paths.is_empty(), "source inventory contains unsafe relative paths: {source_invalid_paths}")
+
+phases = phases + [invoke2("backup-create.shl", source, backup)]
+assert(backup.join("manifest.json").is_file, "backup creation omitted its manifest")
+assert(backup.join("data").is_dir, "backup creation omitted its data tree")
+let manifest = json.parse(backup.join("manifest.json").read)
+assert(manifest.schema == 1, "backup has an unsupported manifest schema")
+assert(manifest.files == source_inventory.files, "backup manifest disagrees with the pre-copy source inventory")
+assert(manifest.total_bytes == source_inventory.total_bytes, "backup manifest byte count disagrees with its source")
+
+phases = phases + [invoke1("backup-verify.shl", backup)]
+phases = phases + [invoke2("artifact-inventory.shl", backup.join("data"), backup_inventory_file)]
+let backup_inventory = json.parse(backup_inventory_file.read)
+assert(backup_inventory.files == manifest.files, "verified backup inventory disagrees with its manifest")
+assert(backup_inventory.total_bytes == manifest.total_bytes, "verified backup byte count disagrees with its manifest")
+
+phases = phases + [invoke2("backup-restore.shl", backup, restored)]
+assert(restored.is_dir, "restore program did not publish a restored tree")
+phases = phases + [invoke2("artifact-inventory.shl", restored, restored_inventory_file)]
+let restored_inventory = json.parse(restored_inventory_file.read)
+assert(restored_inventory.files == source_inventory.files, "round-trip restore changed workspace content")
+assert(restored_inventory.total_bytes == source_inventory.total_bytes, "round-trip restore changed workspace byte totals")
+
+let diff_result = run(
+  shoal,
+  "--standalone",
+  programs.join("artifact-diff.shl"),
+  source_inventory_file,
+  restored_inventory_file,
+  round_trip_diff_file,
+)
+assert(diff_result.ok, "artifact-diff.shl failed: {diff_result.err}")
+phases = phases + [{program: "artifact-diff.shl", ok: true, output: diff_result.out.str().trim()}]
+let round_trip_diff = json.parse(round_trip_diff_file.read)
+assert(round_trip_diff.added.is_empty(), "restored workspace has unexpected files: {round_trip_diff.added}")
+assert(round_trip_diff.removed.is_empty(), "restored workspace omitted files: {round_trip_diff.removed}")
+assert(round_trip_diff.changed.is_empty(), "restored workspace changed files: {round_trip_diff.changed}")
+
+phases = phases + [invoke2("backup-catalog.shl", workspace, catalog_file)]
+let catalog = json.parse(catalog_file.read)
+assert(catalog.count == 1, "continuity workspace should contain exactly one backup")
+let catalog_entry = catalog.backups.first()
+assert(catalog_entry.files == source_inventory.files.len(), "backup catalog file count disagrees with the manifest")
+assert(catalog_entry.bytes == source_inventory.total_bytes, "backup catalog byte count disagrees with the manifest")
+
+let extensions = source_inventory.files.map(row => {
+  let pieces = row.path.split(".")
+  if (pieces.len() <= 1) { "<none>" } else { pieces.last() }
+}).group_by(value => value).map(group => ({extension: group.key, files: group.values.len()})).sort_by(.extension)
+let largest_files = source_inventory.files.sort_by(row => -row.bytes).take(5)
+let empty_files = source_inventory.files.where(.bytes == 0).map(.path).sort()
+let duplicate_content = source_inventory.files.group_by(.sha256)
+  .where(group => group.values.len() > 1)
+  .map(group => ({
+    sha256: group.key,
+    files: group.values.map(.path).sort(),
+    bytes_each: group.values.first().bytes,
+    duplicate_bytes: group.values.first().bytes * (group.values.len() - 1),
+  }))
+  .sort_by(row => -row.duplicate_bytes)
+let duplicate_bytes = duplicate_content.map(.duplicate_bytes).sum()
+let directories = source_inventory.files.map(row => {
+  let segments = row.path.split("/")
+  if (segments.len() <= 1) { "." } else { segments.take(segments.len() - 1).join("/") }
+}).uniq().sort()
+let completed = phases.where(.ok).len()
+assert(completed == phases.len(), "continuity exercise retained an incomplete phase")
+
+let report = {
+  schema: 1,
+  operation: "workspace-continuity-exercise",
+  source: source.display(),
+  workspace: workspace.display(),
+  backup: backup.display(),
+  restored: restored.display(),
+  files: source_inventory.files.len(),
+  bytes: source_inventory.total_bytes,
+  directories: directories,
+  extension_inventory: extensions,
+  largest_files: largest_files,
+  empty_files: empty_files,
+  duplicate_content: duplicate_content,
+  duplicate_bytes: duplicate_bytes,
+  phases: phases,
+  phase_count: phases.len(),
+  source_manifest: source_inventory_file.display(),
+  backup_manifest: backup.join("manifest.json").display(),
+  restored_manifest: restored_inventory_file.display(),
+  diff_evidence: round_trip_diff_file.display(),
+  catalog_evidence: catalog_file.display(),
+  integrity: {
+    source_equals_backup: source_inventory.files == backup_inventory.files,
+    backup_equals_restore: backup_inventory.files == restored_inventory.files,
+    no_added_files: round_trip_diff.added.is_empty(),
+    no_removed_files: round_trip_diff.removed.is_empty(),
+    no_changed_files: round_trip_diff.changed.is_empty(),
+  },
+  recoverable: true,
+}
+json.stringify(report, pretty: true).save(report_file)
+assert(report_file.is_file, "continuity report was not written")
+let persisted = json.parse(report_file.read)
+assert(persisted.recoverable, "persisted continuity decision is not recoverable")
+assert(persisted.integrity.source_equals_backup, "persisted source-to-backup integrity check failed")
+assert(persisted.integrity.backup_equals_restore, "persisted backup-to-restore integrity check failed")
+echo "certified {persisted.files} files and {persisted.bytes} bytes through {persisted.phase_count} continuity phases"

@@ -1,0 +1,65 @@
+#!/usr/bin/env shoal
+# Exercise restricted public status/MCP access plus credentialed managed stop.
+
+assert(args.len() == 4, "usage: kernel-mcp-lifecycle.shl SHOAL MCP ROOT OUTPUT")
+let shoal = path(args[0].str()).abs()
+let mcp = path(args[1].str()).abs()
+let root = path(args[2].str()).abs()
+let output = path(args[3].str())
+for executable in [shoal, mcp] {
+  assert(executable.is_file, "lifecycle executable is missing: {executable}")
+}
+assert(!root.exists, "kernel lifecycle root already exists: {root}")
+let directories = [root, root.join("run"), root.join("home")]
+for directory in directories {
+  let created = run("install", "-d", "-m", "0700", directory)
+  assert(created.ok, "could not create isolated lifecycle directory: {created.err}")
+}
+
+env.HOME = root.join("home").display()
+env.XDG_RUNTIME_DIR = root.join("run").display()
+env.XDG_STATE_HOME = root.join("state").display()
+env.XDG_DATA_HOME = root.join("data").display()
+env.XDG_CONFIG_HOME = root.join("config").display()
+env.SHOAL_SECRET_DIR = root.join("data/secrets").display()
+
+let socket = root.join("run/shoal/default.sock")
+let started = run(shoal, "kernel", "start", "--json")
+assert(started.ok, "captured managed kernel start failed: {started.err}")
+assert(started.out.pid > 0 && started.out.shutdown_requested == false, "managed start response is malformed")
+assert(run("test", "-S", socket).ok, "kernel socket was not created: {socket}")
+
+let request = json.stringify({jsonrpc: "2.0", id: 1, method: "initialize", params: {}}) + "\n"
+let mcp_result = request.feed(^env (mcp) --socket (socket))
+assert(mcp_result.ok, "MCP initialization failed: {mcp_result.err}")
+let response = mcp_result.out
+assert(response.id == 1 && response.result.serverInfo.name == "shoal-mcp", "MCP initialize response is malformed")
+
+let status_result = run(shoal, "kernel", "status", "--json")
+assert(status_result.ok, "restricted tokenless kernel status failed: {status_result.err}")
+let status = status_result.out
+assert(status.pid > 0 && status.shutdown_requested == false, "kernel status is malformed")
+assert(status.principal == "agent:mcp", "tokenless public status did not use the restricted agent principal")
+assert(status.security.connection_trust == "public", "tokenless status did not traverse the public attachment path")
+let stopped = run(shoal, "kernel", "stop", "--json")
+assert(stopped.ok && stopped.out.stopping, "managed kernel shutdown failed: {stopped.err}")
+var socket_removed = false
+for attempt in 0..100 {
+  if (!run("test", "-S", socket).ok) {
+    socket_removed = true
+    break
+  }
+  let pause = run("sleep", "0.01")
+}
+assert(socket_removed, "kernel socket remained after managed shutdown")
+
+let report = {
+  kernel_pid: status.pid,
+  kernel_principal: status.principal,
+  status_authority: "restricted-agent",
+  mcp_server: response.result.serverInfo.name,
+  mcp_protocol: response.result.protocolVersion,
+  managed_shutdown: socket_removed,
+}
+json.stringify(report, pretty: true).save(output)
+echo "verified restricted status/MCP and credentialed managed stop for pid {status.pid}"

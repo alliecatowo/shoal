@@ -68,7 +68,8 @@ impl Evaluator {
         r
     }
 
-    /// `open <path>` — detached `xdg-open` (site/content/internals/language-conformance-contract.md).
+    /// `open <path>` — detached platform desktop opener
+    /// (site/content/internals/language-conformance-contract.md).
     pub(crate) fn builtin_open(&mut self, pos: Vec<Value>) -> VResult<Value> {
         if pos.len() != 1 {
             return Err(ErrorVal::arg_error("open expects exactly one path"));
@@ -88,10 +89,14 @@ impl Evaluator {
         } else {
             self.exec.shell.cwd.join(p)
         };
-        self.host
-            .opener
-            .open(&p)
-            .map_err(|e| ErrorVal::new("custom", e))?;
+        self.host.opener.open(&p).map_err(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::Unsupported => "unsupported",
+                std::io::ErrorKind::WouldBlock => "resource_busy",
+                _ => "custom",
+            };
+            ErrorVal::new(code, error.to_string())
+        })?;
         Ok(Value::Null)
     }
 

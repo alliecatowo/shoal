@@ -23,7 +23,7 @@ impl Evaluator {
             plan_background_registration(call, out);
             self.plan_command_inputs(call, functions, aliases, out, depth)?;
             self.plan_redirects(call, out);
-            return self.plan_call(target, functions, aliases, out, depth + 1);
+            return self.plan_call(&merged(target, call), functions, aliases, out, depth + 1);
         }
         if let Some(body) = functions.get(&call.head) {
             plan_background_registration(call, out);

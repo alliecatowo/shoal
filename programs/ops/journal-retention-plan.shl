@@ -1,0 +1,24 @@
+#!/usr/bin/env shoal
+# Produce an auditable journal-retention plan without deleting data.
+
+assert(args.len() == 3, "usage: journal-retention-plan.shl INPUT KEEP_FROM_SEQ OUTPUT")
+let input = path(args[0].str())
+let keep_from = args[1].str().parse_int()
+let output = path(args[2].str())
+assert(input.is_file, "journal input is missing: {input}")
+assert(keep_from >= 0, "KEEP_FROM_SEQ must be non-negative")
+let rows = json.parse(input.read).sort_by(.seq)
+let remove = rows.where(.seq < keep_from)
+let keep = rows.where(.seq >= keep_from)
+let plan = {
+  schema: 1,
+  keep_from_seq: keep_from,
+  input_records: rows.len(),
+  remove_sequences: remove.map(.seq),
+  keep_sequences: keep.map(.seq),
+  remove_count: remove.len(),
+  keep_count: keep.len(),
+}
+assert(plan.remove_count + plan.keep_count == plan.input_records, "retention plan lost records")
+json.stringify(plan, pretty: true).save(output)
+echo "planned retention: keep {keep.len()}, remove {remove.len()}"

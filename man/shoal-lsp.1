@@ -4,13 +4,27 @@ shoal-lsp \- provide language-server features for Shoal source
 .SH SYNOPSIS
 .B shoal-lsp
 .SH DESCRIPTION
-Runs the Language Server Protocol over standard input and output for editor integrations.
+Runs the Language Server Protocol over standard input and standard output for editor integrations.
+The transport admits bounded framed input and supports diagnostics, completion, hover,
+navigation, symbols, and safe formatting responses.
 .SH OPTIONS
 .TP
 .BR \-h , " \-\-help"
-Print help.
+Print help and exit without starting the protocol transport.
 .TP
 .BR \-V , " \-\-version"
-Print the version.
+Print the version and exit.
+.SH OUTPUT
+Writes only Language Server Protocol frames to standard output while serving.
+Transport errors are written to standard error after the session closes.
+.SH ERRORS
+Unexpected command-line arguments return a usage error.
+Malformed or oversized framed input closes the affected protocol session.
+.SH EXAMPLES
+.EX
+shoal-lsp
+.EE
+.SH EXIT STATUS
+Returns 0 after an orderly protocol shutdown and 2 for invalid command-line arguments.
 .SH SEE ALSO
 .BR shoal (1)

@@ -47,12 +47,12 @@ impl Kernel {
         // principal's policy so any external spawn resolves and applies
         // an OS sandbox for `actor`. The default-permissive policy
         // resolves to no confinement, so the human path is unchanged.
-        evaluator.set_leash_policy(self.policy.clone(), actor.clone());
+        evaluator.set_leash_policy(self.authority.policy.clone(), actor.clone());
         let run_plan = derive_plan(&mut evaluator, &ast, &ast_json);
         let claimed_approval =
             self.claim_exec_approval(&params, session, &actor, &ast_json, &run_plan)?;
         if params.mode == "run" {
-            match self.policy.evaluate_plan(&actor, &run_plan) {
+            match self.authority.policy.evaluate_plan(&actor, &run_plan) {
                 Verdict::Deny => {
                     return Err(RpcError {
                         code: LEASH_DENIED,
@@ -100,6 +100,7 @@ impl Kernel {
             }
             let effects_json = serde_json::to_string(&journal_effects).map_err(internal)?;
             let journal = self
+                .persistence
                 .journal
                 .lock()
                 .map_err(|_| poisoned_subsystem("journal"))?;
@@ -125,7 +126,7 @@ impl Kernel {
             Ok(entry_id) => entry_id,
             Err(error) => {
                 if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, &claimed_approval) {
-                    let _ = self.plans.transaction(|plans| {
+                    let _ = self.runtime.plans.transaction(|plans| {
                         if let Some(stored) = plans.get_mut(plan_ref)
                             && matches!(
                                 &stored.authorization,
@@ -140,7 +141,7 @@ impl Kernel {
             }
         };
         if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, claimed_approval) {
-            let consumed = self.plans.transaction(|plans| {
+            let consumed = self.runtime.plans.transaction(|plans| {
                 let Some(stored) = plans.get_mut(plan_ref) else {
                     return Err("claimed plan disappeared before execution");
                 };
@@ -159,6 +160,7 @@ impl Kernel {
                 Ok(consumed) => consumed,
                 Err(error) => {
                     let journal = self
+                        .persistence
                         .journal
                         .lock()
                         .map_err(|_| poisoned_subsystem("journal"))?;
@@ -168,6 +170,7 @@ impl Kernel {
             };
             if let Err(message) = consumed {
                 let journal = self
+                    .persistence
                     .journal
                     .lock()
                     .map_err(|_| poisoned_subsystem("journal"))?;
@@ -196,6 +199,7 @@ impl Kernel {
             Err(e) => {
                 {
                     let journal = self
+                        .persistence
                         .journal
                         .lock()
                         .map_err(|_| poisoned_subsystem("journal"))?;
@@ -216,7 +220,7 @@ impl Kernel {
                         return Err(internal(error));
                     }
                 }
-                self.events.publish_journal(
+                self.runtime.events.publish_journal(
                     &session.key.owner(),
                     entry_id,
                     journal_event(entry_id, &params.src, false, &actor),
@@ -301,6 +305,7 @@ impl Kernel {
             drop(transcript);
             {
                 let journal = self
+                    .persistence
                     .journal
                     .lock()
                     .map_err(|_| poisoned_subsystem("journal"))?;
@@ -308,7 +313,7 @@ impl Kernel {
                     .finish(entry_id, e.status, false, elapsed_ns(started))
                     .map_err(internal)?;
             }
-            self.events.publish_journal(
+            self.runtime.events.publish_journal(
                 &session.key.owner(),
                 entry_id,
                 journal_event(entry_id, &params.src, false, actor),
@@ -338,6 +343,7 @@ impl Kernel {
         let transcript_output = serde_json::to_string(&transcript_payload).map_err(internal)?;
         {
             let journal = self
+                .persistence
                 .journal
                 .lock()
                 .map_err(|_| poisoned_subsystem("journal"))?;
@@ -369,7 +375,7 @@ impl Kernel {
                 return Err(error);
             }
         }
-        self.events.publish_journal(
+        self.runtime.events.publish_journal(
             &session.key.owner(),
             entry_id,
             journal_event(entry_id, &params.src, true, actor),
@@ -379,7 +385,8 @@ impl Kernel {
         // out[n] exists (with its shape summary) without polling. Uses
         // `publish_transcript` (not the plain `publish`) so the seq↔entry_id
         // pointer needed for cold replay past the ring is recorded too.
-        self.events
+        self.runtime
+            .events
             .publish_transcript(&session.key.owner(), entry_id, transcript_payload);
         let exec_budget = ElideBudget::from_spec(params.elide.as_ref());
         let exec_uri = short_ref_to_uri(&value_ref, None);
@@ -391,7 +398,7 @@ impl Kernel {
         // site/content/internals/kernel-protocol.md: a live UI subscribing to `render` sees the same
         // string the exec response itself carries — no separate unbounded
         // copy, no polling `value.get {format:"render"}`.
-        self.events.publish(
+        self.runtime.events.publish(
             &session.key.owner(),
             "render",
             render_event(&value_ref, &bounded_render),
@@ -421,8 +428,8 @@ impl Kernel {
                 });
             };
             let actual_hash = bound_plan_hash(&params.src, ast_json, run_plan, &session.id, actor);
-            self.plans
-                .transaction(|plans| -> Result<Option<ApprovalRecord>, RpcError> {
+            self.runtime.plans.transaction(
+                |plans| -> Result<Option<ApprovalRecord>, RpcError> {
                     if plans.get(plan_ref).is_some_and(plan_expired) {
                         plans.remove(plan_ref);
                         return Err(RpcError {
@@ -451,7 +458,8 @@ impl Kernel {
                     }
                     let claimed = match &stored.authorization {
                         PlanAuthorization::PolicyAllowed
-                            if self.policy.evaluate_plan(actor, &stored.plan) == Verdict::Allow =>
+                            if self.authority.policy.evaluate_plan(actor, &stored.plan)
+                                == Verdict::Allow =>
                         {
                             None
                         }
@@ -500,7 +508,8 @@ impl Kernel {
                         }
                     };
                     Ok(claimed)
-                })??
+                },
+            )??
         } else {
             None
         };

@@ -120,7 +120,7 @@ accDescr: Shows the components and relationships described in Evaluator port con
   Lazy["Value::CasBytes"] --> Bytes["dyn BytesLoad"]
   Fs --> StdFs["StdFs"]
   Clock --> StdClock["StdClock"]
-  Open --> StdOpen["xdg-open adapter"]
+  Open --> StdOpen["Linux/macOS desktop adapter"]
   Exec --> StdExec["shoal_exec::run"]
   Secret --> StdSecret["shoal-secret adapter"]
 ```
@@ -160,9 +160,11 @@ clock abstraction.
 
 ### `Opener`
 
-`Opener` handles the desktop `open` effect. The Linux-oriented standard adapter spawns detached
-`xdg-open` with null stdio. Platform expansion belongs in host adapters; evaluator semantics should
-continue to request “open this path,” not select desktop commands.
+`Opener` handles the desktop `open` effect. The standard adapter admits at most four concurrent
+process-group owners and spawns detached `xdg-open` on Linux or `open` on macOS with null stdio.
+Saturation fails before spawn with `ErrorKind::WouldBlock`/`resource_busy`; other platforms fail with
+`ErrorKind::Unsupported`/`unsupported`. A 30-second owner terminates the whole launcher group and
+reaps its leader. Evaluator semantics request “open this path” and do not select desktop commands.
 
 ### `SecretPort`
 

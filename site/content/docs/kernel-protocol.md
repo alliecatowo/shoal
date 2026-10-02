@@ -96,7 +96,13 @@ The path selection used by shipped clients is:
 3. `$TMPDIR/shoal-<uid>/shoal/<session>.sock`;
 4. `/tmp/shoal-<uid>/shoal/<session>.sock`.
 
-The kernel creates an owned runtime directory with mode `0700` and the socket with mode `0600`. It refuses to replace a live listener, another user's socket, or a non-socket path. An explicitly selected parent directory may be outside the kernel's ownership, so operators must secure it themselves.
+The kernel creates missing runtime directories with mode `0700`; it opens every parent component
+descriptor-relative without following symbolic links and does not chmod an already-existing
+explicit/shared parent. It binds the socket while unpublished below a private staging directory,
+sets and verifies mode `0600`, then atomically publishes the exact inode without overwriting a
+last-moment replacement. Stale cleanup and shutdown cleanup quarantine the current entry first:
+live, unowned, non-socket, or identity-mismatched replacements are preserved. Operators must still
+secure an explicitly selected shared parent against denial-of-service and pathname replacement.
 
 There is no protocol version negotiation on this socket. `session.attach` returns `ast_version: 2`, which versions the serialized AST vocabulary, not the entire RPC surface. Additive result fields should be ignored by older clients; incompatible method changes require coordinated client/server release management.
 

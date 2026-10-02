@@ -12,8 +12,9 @@ audience = "Kernel and client authors"
 wide = true
 +++
 
-`shoal-kernel` is a multi-client Unix-socket host for Shoal evaluators. It is not the backend of the
-local REPL. Its added responsibilities are identity, named sessions, remote execution policy,
+`shoal-kernel` is a multi-client Unix-socket host for Shoal evaluators. A private, inherited-stream
+instance backs the default interactive REPL; it is not the backend of scripts, `-c`, stdin, or the
+standalone REPL. Its added responsibilities are identity, named sessions, remote execution policy,
 addressable values, bounded serialization, background tasks, long-lived PTYs, plan approval, and
 event delivery.
 

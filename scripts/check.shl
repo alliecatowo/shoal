@@ -10,6 +10,9 @@ run("cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "
 run("cargo", "test", "--workspace", "--locked")
 run("cargo", "build", "--workspace", "--release", "--locked")
 run("target/release/shoal", "scripts/install-test.shl")
+run("cargo", "build", "-p", "shoal-auth", "-p", "shoal-mcp", "-p", "shoal-kernel", "--bins", "--locked")
+env.SHOAL_DOGFOOD_SHOAL = "target/debug/shoal"
+run("target/debug/shoal", "--standalone", "scripts/dogfood-test.shl")
 run("cargo", "audit")
 run("cargo", "audit", "--file", "fuzz/Cargo.lock")
 run("site/scripts/check-diagrams.shl")

@@ -3,7 +3,7 @@ use shoal_proto::RpcError;
 use shoal_proto::error_code::{INTERNAL_ERROR, QUOTA_EXCEEDED};
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -62,9 +62,9 @@ pub(crate) struct PtyRegistry {
     entries: Mutex<HashMap<Ref, Arc<PtyEntry>>>,
     quarantined: AtomicBool,
     slots: Arc<PtyQuota>,
-    max_active_per_owner: AtomicUsize,
-    max_active_per_principal: AtomicUsize,
-    max_active_global: AtomicUsize,
+    max_active_per_owner: usize,
+    max_active_per_principal: usize,
+    max_active_global: usize,
     next_id: AtomicU64,
     reaper_started: Mutex<bool>,
 }
@@ -79,35 +79,21 @@ impl PtyRegistry {
             entries: Mutex::new(HashMap::new()),
             quarantined: AtomicBool::new(false),
             slots: Arc::new(PtyQuota::default()),
-            max_active_per_owner: AtomicUsize::new(max_active_per_owner),
-            max_active_per_principal: AtomicUsize::new(max_active_per_principal),
-            max_active_global: AtomicUsize::new(max_active_global),
+            max_active_per_owner,
+            max_active_per_principal,
+            max_active_global,
             next_id: AtomicU64::new(1),
             reaper_started: Mutex::new(false),
         }
-    }
-
-    pub(crate) fn configure(
-        &self,
-        max_active_per_owner: usize,
-        max_active_per_principal: usize,
-        max_active_global: usize,
-    ) {
-        self.max_active_per_owner
-            .store(max_active_per_owner, Ordering::Relaxed);
-        self.max_active_per_principal
-            .store(max_active_per_principal, Ordering::Relaxed);
-        self.max_active_global
-            .store(max_active_global, Ordering::Relaxed);
     }
 
     pub(crate) fn reserve(&self, owner: &OwnerKey) -> Result<PtyPermit, RpcError> {
         self.ensure_available()?;
         self.slots.reserve(
             owner,
-            self.max_active_per_owner.load(Ordering::Relaxed),
-            self.max_active_per_principal.load(Ordering::Relaxed),
-            self.max_active_global.load(Ordering::Relaxed),
+            self.max_active_per_owner,
+            self.max_active_per_principal,
+            self.max_active_global,
         )
     }
 

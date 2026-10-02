@@ -39,14 +39,47 @@ fn builtin_variadic_ty(name: &str) -> Option<&'static str> {
 }
 
 pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
+    validate_call_flags(call).map_err(|error| error.or_span(call.span))?;
     let mut args = Vec::new();
     let mut flags = Vec::new();
+    let mut expected_sha256 = None;
+    let mut expected_bytes = None;
+    let mut options = true;
     for arg in &call.args {
-        match arg {
-            CmdArg::FlagLong { name, .. } => flags.push(name.clone()),
-            CmdArg::FlagShort { chars, .. } => flags.extend(chars.chars().map(|c| c.to_string())),
-            CmdArg::DashDash { .. } => {}
-            _ => args.extend(ev.expand_arg(arg)?),
+        match (options, arg) {
+            (true, CmdArg::DashDash { .. }) => options = false,
+            (true, CmdArg::FlagLong { name, value, .. }) => {
+                flags.push(name.clone());
+                let destination = match name.as_str() {
+                    "expect_sha256" => Some(&mut expected_sha256),
+                    "expect_bytes" => Some(&mut expected_bytes),
+                    _ => None,
+                };
+                if let Some(destination) = destination {
+                    if destination.is_some() {
+                        return Err(ErrorVal::arg_error(format!(
+                            "rm received duplicate --{name} options"
+                        ))
+                        .or_span(call.span));
+                    }
+                    let value = value.as_deref().ok_or_else(|| {
+                        ErrorVal::arg_error(format!("--{name} requires an =VALUE"))
+                            .or_span(call.span)
+                    })?;
+                    let expanded = ev.expand_arg(value)?;
+                    if expanded.len() != 1 {
+                        return Err(ErrorVal::arg_error(format!(
+                            "--{name} requires exactly one scalar value"
+                        ))
+                        .or_span(call.span));
+                    }
+                    *destination = expanded.into_iter().next();
+                }
+            }
+            (true, CmdArg::FlagShort { chars, .. }) => {
+                flags.extend(chars.chars().map(|c| c.to_string()));
+            }
+            (_, arg) => args.extend(ev.expand_arg(arg)?),
         }
     }
     if let Some(ty) = builtin_variadic_ty(&call.head) {
@@ -63,10 +96,55 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
         &ev.exec.shell.cwd,
         &ev.exec.shell.process_env,
         args,
-        &flags,
+        BuiltinOptions {
+            flags: &flags,
+            expected_removal: expected_removal(expected_sha256, expected_bytes)?,
+        },
         &ev.exec.control.cancel,
     )
     .map_err(|e| e.or_span(call.span))
+}
+
+fn validate_call_flags(call: &CmdCall) -> VResult<()> {
+    let spec = shoal_syntax::commands::builtin_spec(&call.head)
+        .ok_or_else(|| ErrorVal::new("not_found", format!("unknown builtin {}", call.head)))?;
+    let mut options = true;
+    for argument in &call.args {
+        let received = match (options, argument) {
+            (true, CmdArg::DashDash { .. }) => {
+                options = false;
+                continue;
+            }
+            (true, CmdArg::FlagLong { name, .. }) => vec![name.clone()],
+            (true, CmdArg::FlagShort { chars, .. }) => {
+                chars.chars().map(|short| short.to_string()).collect()
+            }
+            _ => continue,
+        };
+        for received in received {
+            let accepted = if received.chars().count() == 1 {
+                let short = received.chars().next().expect("one-character flag");
+                spec.flags.iter().any(|flag| flag.short.contains(&short))
+            } else {
+                spec.flags
+                    .iter()
+                    .any(|flag| flag.long == received || flag.long.replace('-', "_") == *received)
+            };
+            if !accepted {
+                return Err(ErrorVal::arg_error(format!(
+                    "{} received unknown option --{}",
+                    call.head,
+                    received.replace('_', "-")
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct BuiltinOptions<'a> {
+    flags: &'a [String],
+    expected_removal: Option<trash::ExpectedContent>,
 }
 
 fn dispatch(
@@ -75,29 +153,36 @@ fn dispatch(
     cwd: &Path,
     penv: &[(OsString, OsString)],
     args: Vec<Value>,
-    flags: &[String],
+    options: BuiltinOptions<'_>,
     cancel: &CancelToken,
 ) -> VResult<Value> {
     match name {
         // echo renders every value (lists/records/tables/null included), strings
         // unquoted at top level (site/content/internals/pty-job-control.md).
         "echo" => echo(args),
-        "ls" => ls(fs, cwd, args, has(flags, &["a", "all"])),
+        "ls" => ls(fs, cwd, args, has(options.flags, &["a", "all"])),
         "cat" => cat(fs, cwd, args),
-        "mkdir" => mkdir(fs, cwd, args, has(flags, &["p", "parents"])),
+        "mkdir" => mkdir(fs, cwd, args, has(options.flags, &["p", "parents"])),
         "touch" => touch(fs, cwd, args),
-        "cp" => copy_move(fs, cwd, args, has(flags, &["r", "R", "recursive"]), false),
+        "cp" => copy_move(
+            fs,
+            cwd,
+            args,
+            has(options.flags, &["r", "R", "recursive"]),
+            false,
+        ),
         "mv" => copy_move(fs, cwd, args, true, true),
         "rm" => rm(
             fs,
             cwd,
             args,
-            has(flags, &["permanent"]),
-            has(flags, &["r", "R", "recursive"]),
+            has(options.flags, &["permanent"]),
+            has(options.flags, &["r", "R", "recursive"]),
+            options.expected_removal,
         ),
         "stat" => stat(fs, cwd, args),
         "head" => head(fs, cwd, args),
-        "ln" => ln(fs, cwd, args, has(flags, &["s", "symbolic"])),
+        "ln" => ln(fs, cwd, args, has(options.flags, &["s", "symbolic"])),
         "which" => which(penv, args),
         "env" => env(penv, args),
         "sleep" => sleep(args, cancel),
@@ -110,6 +195,61 @@ fn dispatch(
 
 fn has(flags: &[String], names: &[&str]) -> bool {
     flags.iter().any(|f| names.contains(&f.as_str()))
+}
+
+fn expected_removal(
+    sha256: Option<Value>,
+    bytes: Option<Value>,
+) -> VResult<Option<trash::ExpectedContent>> {
+    let (sha256, bytes) = match (sha256, bytes) {
+        (None, None) => return Ok(None),
+        (Some(sha256), Some(bytes)) => (sha256, bytes),
+        _ => {
+            return Err(ErrorVal::arg_error(
+                "rm conditional deletion requires both --expect-sha256 and --expect-bytes",
+            ));
+        }
+    };
+    let sha256 = match sha256 {
+        Value::Str(value) => value,
+        other => {
+            return Err(ErrorVal::type_error(format!(
+                "rm --expect-sha256 requires str, found {}",
+                other.type_name()
+            )));
+        }
+    };
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ErrorVal::arg_error(
+            "rm --expect-sha256 requires a lowercase 64-character SHA-256 digest",
+        ));
+    }
+    let bytes = match bytes {
+        Value::Int(value) if value >= 0 => value as u64,
+        Value::Float(value)
+            if value.is_finite()
+                && value >= 0.0
+                && value <= u64::MAX as f64
+                && value.fract() == 0.0 =>
+        {
+            value as u64
+        }
+        Value::Size(value) => value,
+        Value::Str(value) => value.parse::<u64>().map_err(|_| {
+            ErrorVal::arg_error("rm --expect-bytes requires a non-negative integer")
+        })?,
+        other => {
+            return Err(ErrorVal::type_error(format!(
+                "rm --expect-bytes requires int or size, found {}",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(Some(trash::ExpectedContent { sha256, bytes }))
 }
 /// Top-level display for `echo`: scalars/paths unquoted, everything else via
 /// `render_inline` (site/content/internals/pty-job-control.md — lists/records/tables all printable).
@@ -365,8 +505,9 @@ fn rm(
     args: Vec<Value>,
     permanent: bool,
     recursive: bool,
+    expected: Option<trash::ExpectedContent>,
 ) -> VResult<Value> {
-    trash::remove(fs, cwd, args, permanent, recursive)
+    trash::remove_expected(fs, cwd, args, permanent, recursive, expected)
 }
 fn stat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
@@ -561,12 +702,33 @@ mod tests {
                 d.path(),
                 &pe(),
                 vec![],
-                &[],
+                BuiltinOptions {
+                    flags: &[],
+                    expected_removal: None,
+                },
                 &CancelToken::new()
             )
             .unwrap_err()
             .code,
             "no_matches"
+        );
+    }
+
+    #[test]
+    fn typed_builtin_metadata_rejects_unknown_flags_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let source = "rm --permanent --typo victim";
+        let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+        let error = evaluator
+            .eval_program(&shoal_syntax::parse(source).unwrap())
+            .unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("--typo"), "{}", error.msg);
+        assert!(
+            victim.exists(),
+            "unknown option reached filesystem mutation"
         );
     }
     #[test]
@@ -579,7 +741,10 @@ mod tests {
             d.path(),
             &pe(),
             vec![Value::Path("x".into())],
-            &[],
+            BuiltinOptions {
+                flags: &[],
+                expected_removal: None,
+            },
             &CancelToken::new(),
         )
         .unwrap() else {
@@ -600,6 +765,33 @@ mod tests {
             // SAFETY: `geteuid` has no preconditions.
             assert_eq!(parent.uid(), unsafe { libc::geteuid() });
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn rm_expected_content_options_execute_through_command_syntax() {
+        use sha2::Digest as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"expected").unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(b"expected"));
+        let source = format!(
+            "let digest = \"{digest}\"\nlet bytes = 8\nrm --permanent --expect-sha256=(digest) --expect-bytes=(bytes) ./victim"
+        );
+        let program = shoal_syntax::parse(&source).unwrap();
+        let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+
+        let plan = evaluator.plan_program(&program).unwrap();
+        assert!(plan.effects.iter().any(|effect| matches!(
+            effect,
+            shoal_leash::Effect::FsDelete { paths, permanent: true }
+                if paths.len() == 1 && paths[0].ends_with("victim")
+        )));
+
+        evaluator.eval_program(&program).unwrap();
+
+        assert!(!victim.exists());
     }
     #[test]
     fn trash_falls_back_to_an_atomic_adjacent_rename_on_exdev() {

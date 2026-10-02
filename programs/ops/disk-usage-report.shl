@@ -1,0 +1,17 @@
+#!/usr/bin/env shoal
+# Attribute recursive file usage to named filesystem roots.
+
+assert(args.len() == 2, "usage: disk-usage-report.shl ROOTS OUTPUT")
+let roots_file = path(args[0].str())
+let output = path(args[1].str())
+assert(roots_file.is_file, "disk root inventory is missing: {roots_file}")
+let roots = json.parse(roots_file.read)
+let rows = roots.map(item => {
+  let root = path(item.path)
+  assert(root.is_dir, "disk usage root is missing: {root}")
+  let files = glob(root.join("**/*").display(), hidden: true).expand().where(.is_file)
+  {name: item.name, path: root.abs().display(), files: files.len(), bytes: files.map(file => file.size / 1b).sum()}
+}).sort_by(row => -row.bytes)
+let report = {roots: rows, files: rows.map(.files).sum(), bytes: rows.map(.bytes).sum()}
+json.stringify(report, pretty: true).save(output)
+echo "measured {report.files} files using {report.bytes} bytes"

@@ -1,0 +1,38 @@
+#!/usr/bin/env shoal
+# Inventory cache ownership, extensions, and largest entries.
+
+assert(args.len() == 2, "usage: cache-inventory.shl ROOT OUTPUT")
+let root = path(args[0].str())
+let output = path(args[1].str())
+assert(root.is_dir, "cache root is not a directory: {root}")
+fn digest(file: path) {
+  let result = if ((which sha256sum).out != null) { run("sha256sum", file) } else { run("shasum", "-a", "256", file) }
+  assert(result.ok, "checksum failed for {file}: {result.err}")
+  result.out.str().words().first()
+}
+let prefix = "{root.abs().display()}/"
+let files = glob(root.join("**/*").display(), hidden: true).expand().where(.is_file).map(file => {
+  let relative = file.abs().display().replace(prefix, "")
+  let segments = relative.split("/")
+  {
+    path: relative,
+    owner: segments.first(),
+    bytes: file.size / 1b,
+    sha256: digest(file),
+    extension: file.ext ?? "",
+  }
+}).sort_by(.path)
+let owners = files.group_by(.owner).map(group => ({
+  owner: group.key,
+  files: group.values.len(),
+  bytes: group.values.map(.bytes).sum(),
+})).sort_by(row => -row.bytes)
+let report = {
+  file_count: files.len(),
+  bytes: files.map(.bytes).sum(),
+  owners: owners,
+  entries: files,
+  largest: files.sort_by(row => -row.bytes).first(20),
+}
+json.stringify(report, pretty: true).save(output)
+echo "inventoried {files.len()} cache files"

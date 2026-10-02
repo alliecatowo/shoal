@@ -6,7 +6,9 @@ use std::path::Path;
 
 use reedline::{Span as RlSpan, Suggestion};
 use shoal_adapters::CmdAdapter;
-use shoal_syntax::commands::{CommandFacts, CommandSource, builtin_names, resolve_command_source};
+use shoal_syntax::commands::{
+    CommandFacts, CommandSource, builtin_names, builtin_spec, resolve_command_source,
+};
 use shoal_syntax::lexer::RESERVED;
 use shoal_value::{Value, method_names, methods_for};
 
@@ -110,6 +112,17 @@ impl ShoalCompleter {
     pub(super) fn flag_candidates(&self, head: &str, prefix: &str) -> Vec<String> {
         let mut names = BTreeSet::new();
         match self.head_source(head) {
+            CommandSource::StructuredBuiltin | CommandSource::SpecialBuiltin => {
+                if let Some(spec) = builtin_spec(head) {
+                    for flag in spec.flags {
+                        let suffix = if flag.value.is_some() { "=" } else { "" };
+                        names.insert(format!("--{}{suffix}", flag.long));
+                        for short in flag.short {
+                            names.insert(format!("-{short}"));
+                        }
+                    }
+                }
+            }
             CommandSource::Adapter => {
                 let adapter = self
                     .adapter_lookup(head)

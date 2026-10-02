@@ -5,20 +5,52 @@ shoal-mcp \- expose Shoal through the Model Context Protocol
 .B shoal-mcp
 .RI [ options ]
 .SH DESCRIPTION
-Runs an MCP server on standard input and output, connected to a Shoal kernel.
+Runs a Model Context Protocol server on standard input and output, connected to a Shoal kernel.
+The default tokenless public identity is a restricted agent.
+A named or public socket cannot assert local-human authority; use a policy-scoped bearer token for machine access or the private interactive Shoal REPL for human authority.
 .SH OPTIONS
 .TP
 .BI \-\-socket " PATH"
-Connect to PATH.
+Connect to an explicit kernel Unix socket instead of discovering one from the session.
 .TP
 .BI \-\-session " NAME"
-Select a session.
+Select the session used for socket discovery and attachment.
 .TP
 .BI \-\-token " TOKEN"
-Authenticate with a capability token.
+Authenticate as the capability-token principal.
 .TP
+.BR \-h , " \-\-help"
+Print help and exit.
+.TP
+.BR \-V , " \-\-version"
+Print the version and exit.
+.SH OUTPUT
+Reads and writes Model Context Protocol messages on standard input and output.
+Diagnostics are written to standard error.
+.SH ERRORS
+Invalid arguments, kernel connection or authentication failures,
+and protocol-serving failures terminate the process with a nonzero status.
+The retired
 .B \-\-local-human
-Use local-human authentication.
+option exits with status 2 and migration guidance; it cannot upgrade a public connection.
+.SH ENVIRONMENT
+.TP
+.B SHOAL_SOCKET
+Default explicit socket path.
+.TP
+.B SHOAL_SESSION
+Default session name.
+.TP
+.B SHOAL_TOKEN
+Default bearer token.
+.SH EXAMPLES
+.EX
+SHOAL_TOKEN=secret shoal-mcp --session automation
+shoal-mcp --socket /run/user/1000/shoal/default.sock
+.EE
+.SH EXIT STATUS
+Returns 0 after an orderly protocol shutdown, 1 for runtime failures, and 2 for invalid arguments.
 .SH SEE ALSO
 .BR shoal (1),
-.BR shoal-token (1)
+.BR shoal-token (1),
+.BR shoal-kernel (1)

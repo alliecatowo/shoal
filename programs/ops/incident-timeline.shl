@@ -1,0 +1,20 @@
+#!/usr/bin/env shoal
+# Order incident events and calculate elapsed offsets from the first event.
+
+assert(args.len() == 2, "usage: incident-timeline.shl EVENTS OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "incident events are missing: {input}")
+let events = json.parse(input.read).sort_by(.timestamp_ns)
+let duplicate = events.group_by(.timestamp_ns).where(group => group.values.len() > 1).map(.key)
+assert(duplicate.is_empty(), "incident event timestamps are ambiguous: {duplicate}")
+let origin = if (events.is_empty()) { 0 } else { events.first().timestamp_ns }
+let timeline = events.map(event => ({
+  timestamp_ns: event.timestamp_ns,
+  offset_ns: event.timestamp_ns - origin,
+  source: event.source,
+  message: event.message,
+}))
+let report = {events: timeline, duration_ns: if (timeline.is_empty()) { 0 } else { timeline.last().offset_ns }}
+json.stringify(report, pretty: true).save(output)
+echo "built incident timeline with {timeline.len()} events"

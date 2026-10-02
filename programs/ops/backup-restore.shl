@@ -1,0 +1,42 @@
+#!/usr/bin/env shoal
+# Restore a previously verified backup into a new destination.
+
+assert(args.len() == 2, "usage: backup-restore.shl BACKUP DESTINATION")
+let backup = path(args[0].str())
+let destination = path(args[1].str())
+let data = backup.join("data")
+let manifest = backup.join("manifest.json")
+assert(data.is_dir && manifest.is_file, "not a Shoal backup: {backup}")
+assert(!destination.exists, "restore destination already exists: {destination}")
+fn digest(file: path) {
+  let result = if ((which sha256sum).out != null) { run("sha256sum", file) } else { run("shasum", "-a", "256", file) }
+  assert(result.ok, "checksum failed for {file}: {result.err}")
+  result.out.str().words().first()
+}
+let expected_rows = json.parse(manifest.read).files.sort_by(.path)
+let prefix = "{data.abs().display()}/"
+let actual_rows = glob(data.join("**/*").display(), hidden: true).expand().where(.is_file)
+  .map(file => ({path: file.abs().display().replace(prefix, ""), bytes: file.size / 1b, sha256: digest(file)})).sort_by(.path)
+assert(actual_rows == expected_rows, "backup verification failed before restore")
+
+# The dogfood gate uses this explicit seam to deterministically exercise the
+# otherwise tiny source-mutation window between verification and pinned copy.
+# Production callers leave both variables unset.
+let mutation_relative = (env SHOAL_DOGFOOD_RESTORE_MUTATE_RELATIVE).out
+let mutation_content = (env SHOAL_DOGFOOD_RESTORE_MUTATE_CONTENT).out
+if (mutation_relative != null || mutation_content != null) {
+  assert(mutation_relative != null && mutation_content != null, "restore mutation seam requires relative path and content together")
+  let segments = mutation_relative.split("/")
+  assert(!mutation_relative.is_empty() && !mutation_relative.starts_with("/") && !(".." in segments) && !("." in segments) && !("" in segments), "restore mutation seam path is not clean and relative")
+  mutation_content.save(data.join(mutation_relative))
+}
+
+let data_copied = (cp --recursive (data) (destination))
+let restored_prefix = "{destination.abs().display()}/"
+let restored_rows = glob(destination.join("**/*").display(), hidden: true).expand().where(.is_file)
+  .map(file => ({path: file.abs().display().replace(restored_prefix, ""), bytes: file.size / 1b, sha256: digest(file)})).sort_by(.path)
+if (restored_rows != expected_rows) {
+  let invalid_removed = (rm --permanent --recursive (destination))
+  assert(false, "restored tree failed manifest verification and was removed")
+}
+echo "restored {restored_rows.len()} verified files into {destination}"

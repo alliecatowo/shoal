@@ -168,6 +168,18 @@ fn audited_evaluator_paths_have_no_ambient_path_probes() {
             "reef_builtins.rs",
             production(include_str!("../reef_builtins.rs")),
         ),
+        (
+            "reef_builtins/commands.rs",
+            production(include_str!("../reef_builtins/commands.rs")),
+        ),
+        (
+            "reef_builtins/support.rs",
+            production(include_str!("../reef_builtins/support.rs")),
+        ),
+        (
+            "reef_builtins/which.rs",
+            production(include_str!("../reef_builtins/which.rs")),
+        ),
     ];
     let forbidden_everywhere = [
         ".exists()",
@@ -354,6 +366,82 @@ fn effects_at(cwd: &Path, src: &str) -> Vec<Effect> {
     ev.plan_program(&shoal_syntax::parse(src).unwrap())
         .unwrap()
         .effects
+}
+
+#[test]
+fn rm_planning_preserves_recoverable_and_permanent_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    for (source, permanent, reversibility) in [
+        ("rm old", false, Reversibility::Reversible),
+        ("rm --permanent old", true, Reversibility::Irreversible),
+        ("rm --permanent=true old", true, Reversibility::Irreversible),
+        (
+            "rm --permanent=false old",
+            true,
+            Reversibility::Irreversible,
+        ),
+        // Neither an unknown long flag nor a short flag aliases the explicit
+        // `--permanent` spelling accepted by the runtime.
+        ("rm --permanently old", false, Reversibility::Reversible),
+        ("rm -p old", false, Reversibility::Reversible),
+    ] {
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        let plan = evaluator
+            .plan_program(&shoal_syntax::parse(source).unwrap())
+            .unwrap();
+        assert_eq!(plan.reversibility, reversibility, "{source}");
+        assert_eq!(
+            plan.effects,
+            vec![Effect::FsDelete {
+                paths: vec![dir.path().join("old")],
+                permanent,
+            }],
+            "{source}"
+        );
+    }
+
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+    let terminated = evaluator
+        .plan_program(&shoal_syntax::parse("rm -- --permanent").unwrap())
+        .unwrap();
+    assert_eq!(terminated.reversibility, Reversibility::Reversible);
+    assert_eq!(
+        terminated.effects,
+        vec![Effect::FsDelete {
+            paths: vec![dir.path().join("--permanent")],
+            permanent: false,
+        }]
+    );
+
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+    let expanded = evaluator
+        .plan_program(
+            &shoal_syntax::parse("fn destroy() { rm --permanent old }\ndestroy()").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(expanded.reversibility, Reversibility::Irreversible);
+    assert!(expanded.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::FsDelete {
+            permanent: true,
+            ..
+        }
+    )));
+
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+    let aliased = evaluator
+        .plan_program(
+            &shoal_syntax::parse("alias purge = rm --recursive\npurge --permanent old").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(aliased.reversibility, Reversibility::Irreversible);
+    assert!(aliased.effects.iter().any(|effect| matches!(
+        effect,
+        Effect::FsDelete {
+            permanent: true,
+            paths,
+        } if paths == &vec![dir.path().join("old")]
+    )));
 }
 
 #[test]

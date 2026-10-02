@@ -1,16 +1,56 @@
 .TH SHOAL-SANDBOX-EXEC 1 "July 2026" "Shoal 0.1.0" "User Commands"
 .SH NAME
-shoal-sandbox-exec \- run a process under a Shoal filesystem policy
+shoal-sandbox-exec \- run a process under Shoal child-only OS controls
 .SH SYNOPSIS
 .B shoal-sandbox-exec
-.RI [ \-\-read " path" ]
-.RI [ \-\-write " path" ]
-.RI [ \-\-delete " path" ]
+.RI [ options ]
 .B \-\-
 .I command
 .RI [ args ...]
 .SH DESCRIPTION
-Applies the requested filesystem sandbox and replaces itself with COMMAND.
+Applies requested process limits, filesystem policy, and network denial,
+then replaces itself with COMMAND while preserving its standard streams.
+Filesystem options are repeatable.
+.SH OPTIONS
+.TP
+.B \-\-deny-net
+Deny network access in the child.
+.TP
+.BI \-\-cpu-seconds " N"
+Limit CPU time to a positive number of seconds.
+.TP
+.BI \-\-memory-bytes " N"
+Limit the child address space to a positive byte count.
+.TP
+.BI \-\-read " PATH"
+Permit reads below PATH.
+.TP
+.BI \-\-write " PATH"
+Permit writes below PATH.
+.TP
+.BI \-\-delete " PATH"
+Permit deletion below PATH.
+.TP
+.BR \-h , " \-\-help"
+Print help and exit.
+.TP
+.BR \-V , " \-\-version"
+Print the version and exit.
+.SH OUTPUT
+On successful exec, COMMAND owns stdout and stderr.
+Setup failures are reported on standard error before COMMAND starts.
+.SH ERRORS
+Missing commands, malformed positive limits, unknown options, unavailable enforcement,
+and exec failures are rejected before unconfined fallback can occur.
+.SH EXAMPLES
+.EX
+shoal-sandbox-exec --deny-net --read . -- cargo test
+shoal-sandbox-exec --memory-bytes 536870912 -- ./worker
+.EE
+.SH EXIT STATUS
+After a successful exec, COMMAND determines the status.
+Setup or exec failures return 126.
 .SH SEE ALSO
 .BR shoal (1),
-.BR shoal-kernel (1)
+.BR shoal-kernel (1),
+.BR shoal-landlock-helper (1)

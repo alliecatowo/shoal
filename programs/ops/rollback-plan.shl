@@ -1,0 +1,20 @@
+#!/usr/bin/env shoal
+# Build reverse-order rollback steps from completed deployment actions.
+
+assert(args.len() == 2, "usage: rollback-plan.shl DEPLOYMENT OUTPUT")
+let input = path(args[0].str())
+let output = path(args[1].str())
+assert(input.is_file, "deployment history is missing: {input}")
+let actions = json.parse(input.read)
+let duplicate = actions.group_by(.sequence).where(group => group.values.len() > 1).map(.key)
+assert(duplicate.is_empty(), "deployment history has duplicate sequence numbers: {duplicate}")
+let completed = actions.where(.status == "completed").sort_by(row => -row.sequence)
+let steps = completed.enumerate().map(pair => ({
+  sequence: pair[0] + 1,
+  undo_sequence: pair[1].sequence,
+  host: pair[1].host,
+  restore_version: pair[1].previous_version,
+}))
+let report = {steps: steps, count: steps.len(), requires_confirmation: !steps.is_empty()}
+json.stringify(report, pretty: true).save(output)
+echo "planned {steps.len()} rollback steps"

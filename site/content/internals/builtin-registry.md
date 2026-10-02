@@ -148,10 +148,11 @@ Builders admit at most 16,384 values and 16 MiB of measured retained state befor
 strings and byte concatenation use the same 16 MiB wall. Breaches raise `builtin_output_limit` with
 a hint to narrow or stream the input. Production filesystem adapters must override bounded
 directory reads so `ls` enforces the row wall during iteration, not after collecting the directory.
-`builtins/copy.rs` separately inventories all recursive-copy sources before effects. Its iterative
-work stack shares count/byte admission with finalized operations, preventing recursive pending
-vectors from multiplying memory by depth; execution begins only after the complete bounded plan is
-valid.
+`builtins/copy/plan.rs` separately inventories all recursive-copy sources before effects. Its
+iterative work stack shares count/byte admission from `copy/admission.rs` with finalized operations,
+preventing recursive pending vectors from multiplying memory by depth. That admission layer also
+owns descriptor accounting and cross-job destination alias/overlap rejection. Only after the
+complete bounded plan is valid does `copy/execution.rs` consume its retained capabilities.
 The same admission module is crate-visible to `reef_builtins.rs`: `which --all`, binding/lock/doctor
 tables, adapter schema lists, and resolution scope chains cannot bypass the structured-result wall.
 Reef lock updates remain staged until every output row is admitted.
@@ -198,9 +199,9 @@ order.
 ## Copy, move, removal, and undo
 
 Multiple `cp`/`mv` sources require a directory destination. Copy recurses only with a recursive flag;
-move always uses `Fs::rename`. Recursive copy follows the type information exposed by the `Fs` port
-and creates destination directories as it descends. Its portable preflight admits only ordinary
-files/directories without sparse allocation, extended attributes, or Unix special mode bits; it
+move always uses `Fs::rename`. Recursive copy inventories the type information exposed by retained
+source and destination capabilities before creating anything. Its portable preflight admits only
+ordinary files/directories without sparse allocation, extended attributes, or Unix special mode bits; it
 rejects links and special nodes rather than inheriting `std::fs::copy`'s follow/open behavior.
 `Fs::has_extended_attributes` and `Fs::set_permissions` make metadata inspection/application explicit
 for adapters. Execution applies file modes after each content copy and directory modes deepest-first;

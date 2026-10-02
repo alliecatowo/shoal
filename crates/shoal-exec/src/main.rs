@@ -1,11 +1,47 @@
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+
+const HELP: &str = "Run a command with Shoal child-only OS controls
+
+Usage:
+  shoal-sandbox-exec [OPTIONS] -- COMMAND [ARG...]
+
+Options:
+  --deny-net          Deny network access
+  --cpu-seconds N     Limit CPU time to a positive number of seconds
+  --memory-bytes N    Limit address space to a positive byte count
+  --read PATH         Permit reads below PATH; repeatable
+  --write PATH        Permit writes below PATH; repeatable
+  --delete PATH       Permit deletion below PATH; repeatable
+  -h, --help          Print this help and exit
+  -V, --version       Print the version and exit
+
+Output:
+  On success this process is replaced by COMMAND; its standard streams are unchanged.
+
+Errors:
+  Refuses missing commands, malformed limits, unknown options, or unavailable enforcement.
+
+Examples:
+  shoal-sandbox-exec --deny-net --read . -- cargo test
+
+Exit status:
+  COMMAND determines the status after exec; setup and exec failures return 126.";
+
+/// (name, takes value, repeatable)
+const PARSER_OPTIONS: &[(&str, bool, bool)] = &[
+    ("--deny-net", false, false),
+    ("--cpu-seconds", true, false),
+    ("--memory-bytes", true, false),
+    ("--read", true, true),
+    ("--write", true, true),
+    ("--delete", true, true),
+];
+
 fn main() {
     let raw = std::env::args_os().skip(1).collect::<Vec<_>>();
     if raw.as_slice() == ["-h"] || raw.as_slice() == ["--help"] {
-        println!(
-            "Run a command with Shoal child-only OS controls\n\nUsage: shoal-sandbox-exec [--deny-net] [--cpu-seconds N] [--memory-bytes N] [--read PATH] [--write PATH] [--delete PATH] -- COMMAND [ARG...]"
-        );
+        println!("{HELP}");
         return;
     }
     if raw.as_slice() == ["-V"] || raw.as_slice() == ["--version"] {
@@ -17,20 +53,31 @@ fn main() {
     let mut net = shoal_leash::NetPolicy::Unrestricted;
     let mut limits = shoal_leash::ProcessLimits::default();
     let mut cmd = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     while let Some(x) = a.next() {
         if x == "--" {
             cmd.extend(a);
             break;
         }
-        if x == "--deny-net" {
+        let Some(name) = x.to_str() else {
+            fail("sandbox options must be valid UTF-8");
+        };
+        let Some((_, _, repeatable)) = PARSER_OPTIONS.iter().find(|(option, _, _)| *option == name)
+        else {
+            fail(&format!("unknown sandbox option {name}"));
+        };
+        if !repeatable && !seen.insert(name.to_string()) {
+            fail(&format!("{name} may be specified only once"));
+        }
+        if name == "--deny-net" {
             net = shoal_leash::NetPolicy::Deny;
             continue;
         }
-        if x == "--cpu-seconds" {
+        if name == "--cpu-seconds" {
             limits.cpu_seconds = Some(parse_positive(&mut a, "--cpu-seconds"));
             continue;
         }
-        if x == "--memory-bytes" {
+        if name == "--memory-bytes" {
             limits.memory_bytes = Some(parse_positive(&mut a, "--memory-bytes"));
             continue;
         }
@@ -38,11 +85,11 @@ fn main() {
             a.next()
                 .unwrap_or_else(|| fail("sandbox option requires path")),
         );
-        match x.to_str() {
-            Some("--read") => s.read.push(path),
-            Some("--write") => s.write.push(path),
-            Some("--delete") => s.delete.push(path),
-            _ => fail("unknown sandbox option"),
+        match name {
+            "--read" => s.read.push(path),
+            "--write" => s.write.push(path),
+            "--delete" => s.delete.push(path),
+            _ => unreachable!("registry and parser match arms must remain in parity"),
         }
     }
     if cmd.is_empty() {
@@ -73,4 +120,28 @@ fn parse_positive(args: &mut impl Iterator<Item = std::ffi::OsString>, option: &
 fn fail(msg: &str) -> ! {
     eprintln!("shoal-sandbox-exec: {msg}");
     std::process::exit(126)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_help_and_man_share_the_option_registry() {
+        let documented = HELP
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("--"))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<std::collections::BTreeSet<_>>();
+        let registered = PARSER_OPTIONS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(documented, registered);
+        let man = include_str!("../../../man/shoal-sandbox-exec.1");
+        for (name, _, _) in PARSER_OPTIONS {
+            assert!(man.contains(&name.replace("--", "\\-\\-")), "{name}");
+        }
+    }
 }

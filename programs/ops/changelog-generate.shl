@@ -1,0 +1,28 @@
+#!/usr/bin/env shoal
+# Render structured change records into a deterministic release changelog.
+
+assert(args.len() == 3, "usage: changelog-generate.shl CHANGES VERSION OUTPUT")
+let input = path(args[0].str())
+let version = args[1].str()
+let output = path(args[2].str())
+assert(input.is_file, "change input is missing: {input}")
+assert(!version.is_empty(), "release version is empty")
+let changes = json.parse(input.read)
+assert(!changes.is_empty(), "changes must be a non-empty JSON sequence")
+let categories = ["breaking", "feature", "fix", "security", "documentation"]
+let unknown = changes.where(change => !(change.category in categories))
+assert(unknown.is_empty(), "unknown changelog categories: {unknown}")
+var document = "# Shoal {version}\n\n"
+for category in categories {
+  let rows = changes.where(.category == category).sort_by(.summary)
+  if (!rows.is_empty()) {
+    document += "## {category.upper()}\n\n"
+    for row in rows {
+      document += "- {row.summary} ({row.id})\n"
+    }
+    document += "\n"
+  }
+}
+document.save(output)
+assert(output.read.contains("# Shoal {version}"), "changelog output is malformed")
+echo "rendered {changes.len()} changes for {version}"

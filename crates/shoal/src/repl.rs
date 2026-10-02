@@ -31,6 +31,7 @@ use shoal_syntax::parse_with_ctx;
 use shoal_value::Env;
 use shoal_value::Value;
 
+use crate::args::ExecutionMode;
 use crate::completer;
 #[cfg(test)]
 use crate::kernel_repl::ProtocolOutcome;
@@ -71,7 +72,7 @@ use transcript::push_out_entry;
 use transcript::{TranscriptState, effective_journal_state_dir, language_journal_requested};
 use ui::ReplUi;
 
-pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
+pub(crate) fn repl(mode: ExecutionMode) -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let bootstrap = shoal_host::SessionBootstrap::discover(&cwd).map_err(|e| e.to_string())?;
     // Before anything else prints: feed `render.color` into `no_color()` so
@@ -86,7 +87,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     }
     let config = bootstrap.config().clone();
     let state_dir = effective_journal_state_dir(config.journal.state_dir.as_deref(), &cwd);
-    let protocol_backed = protocol_requested(standalone, config.kernel.enabled);
+    let protocol_backed = protocol_requested(mode, config.kernel.enabled);
     let mut protocol =
         ProtocolState::connect(protocol_backed, &config, state_dir.clone(), cwd.clone())?;
     let mut evaluator = Evaluator::new(cwd.clone());

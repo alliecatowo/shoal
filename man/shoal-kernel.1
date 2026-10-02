@@ -5,25 +5,87 @@ shoal-kernel \- run the resident Shoal execution kernel
 .B shoal-kernel
 .RI [ options ]
 .SH DESCRIPTION
-Serves authenticated Shoal sessions over a private Unix socket or inherited embedded descriptor.
+Serves authenticated Shoal sessions over a private Unix socket or one inherited connected Unix stream.
+It owns durable session, task, event, PTY, journal, and execution state.
 .SH OPTIONS
 .TP
 .BI \-\-session " NAME"
-Select a named session.
+Select the default session.
 .TP
 .BI \-\-socket " PATH"
-Listen on PATH.
+Listen on PATH after enforcing secure ownership and type checks.
 .TP
 .BI \-\-state-dir " PATH"
 Store durable state below PATH.
 .TP
 .BI \-\-token-store " PATH"
-Use PATH as the credential authority file; overrides SHOAL_TOKEN_STORE.
+Use PATH as the credential authority file; overrides
+.BR SHOAL_TOKEN_STORE .
 .TP
 .BI \-\-policy " FILE"
-Load a sandbox policy.
+Load the sandbox policy from FILE.
+.TP
+.BI \-\-embedded-fd " FD"
+Serve one inherited connected AF_UNIX stream and do not open a public listener.
+.TP
+.B \-\-detach-stderr-after-ready
+Close inherited standard error after announcing listener readiness. Explicit supervisors use this
+to preserve startup diagnostics without retaining a captured pipe for the daemon lifetime.
+.B \-\-require-token
+Require bearer authentication on the public socket.
+.TP
+.B \-\-require-peer-uid
+Require the public peer UID to match the kernel process.
+.TP
+.BI \-\-max-connections " N"
+Bound simultaneous client connections.
+.TP
+.BI \-\-max-sessions " N"
+Bound resident sessions.
+.TP
+.BI \-\-max-tasks-per-session " N"
+Bound tasks owned by one session.
+.TP
+.BI \-\-max-ptys-per-session " N"
+Bound PTYs owned by one session.
+.TP
+.BI \-\-max-ptys-per-principal " N"
+Bound PTYs owned by one authenticated principal.
+.TP
+.BI \-\-max-ptys-global " N"
+Bound all resident PTYs.
+.TP
+.BI \-\-max-subscriptions-per-session " N"
+Bound event subscriptions owned by one session.
+.TP
+.BI \-\-max-blob-decompressions-per-window " N"
+Bound decompression work admitted in one accounting window.
+.TP
+.BI \-\-blob-decompression-window-ms " N"
+Set the decompression accounting window in milliseconds.
+.TP
+.BI \-\-frame-read-timeout-ms " N"
+Bound time spent receiving one request frame.
 .TP
 .BR \-h , " \-\-help"
-Print all limit and transport options.
+Print complete transport and limit help.
+.TP
+.BR \-V , " \-\-version"
+Print the version.
+.SH OUTPUT
+Listener mode announces readiness and its socket on standard error.
+Embedded mode writes one bounded JSON readiness frame to the inherited descriptor.
+.SH ERRORS
+The kernel refuses invalid limits, unsafe socket paths, invalid or unrelated descriptors,
+conflicting transports, unusable state or token stores, and invalid policies.
+.SH EXAMPLES
+.EX
+shoal-kernel --session default --require-peer-uid
+shoal-kernel --socket /run/user/1000/shoal/ci.sock --require-token
+.EE
+.SH EXIT STATUS
+Returns 0 after an orderly shutdown and 1 for configuration, state, transport, or serving failures.
 .SH SEE ALSO
-.BR shoal (1)
+.BR shoal (1),
+.BR shoal-token (1),
+.BR shoal-mcp (1)

@@ -1,0 +1,23 @@
+#!/usr/bin/env shoal
+# Expand a release manifest and host inventory into a reviewable deployment plan.
+
+assert(args.len() == 3, "usage: deployment-plan.shl MANIFEST HOSTS OUTPUT")
+let manifest_file = path(args[0].str())
+let hosts_file = path(args[1].str())
+let output = path(args[2].str())
+assert(manifest_file.is_file && hosts_file.is_file, "deployment input is missing")
+let manifest = json.parse(manifest_file.read)
+let hosts = json.parse(hosts_file.read)
+let invalid = hosts.where(host => host.name == null || !(host.environment in ["staging", "production"]))
+assert(invalid.is_empty(), "deployment hosts are invalid: {invalid}")
+let ordered = hosts.sort_by(host => if (host.environment == "staging") { 0 } else { 1 })
+let steps = ordered.enumerate().map(pair => ({
+  sequence: pair[0] + 1,
+  host: pair[1].name,
+  environment: pair[1].environment,
+  version: manifest.version,
+  artifacts: manifest.files.len(),
+}))
+let report = {schema: 1, version: manifest.version, steps: steps, requires_approval: steps.where(.environment == "production").len() > 0}
+json.stringify(report, pretty: true).save(output)
+echo "planned {steps.len()} deployment steps for {manifest.version}"

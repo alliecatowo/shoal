@@ -5,11 +5,32 @@ shoal-doctor \- diagnose a Shoal installation
 .B shoal-doctor
 .RI [ \-\-json ]
 .SH DESCRIPTION
-Checks platform support, paths, permissions, configuration, sandboxing, and companion executables.
-It exits nonzero when required checks fail.
+Checks platform support, paths, permissions, layered configuration, sandboxing,
+and the installed companion executables.
+All checks run so an early failure does not hide later findings.
 .SH OPTIONS
 .TP
 .B \-\-json
-Emit a machine-readable report.
+Emit the complete machine-readable report instead of the human checklist.
+.TP
+.BR \-h , " \-\-help"
+Print help and exit.
+.TP
+.BR \-V , " \-\-version"
+Print the version and exit.
+.SH OUTPUT
+Human output groups checks by status.
+JSON output includes every result and its severity for automation.
+.SH ERRORS
+Failed installation checks are represented in the report and final status.
+Invalid arguments or a JSON rendering failure are command errors.
+.SH EXAMPLES
+.EX
+shoal-doctor
+shoal-doctor --json
+.EE
+.SH EXIT STATUS
+Returns 0 when required checks pass, 1 when required checks fail, and 2 for invalid arguments or report rendering failure.
 .SH SEE ALSO
-.BR shoal (1)
+.BR shoal (1),
+.BR shoal-landlock-helper (1)

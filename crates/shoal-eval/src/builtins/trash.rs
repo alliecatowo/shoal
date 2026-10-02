@@ -2,7 +2,7 @@
 
 use super::admission::OutputBudget;
 use super::{ioerr, paths};
-use shoal_value::{ErrorVal, Fs, FsEntryIdentity, Record, VResult, Value};
+use shoal_value::{ErrorVal, Fs, FsEntryIdentity, FsRemovalTree, Record, VResult, Value};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod mutation;
 pub(super) use mutation::move_to_trash;
 use mutation::permanently_remove;
+use mutation::removal_mutation_error;
 
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
 static TRASH_SESSION: OnceLock<String> = OnceLock::new();
@@ -30,6 +31,14 @@ struct RemovalPlan {
     entry_name: Option<String>,
     primary_target: Option<PathBuf>,
     adjacent_root: Option<PathBuf>,
+    removal_tree: Option<Box<dyn FsRemovalTree>>,
+    expected_content: Option<ExpectedContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExpectedContent {
+    pub(super) sha256: String,
+    pub(super) bytes: u64,
 }
 
 struct RemovalCandidate {
@@ -43,6 +52,7 @@ struct RemovalCandidate {
     inode: u64,
 }
 
+#[cfg(test)]
 pub(super) fn remove(
     fs: &dyn Fs,
     cwd: &Path,
@@ -50,7 +60,26 @@ pub(super) fn remove(
     permanent: bool,
     recursive: bool,
 ) -> VResult<Value> {
-    remove_with_budget(fs, cwd, args, permanent, recursive, OutputBudget::new())
+    remove_expected(fs, cwd, args, permanent, recursive, None)
+}
+
+pub(super) fn remove_expected(
+    fs: &dyn Fs,
+    cwd: &Path,
+    args: Vec<Value>,
+    permanent: bool,
+    recursive: bool,
+    expected: Option<ExpectedContent>,
+) -> VResult<Value> {
+    remove_with_budget(
+        fs,
+        cwd,
+        args,
+        permanent,
+        recursive,
+        expected,
+        OutputBudget::new(),
+    )
 }
 
 fn remove_with_budget(
@@ -59,6 +88,7 @@ fn remove_with_budget(
     args: Vec<Value>,
     permanent: bool,
     recursive: bool,
+    expected: Option<ExpectedContent>,
     mut output_budget: OutputBudget,
 ) -> VResult<Value> {
     if args.is_empty() {
@@ -72,7 +102,7 @@ fn remove_with_budget(
     let primary_session = primary_root
         .as_ref()
         .map(|root| root.join(trash_session_name()));
-    let plans = preflight(
+    let mut plans = preflight(
         fs,
         paths,
         permanent,
@@ -80,6 +110,15 @@ fn remove_with_budget(
         primary_session.as_deref(),
         &mut output_budget,
     )?;
+
+    if let Some(expected) = expected {
+        if !permanent || recursive || plans.len() != 1 || plans[0].is_dir {
+            return Err(ErrorVal::arg_error(
+                "conditional rm requires one ordinary path with --permanent and without --recursive",
+            ));
+        }
+        plans[0].expected_content = Some(expected);
+    }
 
     if permanent {
         permanently_remove(fs, &plans)?;
@@ -216,6 +255,26 @@ fn preflight(
         let adjacent_root = parent.join(adjacent_trash_name());
         if permanent {
             budget.admit_value(&Value::Path(path.clone()))?;
+            let removal_tree = if candidate.is_dir {
+                Some(
+                    fs.open_removal_tree(&candidate.resolved_entry, &candidate.identity)
+                        .map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::FileTooLarge {
+                                ErrorVal::new(
+                                    "builtin_work_limit",
+                                    format!("admit recursive removal: {}: {error}", path.display()),
+                                )
+                                .with_hint(
+                                    "split the tree into smaller permanent-removal operations",
+                                )
+                            } else {
+                                removal_mutation_error("admit recursive removal", &path, error)
+                            }
+                        })?,
+                )
+            } else {
+                None
+            };
             plans.push(RemovalPlan {
                 path,
                 action_path: candidate.resolved_entry,
@@ -224,6 +283,8 @@ fn preflight(
                 entry_name: Some(entry_name),
                 primary_target: None,
                 adjacent_root: Some(adjacent_root),
+                removal_tree,
+                expected_content: None,
             });
             continue;
         }
@@ -263,6 +324,8 @@ fn preflight(
             entry_name: Some(entry_name),
             primary_target,
             adjacent_root: Some(adjacent_root),
+            removal_tree: None,
+            expected_content: None,
         });
     }
     Ok(plans)
@@ -481,7 +544,11 @@ pub(super) fn prune_stale_trash_root(
         {
             continue;
         }
-        if let Err(error) = fs.remove_dir_all(&entry) {
+        let identity = FsEntryIdentity::from_metadata(&metadata);
+        let removal = fs
+            .open_removal_tree(&entry, &identity)
+            .and_then(|tree| tree.remove(&entry));
+        if let Err(error) = removal {
             warnings.push(format!(
                 "cannot prune trash entry {}: {error}",
                 entry.display()
@@ -604,12 +671,125 @@ mod tests {
             vec![Value::Path(first.clone()), Value::Path(second.clone())],
             true,
             false,
+            None,
             OutputBudget::with_limits(1, 4096),
         )
         .unwrap_err();
         assert_eq!(error.code, "builtin_output_limit");
         assert_eq!(std::fs::read(first).unwrap(), b"first");
         assert_eq!(std::fs::read(second).unwrap(), b"second");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn permanent_recursive_remove_cleans_a_healthy_nested_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        std::fs::create_dir_all(victim.join("one/two")).unwrap();
+        std::fs::write(victim.join("root-file"), b"root").unwrap();
+        std::fs::write(victim.join("one/two/leaf"), b"leaf").unwrap();
+
+        let result = remove(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(victim.clone())],
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result, Value::List(vec![Value::Path(victim.clone())]));
+        assert!(!victim.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn permanent_recursive_remove_reports_work_limit_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        let mut nested = victim.clone();
+        for _ in 0..64 {
+            nested.push("d");
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let error = remove(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(victim.clone())],
+            true,
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "builtin_work_limit");
+        assert!(victim.exists());
+        assert!(!root.path().join(adjacent_trash_name()).exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn permanent_recursive_remove_refuses_a_replaced_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        let child = victim.join("child");
+        let admitted_child = root.path().join("admitted-child-moved-by-attacker");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(&child, b"admitted").unwrap();
+        let mut budget = OutputBudget::new();
+        let plans = preflight(&StdFs, vec![victim.clone()], true, true, None, &mut budget).unwrap();
+        let quarantine = plans[0]
+            .adjacent_root
+            .as_ref()
+            .unwrap()
+            .join(trash_session_name())
+            .join(plans[0].entry_name.as_deref().unwrap());
+
+        std::fs::rename(&child, &admitted_child).unwrap();
+        std::fs::write(&child, b"replacement").unwrap();
+        let error = permanently_remove(&StdFs, &plans).unwrap_err();
+
+        assert_eq!(error.code, "rm_path_changed");
+        assert!(!victim.exists(), "top-level entry is atomically contained");
+        assert_eq!(std::fs::read(admitted_child).unwrap(), b"admitted");
+        assert_eq!(
+            std::fs::read(quarantine.join("child")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn permanent_recursive_remove_refuses_a_replaced_descendant_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        let ancestor = victim.join("ancestor");
+        let admitted_ancestor = root.path().join("admitted-ancestor-moved-by-attacker");
+        std::fs::create_dir_all(&ancestor).unwrap();
+        std::fs::write(ancestor.join("leaf"), b"admitted").unwrap();
+        let mut budget = OutputBudget::new();
+        let plans = preflight(&StdFs, vec![victim.clone()], true, true, None, &mut budget).unwrap();
+        let quarantine = plans[0]
+            .adjacent_root
+            .as_ref()
+            .unwrap()
+            .join(trash_session_name())
+            .join(plans[0].entry_name.as_deref().unwrap());
+
+        std::fs::rename(&ancestor, &admitted_ancestor).unwrap();
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::write(ancestor.join("foreign"), b"replacement").unwrap();
+        let error = permanently_remove(&StdFs, &plans).unwrap_err();
+
+        assert_eq!(error.code, "rm_path_changed");
+        assert_eq!(
+            std::fs::read(admitted_ancestor.join("leaf")).unwrap(),
+            b"admitted"
+        );
+        assert_eq!(
+            std::fs::read(quarantine.join("ancestor/foreign")).unwrap(),
+            b"replacement"
+        );
     }
 
     #[test]
@@ -808,6 +988,60 @@ mod tests {
         assert_eq!(std::fs::read(&original).unwrap(), b"expected");
     }
 
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn conditional_permanent_remove_deletes_only_matching_content() {
+        use sha2::Digest as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"expected").unwrap();
+        let expected = ExpectedContent {
+            sha256: format!("{:x}", sha2::Sha256::digest(b"expected")),
+            bytes: 8,
+        };
+
+        remove_expected(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(victim.clone())],
+            true,
+            false,
+            Some(expected),
+        )
+        .unwrap();
+
+        assert!(!victim.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn conditional_permanent_remove_restores_content_drift_instead_of_deleting_it() {
+        use sha2::Digest as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"expected").unwrap();
+        let expected = ExpectedContent {
+            sha256: format!("{:x}", sha2::Sha256::digest(b"expected")),
+            bytes: 8,
+        };
+        let mut budget = OutputBudget::new();
+        let mut plans =
+            preflight(&StdFs, vec![victim.clone()], true, false, None, &mut budget).unwrap();
+        plans[0].expected_content = Some(expected);
+
+        // Preserve the admitted inode while changing its bytes. The guarded
+        // quarantine move succeeds, but post-move content verification must
+        // restore this object instead of unlinking it.
+        std::fs::write(&victim, b"drifted!").unwrap();
+        let error = permanently_remove(&StdFs, &plans).unwrap_err();
+
+        assert_eq!(error.code, "rm_content_changed");
+        assert!(error.msg.contains("entry was restored"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"drifted!");
+    }
+
     #[cfg(unix)]
     #[test]
     fn permanent_remove_refuses_ancestor_replacement_before_deletion() {
@@ -878,8 +1112,12 @@ mod tests {
         let source = include_str!("trash/mutation.rs");
         let execution = source;
         assert!(execution.contains("rename_if_unchanged"));
+        assert!(execution.contains("remove_entry_if_unchanged"));
+        assert!(execution.contains(".removal_tree"));
         assert!(!execution.contains("fs.rename("));
+        assert!(!execution.contains("fs.remove_file(&target)"));
         assert!(!execution.contains("fs.remove_file(&plan.path)"));
         assert!(!execution.contains("fs.remove_dir_all(&plan.path)"));
+        assert!(!execution.contains("fs.remove_dir_all("));
     }
 }

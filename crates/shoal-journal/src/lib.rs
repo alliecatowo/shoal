@@ -57,7 +57,9 @@ mod tests;
 mod transcript;
 mod undo;
 
-pub use cas::{Cas, JournalOptions, OutputMeta, OutputRow};
+pub use cas::{
+    CAS_MATERIALIZE_MAX_BYTES, Cas, CasReadError, JournalOptions, OutputMeta, OutputRow,
+};
 pub use gc::{GcBlob, GcOptions, GcReport};
 pub use lease::PinLease;
 pub use query::{DurableEventSeed, EntryRow, JournalQuery};
