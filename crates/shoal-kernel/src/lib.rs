@@ -370,7 +370,15 @@ impl Kernel {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let listener = UnixListener::bind(path)?;
+        // Bind under a restrictive umask so the socket is never reachable with
+        // looser permissions, even briefly before the chmod below.
+        let listener = {
+            // SAFETY: umask only swaps the process file-mode mask.
+            let previous = unsafe { libc::umask(0o177) };
+            let bound = UnixListener::bind(path);
+            unsafe { libc::umask(previous) };
+            bound?
+        };
         let _socket_guard = BoundSocket(path.to_path_buf());
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
@@ -387,7 +395,10 @@ impl Kernel {
                     // per-connection reads in `handle_stream` block as intended
                     // on every platform, instead of racing the client's next
                     // write and getting a transient `WouldBlock` misread as EOF.
-                    stream.set_nonblocking(false)?;
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("shoal-kernel: dropping connection: {error}");
+                        continue;
+                    }
                     if kernel.require_peer_uid.load(Ordering::SeqCst)
                         && let Err(error) = peer::require_matching_effective_uid(&stream)
                     {
@@ -402,16 +413,27 @@ impl Kernel {
                             continue;
                         }
                     };
-                    std::thread::Builder::new()
+                    if let Err(error) = std::thread::Builder::new()
                         .name("shoal-kernel-connection".into())
                         .spawn(move || {
                             let _slot = slot;
                             let _ =
                                 kernel.handle_stream_with_trust(stream, ConnectionTrust::Public);
-                        })?;
+                        })
+                    {
+                        // Out of threads: shed this connection, keep serving.
+                        eprintln!("shoal-kernel: cannot spawn connection thread: {error}");
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                Err(error) if is_transient_accept_error(&error) => {
+                    // A peer that vanished mid-handshake or temporary fd
+                    // exhaustion must not take every session down with it.
+                    eprintln!("shoal-kernel: transient accept error: {error}");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(error) => return Err(error),
             }
@@ -660,6 +682,21 @@ fn now_ns() -> i64 {
 fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
 }
+/// Accept failures the listener survives: aborted handshakes, signals, and
+/// fd/memory pressure that clears on its own.
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::OutOfMemory
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EPROTO)
+    )
+}
+
 fn permissive_policy() -> Policy {
     Policy::permissive(&principal())
 }
