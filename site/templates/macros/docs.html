@@ -82,11 +82,13 @@
       <small>{{ group_count }} chapter{% if group_count != 1 %}s{% endif %}</small>
     </div>
     <div class="guide-rows">
+      {% set_global guide_row = 0 %}
       {% for guide in section.pages %}
         {% set guide_group = guide.extra.group | default(value="Guides") %}
         {% if group == "*" or guide_group == group %}
+        {% set_global guide_row = guide_row + 1 %}
         <a href="{{ guide.permalink }}">
-          <span class="guide-number">{% if loop.index < 10 %}0{% endif %}{{ loop.index }}</span>
+          <span class="guide-number">{% if guide_row < 10 %}0{% endif %}{{ guide_row }}</span>
           <span class="guide-copy"><strong>{{ guide.title }}</strong>{% if guide.description %}<small>{{ guide.description }}</small>{% endif %}</span>
           <span class="guide-arrow" aria-hidden="true">→</span>
         </a>
