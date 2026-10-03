@@ -51,6 +51,7 @@ impl Kernel {
             let evaluator = session.lock_evaluator()?;
             (evaluator.cwd().to_path_buf(), evaluator.env_vars().to_vec())
         };
+        self.policy.filter_child_env(&actor, &mut env);
         for (k, v) in &p.env {
             let key = OsString::from(k);
             env.retain(|(ek, _)| ek != &key);

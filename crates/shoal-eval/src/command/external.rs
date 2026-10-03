@@ -89,6 +89,12 @@ impl Evaluator {
             ProcessMode::Redirected(position) => (position, true, false),
         };
         let mut env = self.exec.shell.process_env.clone();
+        // A scoped principal's children must not inherit variables its
+        // `env_read` grant denies (the daemon's own env can hold tokens).
+        // Explicit `NAME=value` prefixes below are the principal's own input.
+        if let Some((policy, principal)) = self.session.leash.as_ref() {
+            policy.filter_child_env(principal, &mut env);
+        }
         for p in prefixes {
             let v = self.cmd_arg_value(&p.value)?;
             let s = match v {
