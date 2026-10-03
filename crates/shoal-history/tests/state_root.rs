@@ -1,5 +1,12 @@
 use std::process::Command;
 
+/// Project config only applies once trusted; trust it in a per-test store.
+fn trusted(dir: &std::path::Path) -> std::path::PathBuf {
+    let store = dir.join("trust-store");
+    shoal_config::trust::trust_in(&store, &dir.join(".shoal.toml")).unwrap();
+    store
+}
+
 fn history() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shoal-history"))
 }
@@ -15,8 +22,10 @@ fn layered_relative_state_dir_targets_the_project_journal() {
     )
     .unwrap();
 
+    let store = trusted(dir.path());
     let output = history()
         .current_dir(dir.path())
+        .env("SHOAL_TRUST_DIR", &store)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", dir.path().join("fallback-state"))
         .arg("status")
@@ -58,8 +67,10 @@ fn malformed_config_never_silently_opens_the_fallback() {
     let fallback = dir.path().join("fallback-state");
     std::fs::write(dir.path().join(".shoal.toml"), "[journal]\nstate_dir = 5\n").unwrap();
 
+    let store = trusted(dir.path());
     let output = history()
         .current_dir(dir.path())
+        .env("SHOAL_TRUST_DIR", &store)
         .env("XDG_CONFIG_HOME", dir.path().join("config-home"))
         .env("XDG_STATE_HOME", &fallback)
         .arg("status")

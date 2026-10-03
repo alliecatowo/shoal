@@ -13,10 +13,11 @@ use crate::prompt;
 #[path = "args/completions.rs"]
 mod completions;
 
-pub(crate) const USAGE: &str = "Shoal language and interactive shell\n\nUsage: shoal [OPTIONS] [SCRIPT [ARGS...]]\n       shoal <COMMAND> [ARGS...]\n\nOptions:\n  -c, --command SOURCE  Evaluate source\n  --standalone          Run in-process without kernel protocol\n  -h, --help            Print help\n  -V, --version         Print version\n\nCommands:\n  kernel      Manage the resident kernel\n  fmt         Format .shl source\n  doctor      Diagnose the installation\n  lsp         Run the language server\n  mcp         Run the MCP server\n  completions Generate shell completions\n  prompt      Inspect and benchmark the prompt";
+pub(crate) const USAGE: &str = "Shoal language and interactive shell\n\nUsage: shoal [OPTIONS] [SCRIPT [ARGS...]]\n       shoal <COMMAND> [ARGS...]\n\nOptions:\n  -c, --command SOURCE  Evaluate source\n  --standalone          Run in-process without kernel protocol\n  -h, --help            Print help\n  -V, --version         Print version\n\nCommands:\n  kernel      Manage the resident kernel\n  fmt         Format .shl source\n  doctor      Diagnose the installation\n  trust       Trust (or --revoke) this project's .shoal.toml\n  lsp         Run the language server\n  mcp         Run the MCP server\n  completions Generate shell completions\n  prompt      Inspect and benchmark the prompt";
 pub(crate) const FMT_USAGE: &str = "Format Shoal source\n\nUsage: shoal fmt [--check] [FILE...]\n\nWith no files, reads standard input.";
 pub(crate) const DOCTOR_USAGE: &str =
     "Diagnose the Shoal installation\n\nUsage: shoal doctor [--json]";
+pub(crate) const TRUST_USAGE: &str = "Trust the nearest project .shoal.toml\n\nUsage: shoal trust [--status|--revoke]\n\nA project .shoal.toml can run init files, set PATH and load plugins, so it is ignored until you trust that exact file. Editing it revokes trust.";
 pub(crate) const KERNEL_USAGE: &str =
     "Manage the resident kernel\n\nUsage: shoal kernel <start|status|stop> [--json]";
 pub(crate) const LSP_USAGE: &str = "Run the language server\n\nUsage: shoal lsp";
@@ -24,6 +25,13 @@ pub(crate) const MCP_USAGE: &str = "Run the MCP server\n\nUsage: shoal mcp";
 pub(crate) const COMPLETIONS_USAGE: &str =
     "Generate shell completions\n\nUsage: shoal completions <bash|zsh|fish>";
 pub(crate) const PROMPT_USAGE: &str = "Inspect and benchmark the prompt\n\nUsage: shoal prompt <explain|print|bench> [--side SIDE] [--n N]\n\nSIDE is left, right, continuation, or transient.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustAction {
+    Trust,
+    Status,
+    Revoke,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KernelAction {
@@ -41,6 +49,7 @@ pub(crate) enum Action {
     Version,
     Fmt { check: bool, files: Vec<PathBuf> },
     Doctor { json: bool },
+    Trust(TrustAction),
     Kernel(KernelAction),
     Companion(&'static str),
     Completions(String),
@@ -96,6 +105,26 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
             Ok(Action::Doctor {
                 json: !args.is_empty(),
             })
+        }
+        Some("trust") => {
+            let args = iter
+                .map(|a| {
+                    a.into_string()
+                        .map_err(|_| "trust arguments must be UTF-8".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            match args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["-h"] | ["--help"] => Ok(Action::Help(TRUST_USAGE)),
+                [] => Ok(Action::Trust(TrustAction::Trust)),
+                ["--status"] => Ok(Action::Trust(TrustAction::Status)),
+                ["--revoke"] => Ok(Action::Trust(TrustAction::Revoke)),
+                _ => Err("trust accepts only --status or --revoke".into()),
+            }
         }
         Some("kernel") => {
             let args = iter
@@ -232,6 +261,43 @@ pub(crate) fn run_companion(name: &str) -> Result<i32, String> {
 }
 pub(crate) fn completion_script(shell: &str) -> Result<String, String> {
     completions::generate(shell)
+}
+
+/// `shoal trust [--status|--revoke]`: manage trust for the nearest project
+/// `.shoal.toml` (see `shoal_config::trust`).
+pub(crate) fn trust_command(action: TrustAction) -> Result<i32, String> {
+    use shoal_config::trust::{self, TrustState};
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
+    let Some(config) = shoal_config::find_project_config(&cwd) else {
+        println!("no .shoal.toml found above {}", cwd.display());
+        return Ok(1);
+    };
+    let dir = trust::trust_dir().ok_or("cannot locate the trust store (no HOME/XDG_DATA_HOME)")?;
+    match action {
+        TrustAction::Status => {
+            let state = trust::trust_state_in(&dir, &config);
+            println!("{}: {state:?}", config.display());
+            Ok(if state == TrustState::Trusted { 0 } else { 1 })
+        }
+        TrustAction::Trust => {
+            let path = trust::trust_in(&dir, &config).map_err(|e| format!("trust: {e}"))?;
+            println!("trusted {}", path.display());
+            Ok(0)
+        }
+        TrustAction::Revoke => {
+            let removed = trust::untrust_in(&dir, &config).map_err(|e| format!("untrust: {e}"))?;
+            println!(
+                "{} {}",
+                if removed {
+                    "revoked trust for"
+                } else {
+                    "was not trusted:"
+                },
+                config.display()
+            );
+            Ok(0)
+        }
+    }
 }
 
 #[cfg(test)]

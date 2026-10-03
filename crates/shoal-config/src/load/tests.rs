@@ -11,6 +11,7 @@ fn opts(
         system,
         user,
         project,
+        untrusted_project: None,
         env: env
             .into_iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -598,4 +599,59 @@ hermetic = false
     let text = toml::to_string(&l.config).unwrap();
     let back: Config = toml::from_str(&text).unwrap();
     assert_eq!(back, l.config);
+}
+
+#[test]
+fn trust_is_bound_to_path_and_contents() {
+    use crate::trust::{TrustState, trust_in, trust_state_in, untrust_in};
+    let store = tempfile::tempdir().unwrap();
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join(".shoal.toml");
+    fs::write(&cfg, "[env]\nPATH='./bin'\n").unwrap();
+    assert_eq!(trust_state_in(store.path(), &cfg), TrustState::Untrusted);
+    trust_in(store.path(), &cfg).unwrap();
+    assert_eq!(trust_state_in(store.path(), &cfg), TrustState::Trusted);
+    fs::write(&cfg, "[env]\nPATH='./evil'\n").unwrap();
+    assert_eq!(trust_state_in(store.path(), &cfg), TrustState::Changed);
+    trust_in(store.path(), &cfg).unwrap();
+    assert!(untrust_in(store.path(), &cfg).unwrap());
+    assert_eq!(trust_state_in(store.path(), &cfg), TrustState::Untrusted);
+}
+
+#[test]
+fn untrusted_project_is_skipped_with_one_warning() {
+    // Regression (audit C2): discover() used to apply any `.shoal.toml`.
+    let store = tempfile::tempdir().unwrap();
+    let t = tempfile::tempdir().unwrap();
+    fs::write(
+        t.path().join(".shoal.toml"),
+        "[env]\nPATH='./bin:/usr/bin'\n",
+    )
+    .unwrap();
+    // SAFETY: only this test touches SHOAL_TRUST_DIR in this process.
+    unsafe { std::env::set_var("SHOAL_TRUST_DIR", store.path()) };
+    let o = LoadOptions::discover(t.path());
+    assert!(o.project.is_none());
+    let loaded = load(&LoadOptions {
+        system: None,
+        user: None,
+        ..o
+    })
+    .unwrap();
+    assert!(loaded.sources.is_empty());
+    assert!(loaded.config.env.is_empty(), "{:?}", loaded.config.env);
+    assert_eq!(loaded.warnings.len(), 1);
+    assert!(loaded.warnings[0].contains("shoal trust"));
+
+    crate::trust::trust_in(store.path(), &t.path().join(".shoal.toml")).unwrap();
+    let o = LoadOptions::discover(t.path());
+    let loaded = load(&LoadOptions {
+        system: None,
+        user: None,
+        ..o
+    })
+    .unwrap();
+    assert_eq!(loaded.sources.len(), 1);
+    assert!(loaded.warnings.is_empty());
+    unsafe { std::env::remove_var("SHOAL_TRUST_DIR") };
 }

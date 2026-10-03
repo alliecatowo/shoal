@@ -78,6 +78,8 @@ override is capped at 64 KiB before it is copied into the merged TOML tree.
 | 4 | environment | explicit static `SHOAL_*` table | only recognized names participate |
 | 5 | color veto | presence of `NO_COLOR` | forces `render.color = false` |
 
+The project layer is applied only after `shoal trust` has recorded the blake3 hash of that exact file (keyed by its canonical path, stored under `$SHOAL_TRUST_DIR`, else `$XDG_DATA_HOME/shoal/trust`). An untrusted or since-edited project file is ignored with a one-line notice. `shoal trust --status` and `shoal trust --revoke` inspect and remove trust.
+
 Project discovery stops at the **first** matching ancestor. It does not combine every ancestor
 `.shoal.toml`, and it does not stop at a Git root or home-directory boundary. For a working
 directory `/a/b/c`, the search is `/a/b/c/.shoal.toml`, `/a/b/.shoal.toml`,

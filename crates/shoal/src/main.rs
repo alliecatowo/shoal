@@ -137,6 +137,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             }
             Ok(report.exit_code())
         }
+        Action::Trust(action) => args::trust_command(action),
         Action::Kernel(action) => kernel_cli::run(action),
         Action::Companion(name) => args::run_companion(name),
         Action::Completions(shell) => {
