@@ -150,6 +150,7 @@ fn embedded_fd_is_private_trust_without_a_public_listener() {
 
 /// Regression (audit H1/H2): the kernel's end of the REPL channel (fd 3) leaked
 /// into every command the shell ran.
+#[cfg(target_os = "linux")] // lists /proc/self/fd
 #[test]
 fn embedded_transport_fd_is_not_inherited_by_children() {
     let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
