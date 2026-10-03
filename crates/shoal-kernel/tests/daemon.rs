@@ -148,6 +148,45 @@ fn embedded_fd_is_private_trust_without_a_public_listener() {
     assert!(!expected_socket.exists());
 }
 
+/// Regression (audit H1/H2): the kernel's end of the REPL channel (fd 3) leaked
+/// into every command the shell ran.
+#[cfg(target_os = "linux")] // lists /proc/self/fd
+#[test]
+fn embedded_transport_fd_is_not_inherited_by_children() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let (mut child, mut private, _stderr) =
+        spawn_embedded_kernel(temp.path(), &state, &runtime, None, "cloexec");
+    let mut reader = BufReader::new(private.try_clone().unwrap());
+    attach_embedded(&mut private, &mut reader, 1, "embedded");
+    write_frame(
+        &mut private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "exec".into(),
+            params: serde_json::json!({
+                "src":"run(\"ls\", \"/proc/self/fd\").out",
+                "position":"value"
+            }),
+        },
+    )
+    .unwrap();
+    let listing = serde_json::to_string(&recv(&mut reader).result.unwrap()["value"]).unwrap();
+    // `ls` itself opens the directory fd; the socket on fd 3 must be gone.
+    assert!(
+        !listing.contains("\\n3\\n") && !listing.contains("\"3\\n"),
+        "{listing}"
+    );
+    drop(private);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn two_private_embedded_kernels_can_share_state_without_contending_on_a_socket() {
     let _serialize = ONLY_ONE_DAEMON_AT_A_TIME

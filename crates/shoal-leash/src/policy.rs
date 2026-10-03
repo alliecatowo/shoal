@@ -174,6 +174,35 @@ impl Policy {
                 .is_some_and(|p| !p.proc_spawn.is_empty())
     }
 
+    /// Whether a child process spawned for `principal` may inherit the
+    /// environment variable `name`. The `env_read` grant governs `env.X`
+    /// reads, so it must also govern what a spawned child can read: a fixed set
+    /// of harmless base variables is always inherited, everything else needs an
+    /// `env_read` grant (or `*`). Unknown principals and a quarantined policy
+    /// get only the base set.
+    pub fn child_env_allows(&self, principal: &str, name: &str) -> bool {
+        if SAFE_CHILD_ENV.contains(&name) || name.starts_with("LC_") {
+            return true;
+        }
+        if self.fail_closed {
+            return false;
+        }
+        self.principal(principal)
+            .is_some_and(|p| p.env_read.iter().any(|g| g == "*" || g == name))
+    }
+
+    /// Drop every variable from `env` that [`Policy::child_env_allows`] refuses.
+    pub fn filter_child_env(
+        &self,
+        principal: &str,
+        env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) {
+        env.retain(|(k, _)| {
+            k.to_str()
+                .is_some_and(|name| self.child_env_allows(principal, name))
+        });
+    }
+
     /// Whether this principal asks Leash to restrict filesystem access.
     /// This intentionally remains true when every configured root is missing:
     /// a hermetic typo must be distinguishable from an unrestricted policy so
@@ -737,6 +766,24 @@ auto_apply = 'in-grant'\n\
 time = true\n\
 session_write = true\n\
 journal_read = true\n";
+
+/// Variables every child may inherit regardless of `env_read`: process
+/// plumbing and locale, never credentials.
+const SAFE_CHILD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "COLORTERM",
+    "TZ",
+    "TMPDIR",
+    "PWD",
+    "NO_COLOR",
+];
 
 fn names_verdict(names: &[String], grants: &[String]) -> Verdict {
     bool_verdict(
