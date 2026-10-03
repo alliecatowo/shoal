@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use reedline::ExternalPrinter;
 use shoal_prompt::{PromptContext, Renderer};
+use std::sync::mpsc::SyncSender;
 
 use crate::maybe_strip;
 
@@ -9,12 +9,12 @@ use crate::maybe_strip;
 /// renders through Reedline's bounded, nonblocking notice queue.
 pub(crate) struct PromptBudgetWarnings {
     renderer: Arc<Renderer>,
-    printer: ExternalPrinter<String>,
+    printer: SyncSender<String>,
     suppressed: usize,
 }
 
 impl PromptBudgetWarnings {
-    pub(crate) fn new(renderer: Arc<Renderer>, printer: ExternalPrinter<String>) -> Self {
+    pub(crate) fn new(renderer: Arc<Renderer>, printer: SyncSender<String>) -> Self {
         Self {
             renderer,
             printer,
@@ -40,7 +40,7 @@ impl PromptBudgetWarnings {
             report.slowest.as_micros(),
             self.renderer.config().budget.render_deadline_ms,
         ));
-        if self.printer.sender().try_send(warning).is_ok() {
+        if self.printer.try_send(warning).is_ok() {
             self.suppressed = 0;
         } else {
             self.suppressed = self.suppressed.saturating_add(1);
@@ -51,6 +51,7 @@ impl PromptBudgetWarnings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reedline::ExternalPrinter;
 
     fn reporter(capacity: usize, warn: bool) -> (PromptBudgetWarnings, ExternalPrinter<String>) {
         let mut config = shoal_prompt::PromptConfig::default();
@@ -59,7 +60,7 @@ mod tests {
         let (renderer, _) = Renderer::new(config);
         let printer = ExternalPrinter::new(capacity);
         (
-            PromptBudgetWarnings::new(Arc::new(renderer), printer.clone()),
+            PromptBudgetWarnings::new(Arc::new(renderer), printer.sender()),
             printer,
         )
     }

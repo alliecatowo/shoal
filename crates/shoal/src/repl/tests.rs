@@ -319,7 +319,7 @@ fn background_notices_use_a_bounded_nonblocking_reedline_queue() {
         omitted_output_bytes: 0,
         notified: false,
     };
-    enqueue_background_notice(&printer, &mut first);
+    enqueue_background_notice(&printer.sender(), &mut first);
     assert!(first.notified());
     assert!(printer.get_line().unwrap().contains("[7]+  Done"));
 
@@ -332,7 +332,7 @@ fn background_notices_use_a_bounded_nonblocking_reedline_queue() {
         omitted_output_bytes: 0,
         notified: false,
     };
-    enqueue_background_notice(&printer, &mut second);
+    enqueue_background_notice(&printer.sender(), &mut second);
     assert!(!second.notified());
 }
 
@@ -398,7 +398,7 @@ fn blocked_background_transition_producer_wakes_when_repl_receiver_drops() {
 #[test]
 fn background_output_is_line_bounded_and_terminal_control_safe() {
     let printer = ExternalPrinter::new(4);
-    let mut output = BackgroundOutputState::new(12, printer.clone());
+    let mut output = BackgroundOutputState::new(12, printer.sender());
     output.push(b"safe\x1b[2Jtext\r\n");
     assert_eq!(output.finish(), 0);
     let line = printer.get_line().unwrap();
@@ -412,7 +412,7 @@ fn background_output_is_line_bounded_and_terminal_control_safe() {
 fn background_output_queue_saturation_is_counted_for_the_terminal_notice() {
     let printer = ExternalPrinter::new(1);
     printer.sender().try_send("occupied".into()).unwrap();
-    let mut output = BackgroundOutputState::new(13, printer);
+    let mut output = BackgroundOutputState::new(13, printer.sender());
     output.push(b"dropped line\n");
     assert_eq!(output.finish(), b"dropped line\n".len());
 }
@@ -436,7 +436,7 @@ fn returned_taskvals_emit_one_async_completion_notice() {
         &mut watched,
         &suppressed,
         &tx,
-        &printer,
+        &printer.sender(),
     );
     let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(matches!(
@@ -452,7 +452,7 @@ fn returned_taskvals_emit_one_async_completion_notice() {
         &mut watched,
         &suppressed,
         &tx,
-        &printer,
+        &printer.sender(),
     );
     assert!(rx.try_recv().is_err(), "a task is watched exactly once");
 }
@@ -471,7 +471,7 @@ fn task_awaited_in_the_submitted_line_does_not_emit_a_background_notice() {
         &mut BTreeSet::new(),
         &Arc::new(Mutex::new(BTreeSet::new())),
         &tx,
-        &printer,
+        &printer.sender(),
     );
     assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
     assert!(printer.get_line().is_none());
@@ -503,7 +503,7 @@ fn failed_task_watcher_launch_retires_mirror_and_warns_for_retry() {
         Err(std::io::Error::other("thread quota reached")),
         77,
         &mut watched,
-        &printer,
+        &printer.sender(),
     );
     assert!(!watched.contains(&77));
     let warning = printer.get_line().unwrap();

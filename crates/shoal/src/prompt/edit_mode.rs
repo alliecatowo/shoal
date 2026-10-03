@@ -14,7 +14,10 @@ impl EditModeTracker {
             PromptEditMode::Vi(PromptViMode::Normal) => 1,
             PromptEditMode::Vi(PromptViMode::Insert) => 2,
             PromptEditMode::Vi(PromptViMode::Visual) => 3,
-            PromptEditMode::Default | PromptEditMode::Emacs | PromptEditMode::Custom(_) => 0,
+            PromptEditMode::Default
+            | PromptEditMode::Emacs
+            | PromptEditMode::Helix(_)
+            | PromptEditMode::Custom(_) => 0,
         };
         self.0.store(encoded, Ordering::Release);
     }

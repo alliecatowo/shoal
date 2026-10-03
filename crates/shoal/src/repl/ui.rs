@@ -1,6 +1,7 @@
 //! Reedline, completion, prompt, history, and paging assembly.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -37,7 +38,7 @@ impl ReplUi {
         adapter_names: Vec<String>,
         cwd_cell: Arc<Mutex<PathBuf>>,
         completion_path_dirs: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    ) -> (Self, ExternalPrinter<String>) {
+    ) -> (Self, SyncSender<String>) {
         let completer =
             ShoalCompleter::new(evaluator.env().clone(), cwd_cell, catalogs, adapter_names)
                 .with_path_dirs(completion_path_dirs)
@@ -74,9 +75,12 @@ impl ReplUi {
             false,
         );
 
-        let background_printer = ExternalPrinter::new(64);
+        // Reedline owns the printer (it is no longer `Clone`); everything else prints through
+        // clones of its sender.
+        let printer = ExternalPrinter::new(64);
+        let background_printer = printer.sender();
         let mut editor = Reedline::create()
-            .with_external_printer(background_printer.clone())
+            .with_external_printer(printer)
             .with_poll_interval(Duration::from_millis(50))
             .use_bracketed_paste(config.editor.bracketed_paste)
             .with_validator(Box::new(ShoalValidator))
