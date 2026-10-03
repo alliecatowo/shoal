@@ -2372,7 +2372,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shoal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "libc",
@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-adapters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-ast"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-auth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blake3",
@@ -2432,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-doctor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -2455,7 +2455,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-eval"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "csv",
  "glob",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-exec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-history"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-journal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "criterion",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-kernel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "blake3",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-leash"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "glob",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "shoal-syntax",
  "tokio",
@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde_json",
@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-picker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "shoal-value",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-prompt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "serde",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "proptest",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-reef"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "libc",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-secret"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -2628,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-syntax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "pretty_assertions",
@@ -2639,7 +2639,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-value"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "glob",
@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "shoal-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "tempfile",
