@@ -37,8 +37,7 @@ use shoal_value::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -370,9 +369,8 @@ impl Kernel {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let listener = UnixListener::bind(path)?;
+        let listener = bind_private_socket(path)?;
         let _socket_guard = BoundSocket(path.to_path_buf());
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         while !stop.load(Ordering::SeqCst) && !self.shutdown_requested.load(Ordering::SeqCst) {
             let kernel = self.clone();
@@ -387,7 +385,10 @@ impl Kernel {
                     // per-connection reads in `handle_stream` block as intended
                     // on every platform, instead of racing the client's next
                     // write and getting a transient `WouldBlock` misread as EOF.
-                    stream.set_nonblocking(false)?;
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("shoal-kernel: dropping connection: {error}");
+                        continue;
+                    }
                     if kernel.require_peer_uid.load(Ordering::SeqCst)
                         && let Err(error) = peer::require_matching_effective_uid(&stream)
                     {
@@ -402,16 +403,27 @@ impl Kernel {
                             continue;
                         }
                     };
-                    std::thread::Builder::new()
+                    if let Err(error) = std::thread::Builder::new()
                         .name("shoal-kernel-connection".into())
                         .spawn(move || {
                             let _slot = slot;
                             let _ =
                                 kernel.handle_stream_with_trust(stream, ConnectionTrust::Public);
-                        })?;
+                        })
+                    {
+                        // Out of threads: shed this connection, keep serving.
+                        eprintln!("shoal-kernel: cannot spawn connection thread: {error}");
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                Err(error) if is_transient_accept_error(&error) => {
+                    // A peer that vanished mid-handshake or temporary fd
+                    // exhaustion must not take every session down with it.
+                    eprintln!("shoal-kernel: transient accept error: {error}");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(error) => return Err(error),
             }
