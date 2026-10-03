@@ -135,12 +135,9 @@ impl Completer for ShoalCompleter {
     }
 }
 
-/// Scan adapter config directories for `[cmd.<name>]` table keys — just the
-/// name enumeration `AdapterCatalog` doesn't expose publicly (see
-/// api_changes); flag/subcommand data still goes through the real
-/// `AdapterCatalog::load_dir` + `lookup`.
-pub fn scan_adapter_names(dirs: &[PathBuf]) -> Vec<String> {
-    adapter_names(dirs)
+/// Names of every adapter command across the loaded catalogs (bundled first).
+pub fn adapter_names_from(catalogs: &[AdapterCatalog]) -> Vec<String> {
+    adapter_names(catalogs)
 }
 
 #[cfg(test)]

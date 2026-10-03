@@ -54,7 +54,7 @@ pub(crate) fn read_manifest(path: &Path) -> Result<String, String> {
     Ok(source)
 }
 
-fn validate_source(source: &str) -> Result<(), String> {
+pub(crate) fn validate_source(source: &str) -> Result<(), String> {
     let mut depth = 0usize;
     let mut quote = None;
     let mut escaped = false;

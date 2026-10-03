@@ -712,8 +712,7 @@ impl Evaluator {
     }
 
     pub fn load_bundled_adapters(&mut self) -> Vec<String> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
-        let (catalog, warnings) = AdapterCatalog::load_dir(&root);
+        let (catalog, warnings) = AdapterCatalog::load_bundled();
         Arc::make_mut(&mut self.host).adapters = catalog;
         warnings
     }

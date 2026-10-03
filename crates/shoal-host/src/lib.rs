@@ -142,18 +142,22 @@ impl SessionBootstrap {
     }
 }
 
-pub fn bundled_adapter_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters")
-}
-
+/// Configured adapter directories, in precedence order. The bundled catalog is compiled into
+/// the binary ([`AdapterCatalog::load_bundled`]) and always loads first.
 pub fn adapter_dirs(config: &Config) -> Vec<PathBuf> {
-    std::iter::once(bundled_adapter_dir())
-        .chain(config.adapters.dirs.iter().cloned())
-        .collect()
+    config.adapters.dirs.clone()
 }
 
 fn load_adapters(evaluator: &mut Evaluator, config: &Config, report: &mut BootstrapReport) {
     let mut active = AdapterCatalog::empty();
+    let (bundled, bundled_warnings) = AdapterCatalog::load_bundled();
+    report.warnings.extend(
+        bundled_warnings
+            .into_iter()
+            .map(|warning| format!("adapter: {warning}")),
+    );
+    active.overlay(&bundled);
+    report.adapter_catalogs.push(bundled);
     for dir in adapter_dirs(config) {
         let (catalog, warnings) = AdapterCatalog::load_dir(&dir);
         report.warnings.extend(

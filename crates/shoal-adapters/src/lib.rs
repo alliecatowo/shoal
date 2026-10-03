@@ -33,6 +33,9 @@ use std::fs;
 use std::path::Path;
 
 mod catalog_input;
+mod bundled {
+    include!(concat!(env!("OUT_DIR"), "/bundled_adapters.rs"));
+}
 mod output;
 
 pub use catalog_input::{
@@ -123,7 +126,6 @@ impl AdapterCatalog {
     /// Load all TOML files in a directory. A malformed file or command becomes a
     /// warning; valid siblings remain available.
     pub fn load_dir(dir: &Path) -> (Self, Vec<String>) {
-        let mut catalog = Self::empty();
         let mut warnings = Vec::new();
         let mut paths = match catalog_input::manifest_paths(dir) {
             Ok((paths, omitted)) => {
@@ -138,31 +140,56 @@ impl AdapterCatalog {
             }
             Err(e) => {
                 warnings.push(format!("{}: {e}", dir.display()));
-                return (catalog, warnings);
+                return (Self::empty(), warnings);
             }
         };
         paths.sort();
-        for path in paths {
-            let src = match catalog_input::read_manifest(&path) {
+        let sources = paths.into_iter().map(|path| {
+            let src = catalog_input::read_manifest(&path);
+            (path.display().to_string(), src)
+        });
+        let catalog = Self::from_sources(sources, &mut warnings);
+        (catalog, warnings)
+    }
+
+    /// The adapters shipped with Shoal, compiled into the binary from the repository's
+    /// `adapters/` directory so an installed `shoal` needs no files beside it.
+    pub fn load_bundled() -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        let sources = bundled::MANIFESTS.iter().map(|(name, src)| {
+            let checked = catalog_input::validate_source(src).map(|()| (*src).to_owned());
+            (format!("bundled:{name}"), checked)
+        });
+        let catalog = Self::from_sources(sources, &mut warnings);
+        (catalog, warnings)
+    }
+
+    fn from_sources(
+        sources: impl IntoIterator<Item = (String, Result<String, String>)>,
+        warnings: &mut Vec<String>,
+    ) -> Self {
+        let mut catalog = Self::empty();
+        for (label, src) in sources {
+            let src = match src {
                 Ok(s) => s,
                 Err(e) => {
-                    warnings.push(format!("{}: {e}", path.display()));
+                    warnings.push(format!("{label}: {e}"));
                     continue;
                 }
             };
             let doc: toml::Value = match toml::from_str(&src) {
                 Ok(v) => v,
                 Err(e) => {
-                    warnings.push(format!("{}: {e}", path.display()));
+                    warnings.push(format!("{label}: {e}"));
                     continue;
                 }
             };
             if let Err(error) = catalog_input::validate_document(&doc) {
-                warnings.push(format!("{}: {error}", path.display()));
+                warnings.push(format!("{label}: {error}"));
                 continue;
             }
             let Some(cmds) = doc.get("cmd").and_then(toml::Value::as_table) else {
-                warnings.push(format!("{}: missing [cmd.<name>] table", path.display()));
+                warnings.push(format!("{label}: missing [cmd.<name>] table"));
                 continue;
             };
             for (name, raw) in cmds {
@@ -170,8 +197,7 @@ impl AdapterCatalog {
                     && catalog.cmds.len() >= MAX_ADAPTER_CATALOG_COMMANDS
                 {
                     warnings.push(format!(
-                        "{}: cmd.{name}: catalog command limit reached ({MAX_ADAPTER_CATALOG_COMMANDS})",
-                        path.display()
+                        "{label}: cmd.{name}: catalog command limit reached ({MAX_ADAPTER_CATALOG_COMMANDS})"
                     ));
                     continue;
                 }
@@ -179,16 +205,15 @@ impl AdapterCatalog {
                     Ok(cmd) => {
                         if catalog.cmds.insert(name.clone(), cmd).is_some() {
                             warnings.push(format!(
-                                "{}: duplicate adapter cmd.{name}; later file wins",
-                                path.display()
+                                "{label}: duplicate adapter cmd.{name}; later file wins"
                             ));
                         }
                     }
-                    Err(e) => warnings.push(format!("{}: cmd.{name}: {e}", path.display())),
+                    Err(e) => warnings.push(format!("{label}: cmd.{name}: {e}")),
                 }
             }
         }
-        (catalog, warnings)
+        catalog
     }
 
     pub fn lookup(&self, head: &str) -> Option<&CmdAdapter> {
