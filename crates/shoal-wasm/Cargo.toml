@@ -17,6 +17,6 @@ wasmtime={version="49",default-features=false,features=["component-model","crane
 [dev-dependencies]
 tempfile="3"
 wit-component={version="0.251",features=["dummy-module"]}
-wit-parser="0.251"
+wit-parser="0.258"
 wasmprinter="0.258"
 wat="1"

@@ -2595,7 +2595,7 @@ dependencies = [
  "wasmprinter",
  "wat",
  "wit-component 0.251.0",
- "wit-parser 0.251.0",
+ "wit-parser 0.258.3",
 ]
 
 [[package]]
@@ -2825,7 +2825,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "wit-component 0.251.0",
- "wit-parser 0.251.0",
+ "wit-parser 0.258.3",
 ]
 
 [[package]]
