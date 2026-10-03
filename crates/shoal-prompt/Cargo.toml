@@ -1,6 +1,6 @@
 [package]
 name = "shoal-prompt"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Pure domain crate that renders a shoal prompt from a structured PromptContext snapshot — no IO, no subprocesses."
