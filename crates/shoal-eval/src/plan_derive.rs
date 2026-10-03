@@ -4,14 +4,31 @@
 
 use super::*;
 
-use crate::plan_effects::{parse_declared_effect, push_effect};
+use crate::plan_effects::push_effect;
+
+mod attribution;
+mod commands;
+mod inputs;
+mod statements;
+mod value_effects;
+
+use attribution::{cmd_arg_str_literal, str_literal};
+
+type Functions = std::collections::HashMap<String, Block>;
+type Aliases = std::collections::HashMap<String, CmdCall>;
+
+fn plan_background_registration(call: &CmdCall, out: &mut Vec<Effect>) {
+    if call.background {
+        push_effect(out, Effect::SessionWrite);
+    }
+}
 
 impl Evaluator {
     /// Derive a conservative, concrete plan without spawning or mutating.
     pub fn plan_program(&mut self, program: &Program) -> VResult<Plan> {
         let mut effects = Vec::new();
-        let mut functions = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
+        let mut functions = Functions::new();
+        let mut aliases = Aliases::new();
         for stmt in &program.stmts {
             if let Stmt::Fn { decl } = stmt {
                 functions.insert(decl.name.clone(), decl.body.clone());
@@ -34,48 +51,6 @@ impl Evaluator {
         Ok(Plan::new(effects, reversibility, Estimates::default()))
     }
 
-    pub(crate) fn plan_stmt(
-        &mut self,
-        stmt: &Stmt,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        match stmt {
-            Stmt::Expr { expr, .. } => self.plan_expr(expr, functions, aliases, out, depth),
-            Stmt::Let { init, .. } | Stmt::Assign { value: init, .. } => {
-                self.plan_expr(init, functions, aliases, out, depth)
-            }
-            Stmt::Return {
-                value: Some(expr), ..
-            } => self.plan_expr(expr, functions, aliases, out, depth),
-            Stmt::For { iter, body, .. } => {
-                self.plan_expr(iter, functions, aliases, out, depth)?;
-                self.plan_block(body, functions, aliases, out, depth)
-            }
-            Stmt::While { cond, body, .. } => {
-                self.plan_expr(cond, functions, aliases, out, depth)?;
-                self.plan_block(body, functions, aliases, out, depth)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    pub(crate) fn plan_block(
-        &mut self,
-        block: &Block,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        for stmt in &block.stmts {
-            self.plan_stmt(stmt, functions, aliases, out, depth)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn plan_expr(
         &mut self,
         expr: &Expr,
@@ -90,8 +65,10 @@ impl Evaluator {
                 push_effect(out, Effect::Opaque);
                 Ok(())
             }
-            Expr::Block { block, .. } | Expr::Spawn { body: block, .. } => {
-                self.plan_block(block, functions, aliases, out, depth)
+            Expr::Block { block, .. } => self.plan_block(block, functions, aliases, out, depth),
+            Expr::Spawn { body, .. } => {
+                push_effect(out, Effect::SessionWrite);
+                self.plan_block(body, functions, aliases, out, depth)
             }
             Expr::If {
                 cond, then, r#else, ..
@@ -115,8 +92,10 @@ impl Evaluator {
                 self.plan_expr(lhs, functions, aliases, out, depth)?;
                 self.plan_expr(rhs, functions, aliases, out, depth)
             }
-            Expr::Unary { expr, .. } | Expr::Field { recv: expr, .. } => {
-                self.plan_expr(expr, functions, aliases, out, depth)
+            Expr::Unary { expr, .. } => self.plan_expr(expr, functions, aliases, out, depth),
+            Expr::Field { recv, name, .. } => {
+                self.plan_field_effects(recv, name, out);
+                self.plan_expr(recv, functions, aliases, out, depth)
             }
             Expr::Index { recv, index, .. } => {
                 self.plan_expr(recv, functions, aliases, out, depth)?;
@@ -125,22 +104,14 @@ impl Evaluator {
             Expr::MethodCall {
                 recv, name, args, ..
             } => {
-                // `http.get/post/put/delete(url, …)` declares a `net.connect`
-                // effect for leash + plan (site/content/internals/roadmap-and-priorities.md). The host is parsed from a
-                // literal URL argument; a non-literal URL declares an
-                // unknown-host connect (`*`).
-                if let Expr::Var { name: ns, .. } = &**recv
-                    && ns == "http"
-                    && matches!(name.as_str(), "get" | "post" | "put" | "delete")
-                {
-                    let (host, port) = args
-                        .pos
-                        .first()
-                        .and_then(url_literal)
-                        .map(|u| url_host_port(&u))
-                        .unwrap_or_else(|| ("*".into(), 443));
-                    push_effect(out, Effect::NetConnect { host, port });
+                // `.feed(cmd)` bypasses builtin/adapter dispatch and spawns the
+                // command via run_argv (A9): resolve the command operand as an
+                // external spawn, exactly like the runtime — handled before the
+                // generic traversal so it is not mis-resolved as a builtin.
+                if name == "feed" && args.pos.len() == 1 && args.named.is_empty() {
+                    return self.plan_feed(recv, &args.pos[0], functions, aliases, out, depth);
                 }
+                self.plan_method_effects(recv, name, args, out);
                 self.plan_expr(recv, functions, aliases, out, depth)?;
                 for e in &args.pos {
                     self.plan_expr(e, functions, aliases, out, depth)?;
@@ -150,15 +121,63 @@ impl Evaluator {
                 }
                 Ok(())
             }
-            Expr::FnCall { name, args, .. } => {
+            Expr::FnCall { name, args, span } => {
+                // Arguments always contribute their own effects — including the
+                // bodies of lambda arguments to `parallel`/`retry`/`on`/`map`
+                // (A8), via the `Expr::Lambda` arm.
                 for e in &args.pos {
                     self.plan_expr(e, functions, aliases, out, depth)?;
                 }
                 for n in &args.named {
                     self.plan_expr(&n.value, functions, aliases, out, depth)?;
                 }
-                if let Some(body) = functions.get(name) {
-                    self.plan_block(body, functions, aliases, out, depth + 1)?;
+                if self.plan_constructor_effects(name, args, out) {
+                    return Ok(());
+                }
+                match name.as_str() {
+                    // Effectful builtins invoked as functions (A8).
+                    "run" => self.plan_run_target(args.pos.first().and_then(str_literal), out),
+                    // `save(path, value)` writes the first argument.
+                    "save" => {
+                        let path = args.pos.first().and_then(|a| self.path_literal(a));
+                        self.plan_save(path, out);
+                    }
+                    "open" => {
+                        let path = args.pos.first().and_then(|a| self.path_literal(a));
+                        self.plan_open(path, out);
+                    }
+                    // Clock reads.
+                    "now" | "today" => push_effect(out, Effect::Time),
+                    // Higher-order builtins: their closure bodies are already
+                    // planned above via the Lambda arm; `assert` is pure.
+                    "on" => push_effect(out, Effect::SessionWrite),
+                    "parallel" | "retry" | "assert" => {}
+                    other => {
+                        if let Some(body) = functions.get(other) {
+                            // A function declared in this program: expand it.
+                            self.plan_block(body, functions, aliases, out, depth + 1)?;
+                        } else if self
+                            .exec
+                            .shell
+                            .env
+                            .get(other)
+                            .is_some_and(|v| v.is_callable())
+                        {
+                            // A session-stored closure/function that cannot be
+                            // statically expanded (A5): require approval, never
+                            // report nothing.
+                            push_effect(out, Effect::Opaque);
+                        } else if self.is_command_name(other) {
+                            // A bare name that resolves as a command runs as one
+                            // (defect #5); plan it with command resolution.
+                            self.plan_command_ref(other, *span, functions, aliases, out, depth)?;
+                        } else {
+                            // Not a known pure form, an expandable function, a
+                            // session closure, or a command — cannot be proven
+                            // effect-free (A5/A10).
+                            push_effect(out, Effect::Opaque);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -208,97 +227,44 @@ impl Evaluator {
                 }
                 Ok(())
             }
-            _ => Ok(()),
-        }
-    }
-
-    pub(crate) fn plan_call(
-        &mut self,
-        call: &CmdCall,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        if depth > 64 {
-            return Err(ErrorVal::new(
-                "recursion_limit",
-                "planning function recursion exceeded 64",
-            ));
-        }
-        if let Some(target) = aliases.get(&call.head) {
-            return self.plan_call(target, functions, aliases, out, depth + 1);
-        }
-        if let Some(body) = functions.get(&call.head) {
-            return self.plan_block(body, functions, aliases, out, depth + 1);
-        }
-        if builtins::is_builtin(&call.head)
-            || matches!(call.head.as_str(), "cd" | "pwd" | "j" | "jump")
-        {
-            for effect in self.builtin_effects(call)? {
-                push_effect(out, effect);
-            }
-            return Ok(());
-        }
-        if let Some(adapter) = self.adapters.lookup(&call.head).cloned() {
-            let (spec, start) = match call.args.first() {
-                Some(CmdArg::Word { text, .. }) if adapter.subs.contains_key(text) => {
-                    (adapter.subs[text].clone(), 1)
+            // A lambda's body effects surface wherever the lambda is used — the
+            // higher-order builtins (`parallel`, `map`, …) will invoke it (A8).
+            Expr::Lambda { body, .. } => self.plan_expr(body, functions, aliases, out, depth),
+            Expr::StrInterp { parts, .. } => {
+                for part in parts {
+                    if let StrPart::Expr { expr } = part {
+                        self.plan_expr(expr, functions, aliases, out, depth)?;
+                    }
                 }
-                _ => (adapter.top.clone(), 0),
-            };
-            let bindings = self.plan_bindings(call, &spec, start)?;
-            for declared in &spec.effects {
-                for effect in parse_declared_effect(declared, &bindings, &self.cwd) {
-                    push_effect(out, effect);
-                }
+                Ok(())
             }
-            // Derive a real binary-content hash for the plan (site/content/internals/language-conformance-contract.md): resolve
-            // the adapter's bin and hash it, matching reef/leash's blake3-hex so
-            // the hash a plan renders is the one a `proc_spawn` pin would check.
-            // Falls back to an empty hash when the tool isn't installed/locatable
-            // (name-only matching, as before) — planning never spawns or mutates.
-            let bin_hash = self
-                .hash_resolved_bin(OsStr::new(&adapter.bin))
-                .unwrap_or_default();
-            push_effect(
-                out,
-                Effect::ProcSpawn {
-                    bin_hash,
-                    argv0: adapter.bin,
-                },
-            );
-        } else {
-            push_effect(out, Effect::Opaque);
+            // Provably effect-free atoms: an empty effect set is correct here.
+            // No wildcard arm — a new `Expr` variant must be classified here,
+            // so an effectful form can never silently derive no effects (A10).
+            Expr::Null { .. }
+            | Expr::Bool { .. }
+            | Expr::Int { .. }
+            | Expr::Float { .. }
+            | Expr::Str { .. }
+            | Expr::Size { .. }
+            | Expr::Duration { .. }
+            | Expr::Time { .. }
+            | Expr::DateTime { .. }
+            | Expr::Regex { .. } => Ok(()),
+            Expr::Var { name, .. } => {
+                if let Some(Value::Secret(secret)) = self.exec.shell.env.get(name) {
+                    push_effect(
+                        out,
+                        Effect::SecretUse {
+                            names: vec![secret.name],
+                        },
+                    );
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
-/// The literal string value of an expression, if it is a plain string literal
-/// (for extracting a `net.connect` host from `http.get("https://…")`).
-fn url_literal(e: &Expr) -> Option<String> {
-    match e {
-        Expr::Str { value, .. } => Some(value.clone()),
-        _ => None,
-    }
-}
-
-/// Parse `host` and `port` from a URL for a `net.connect` effect. Defaults to the
-/// scheme port (443 for https, 80 otherwise) when the URL has no explicit port.
-fn url_host_port(url: &str) -> (String, u16) {
-    let default_port = if url.starts_with("https") { 443 } else { 80 };
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    // Strip any userinfo (`user:pass@host`).
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    match host_port.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-            (h.to_string(), p.parse().unwrap_or(default_port))
-        }
-        _ => (host_port.to_string(), default_port),
-    }
-}
+#[cfg(test)]
+mod tests;

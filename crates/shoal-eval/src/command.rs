@@ -3,11 +3,41 @@
 //! adapter argv construction, and the exec-spawning core (`run_argv`).
 
 use super::*;
-use crate::coerce::{coerce_call_args, signature, validate_adapter_value};
+use crate::coerce::{signature, validate_adapter_value};
 use crate::host::builtin_outcome;
+use shoal_syntax::commands::CommandSource;
+
+mod adapter;
+mod capture;
+mod external;
+mod navigation;
+mod redirects;
+mod resolution;
+
+pub(crate) use redirects::PreparedRedirects;
 
 impl Evaluator {
     pub(crate) fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
+        // Parser-authored calls already enforce this, but aliases, plugins and
+        // embedders can construct CmdCall values directly. Validate before
+        // background desugaring, argument evaluation, filesystem mutation, or
+        // process spawn so ambiguous redirects can never partially execute.
+        validate_redirect_shape(call)?;
+        let resolution = self.resolve_command(call);
+        // Builtin help is a canonical, zero-effect dispatch. Resolve first so
+        // an in-session callable named `ls` still wins over the builtin, then
+        // intercept before background desugaring, argument/glob evaluation,
+        // env-prefix handling, redirects, Reef, filesystem, or process ports.
+        if matches!(
+            resolution.source,
+            CommandSource::StructuredBuiltin | CommandSource::SpecialBuiltin
+        ) && call_requests_help(call)
+        {
+            let help = shoal_syntax::commands::builtin_help(&call.head)
+                .expect("every resolved builtin has canonical help metadata");
+            self.emit(&Value::Str(help));
+            return Ok(Value::Null);
+        }
         // Trailing `&` desugars to `spawn { <call> }` (site/content/internals/language-conformance-contract.md): the command
         // runs on a background task and the statement yields a `task` handle
         // instead of running synchronously.
@@ -28,9 +58,11 @@ impl Evaluator {
         }
         // Session callables (fns/aliases) resolve as commands even when `^`-forced
         // (defect #3): `^` bypasses only non-callable let/var shadows.
-        if let Some(bound) = self.env.get(&call.head)
-            && bound.is_callable()
-        {
+        if resolution.source == CommandSource::SessionCallable {
+            let bound = resolution
+                .binding
+                .clone()
+                .expect("callable resolution carries its binding");
             // `deploy --help` synthesises the signature + doc (site/content/internals/language-conformance-contract.md, defect #12).
             if let Value::Closure(c) = &bound
                 && call
@@ -38,7 +70,7 @@ impl Evaluator {
                     .iter()
                     .any(|a| matches!(a, CmdArg::FlagLong { name, .. } if name == "help"))
             {
-                let help = crate::helpers::closure_help(c);
+                let help = crate::helpers::closure_help(c.as_ref());
                 self.emit(&Value::Str(help));
                 return Ok(Value::Null);
             }
@@ -93,46 +125,28 @@ impl Evaluator {
                     // expansion as one list (site/content/internals/language-conformance-contract.md): `showpaths *.txt` binds
                     // every sorted match to `paths: list<path>`, not just the
                     // first. Element type coercion (`path`/`str`/…) applies per
-                    // item; `coerce_call_args` leaves the assembled list intact.
+                    // item at the shared closure-call boundary.
                     CmdArg::Glob { .. } | CmdArg::Word { .. } | CmdArg::Path { .. }
                         if closure_sig
                             .and_then(|(params, _)| params.get(pos.len()))
                             .and_then(|p| p.ty.as_ref())
                             .is_some_and(|t| t.name == "list") =>
                     {
-                        let elem = closure_sig
-                            .and_then(|(params, _)| params.get(pos.len()))
-                            .and_then(|p| p.ty.as_ref())
-                            .and_then(|t| t.args.first())
-                            .map(|t| t.name.clone())
-                            .unwrap_or_else(|| "str".into());
-                        let items = self
-                            .expand_arg(a)?
-                            .into_iter()
-                            .map(|v| crate::coerce::coerce_word(v, &elem))
-                            .collect::<VResult<Vec<_>>>()?;
+                        let items = self.expand_arg(a)?;
                         pos.push(Value::List(items));
                     }
                     _ => pos.extend(self.expand_arg(a)?),
                 }
                 i += 1;
             }
-            // Coerce CMD words to the callee's declared param types (defect #12).
-            if let Value::Closure(c) = &bound {
-                coerce_call_args(&c.params, c.rest.as_ref(), &mut pos, &mut named)?;
-            }
             return self.call_value(&bound, CallArgs { pos, named });
         }
         // A bare word bound to a non-callable value (e.g. `it`, `out`, or any
         // `let`) resolves to that value — bound names dispatch as EXPR (site/content/internals/language-conformance-contract.md).
-        if let Some(bound) = self.env.get(&call.head)
-            && !call.forced
-            && !bound.is_callable()
-            && call.args.is_empty()
-            && call.redirects.is_empty()
-            && call.env_prefix.is_empty()
-        {
-            return Ok(bound);
+        if resolution.source == CommandSource::BoundValue {
+            return Ok(resolution
+                .binding
+                .expect("value resolution carries its binding"));
         }
         if call.head == "jobs" {
             return Ok(self.jobs_table());
@@ -143,7 +157,7 @@ impl Evaluator {
         // here — that would kill the kernel/embedded host (defect: no exit).
         if call.head == "exit" || call.head == "quit" {
             let code = self.exit_code_arg(call)?;
-            self.pending_exit = Some(code);
+            self.exec.control.pending_exit = Some(code);
             return Ok(Value::Null);
         }
         // plan/apply/explain REPL verbs (site/content/internals/roadmap-and-priorities.md). `plan { … }` renders the
@@ -184,15 +198,17 @@ impl Evaluator {
         // bare path. Intercepted before the generic builtin dispatch so it can
         // reach the scope chain; still wrapped as an outcome + redirect-capable.
         if call.head == "which" {
+            let redirects = self.prepare_redirects(call, false)?;
             let value = self.builtin_which(call)?;
             let outcome = builtin_outcome("which", value);
-            return self.apply_builtin_redirects(call, outcome);
+            return self.apply_builtin_redirects(&redirects, outcome);
         }
         // `reef` builtin family (site/content/internals/reef-resolution.md): binding table, add, lock, fetch.
         if call.head == "reef" {
+            let redirects = self.prepare_redirects(call, false)?;
             let value = self.builtin_reef(call)?;
             let outcome = builtin_outcome("reef", value);
-            return self.apply_builtin_redirects(call, outcome);
+            return self.apply_builtin_redirects(&redirects, outcome);
         }
         if call.head == "undo" {
             return self.builtin_undo(call);
@@ -200,7 +216,7 @@ impl Evaluator {
         if call.head == "journal" || call.head == "history" {
             return self.builtin_journal_view(call);
         }
-        if builtins::is_builtin(&call.head) {
+        if resolution.source == CommandSource::StructuredBuiltin {
             // Outcome unification (P1a): a builtin yields a `Value::Outcome`
             // exactly like an external command — its structured result becomes
             // the outcome's `.out` (`parsed`), `status = 0`/`ok = true`. A
@@ -209,12 +225,13 @@ impl Evaluator {
             // site/content/internals/language-conformance-contract.md undo: capture prior state of an overwriting cp/mv/save
             // BEFORE the mutation, then record the typed inverse AFTER. All a
             // no-op unless a journal is installed and a statement is executing.
+            let redirects = self.prepare_redirects(call, false)?;
             let undo_pre = self.fs_undo_pre(&call.head, call);
             let value = builtins::run(self, call)?;
             self.fs_undo_post(&call.head, undo_pre, &value);
             let outcome = builtin_outcome(&call.head, value);
             // Redirects apply to builtin results too (defect #8).
-            return self.apply_builtin_redirects(call, outcome);
+            return self.apply_builtin_redirects(&redirects, outcome);
         }
         if call.head == "cd" {
             return self.eval_cd(call);
@@ -238,7 +255,7 @@ impl Evaluator {
             return self.eval_jump(call);
         }
         if call.head == "pwd" {
-            return Ok(Value::Path(self.cwd.clone()));
+            return Ok(Value::Path(self.exec.shell.cwd.clone()));
         }
         // `run` is the poly runner + dynamic form (site/content/internals/pty-job-control.md): dispatch by extension
         // or, for a non-path name, invoke dynamically as a command.
@@ -250,7 +267,7 @@ impl Evaluator {
             let target = vs.remove(0);
             return self.run_poly(target, vs, position);
         }
-        if call.head == "source" || call.head.ends_with(".shl") {
+        if call.head == "source" || resolution.source == CommandSource::Script {
             let is_source = call.head == "source";
             let script_path = if is_source {
                 let p = call
@@ -271,14 +288,11 @@ impl Evaluator {
             let path = if script_path.is_absolute() {
                 script_path
             } else {
-                self.cwd.join(script_path)
+                self.exec.shell.cwd.join(script_path)
             };
             if is_source {
-                let src = self
-                    .fs
-                    .read_to_string(&path)
-                    .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
-                let program = shoal_syntax::parse(&src)
+                let src = self.read_shoal_source(&path, "script")?;
+                let program = shoal_syntax::parse_with_ctx(&src, self.parse_context(false))
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 return self.eval_program(&program);
             }
@@ -289,46 +303,81 @@ impl Evaluator {
             let args = self.collect_cmd_values(call)?;
             return self.run_script_file(&path, Some("shl"), args, position);
         }
-        // `^name` bypasses adapters too (language card): the forced head must
-        // reach the real command, not the adapter's flag/signature gate.
-        if !call.forced && self.adapters.lookup(&call.head).is_some() {
-            return self.eval_adapter(call, position);
+        // `^name` bypasses plugins and adapters: only an unforced head can
+        // enter an extension-owned command surface.
+        if resolution.source == CommandSource::Plugin {
+            return self.eval_wasm_command(call);
         }
-        let mut argv = vec![OsString::from(&call.head)];
+        if resolution.source == CommandSource::Adapter {
+            let redirects = self.prepare_redirects(call, true)?;
+            let value = self.eval_adapter(call, position, &redirects)?;
+            let value = self.apply_external_redirects(&redirects, value)?;
+            return self.enforce_command_position(value, position, false);
+        }
+        debug_assert_eq!(resolution.source, CommandSource::External);
+        let redirects = self.prepare_redirects(call, true)?;
+        let mut argv = crate::args::ArgvBuilder::new(OsString::from(&call.head))?;
         for a in &call.args {
             for v in self.expand_arg(a)? {
-                argv.push(self.argv_value(v)?);
+                argv.push(self.argv_value(v)?)?;
             }
         }
-        let mut stdin = StdinSpec::Null;
-        for r in &call.redirects {
-            if r.kind == RedirectKind::In {
-                stdin = StdinSpec::File(self.arg_path(&r.target)?);
-            }
-        }
-        let value = self.run_argv(argv, position, stdin, &call.env_prefix, call.span, None)?;
+        let argv = argv.finish();
+        let stdin = redirects.stdin_spec();
+        let output_redirected = redirects.has_output();
+        // A redirected command must finish capture and commit its bytes before
+        // statement-position failure promotion. This matches shell ordering:
+        // `false > file` still creates/truncates `file`, then reports failure.
+        let run_position = if output_redirected {
+            Position::Value
+        } else {
+            position
+        };
+        let value = if output_redirected {
+            self.run_argv_redirected(argv, run_position, stdin, &call.env_prefix, call.span, None)?
+        } else {
+            self.run_argv(argv, run_position, stdin, &call.env_prefix, call.span, None)?
+        };
+        let value = self.apply_external_redirects(&redirects, value)?;
+        self.enforce_command_position(value, position, false)
+    }
+
+    /// Commit output redirects for any process-backed command (raw external or
+    /// adapter) from the outcome's complete stdout, including lazy CAS spills.
+    fn apply_external_redirects(
+        &mut self,
+        redirects: &PreparedRedirects,
+        value: Value,
+    ) -> VResult<Value> {
         let Value::Outcome(out) = &value else {
             return Ok(value);
         };
-        let fs = self.fs.clone();
-        for r in &call.redirects {
-            let target = self.arg_path(&r.target)?;
-            match r.kind {
+        let fs = self.host.fs.clone();
+        if let Some(output) = redirects.output() {
+            match output.kind {
                 // Undo (site/content/internals/language-conformance-contract.md): an external command's `> file` / `>> file`
                 // clobbers the target's contents just like `cp` — snapshot the
                 // prior bytes first, record the restore inverse after, so
                 // `some-cmd > f` and `sh { … } > f` are reversible too.
                 RedirectKind::Out => {
+                    let target = output.path.clone();
                     let undo_pre = self.redirect_undo_pre(&target);
-                    // site/content/internals/language-conformance-contract.md: write the FULL stdout (load from CAS when it
-                    // spilled), never just the resident preview.
-                    fs.write(&target, &out.stdout_bytes()?)
+                    let mut reader = out.open_stdout()?;
+                    let mut writer = fs
+                        .open_write(&target)
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    std::io::copy(&mut reader, &mut writer)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
                 }
                 RedirectKind::Append => {
+                    let target = output.path.clone();
                     let undo_pre = self.redirect_undo_pre(&target);
-                    fs.append(&target, &out.stdout_bytes()?)
+                    let mut reader = out.open_stdout()?;
+                    let mut writer = fs
+                        .open_append(&target)
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    std::io::copy(&mut reader, &mut writer)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
                 }
@@ -337,767 +386,43 @@ impl Evaluator {
         }
         Ok(value)
     }
+}
 
-    /// The single choke point for a real session cwd change (`cd`, `cd -`,
-    /// `pushd`, `popd`, `j`): stash the prior cwd as OLDPWD (so `cd -` returns
-    /// to the *exact* directory left, byte-identical), move to `new`, and feed
-    /// the destination to the `j`/`jump` frecency store (best-effort — a store
-    /// write failure never fails the navigation). `with cwd:` and module loads
-    /// deliberately do NOT flow through here: those are scoped save/restore cwd
-    /// swaps, not navigation the user asked the shell to remember.
-    pub(crate) fn change_cwd(&mut self, new: PathBuf) {
-        let prev = std::mem::replace(&mut self.cwd, new);
-        self.oldpwd = Some(prev);
-        let cwd = self.cwd.clone();
-        self.record_cd(&cwd);
-    }
+/// Does this command request standard help before the `--` end-of-flags
+/// marker? Kept on parsed arguments so quoted/path values named `--help` never
+/// acquire option semantics.
+pub(crate) fn call_requests_help(call: &CmdCall) -> bool {
+    call.args
+        .iter()
+        .take_while(|arg| !matches!(arg, CmdArg::DashDash { .. }))
+        .any(|arg| match arg {
+            CmdArg::FlagLong { name, .. } => name == "help",
+            CmdArg::FlagShort { chars, .. } => chars.contains('h'),
+            _ => false,
+        })
+}
 
-    /// Reject a session-cwd mutation (`cd`/`pushd`/`popd`) inside a `fn` body
-    /// (site/content/internals/language-conformance-contract.md): a fn must not move the ambient session cwd — `with cwd:` is
-    /// the scoped alternative. A pure guard shared by all three verbs.
-    fn ensure_cwd_mutable(&self, verb: &str, span: Span) -> VResult<()> {
-        if self.in_fn_body > 0 {
-            return Err(ErrorVal::new(
-                "custom",
-                format!(
-                    "{verb} is only allowed at session top level; use `with cwd:` inside a fn body"
-                ),
-            )
-            .with_span(span));
-        }
-        Ok(())
-    }
-
-    /// `cd [dir]` / `cd -` (site/content/internals/language-conformance-contract.md). Bare `cd` goes to `$HOME`; `cd -` returns
-    /// to the previous directory (OLDPWD) and echoes it (bash parity, achieved
-    /// by returning the `Path`, which the statement sink renders); otherwise cd
-    /// to the resolved, canonicalized path. Every form records into the frecency
-    /// store and updates OLDPWD via [`Evaluator::change_cwd`].
-    fn eval_cd(&mut self, call: &CmdCall) -> VResult<Value> {
-        self.ensure_cwd_mutable("cd", call.span)?;
-        // `cd -`: jump back to the previous directory (bash's `$OLDPWD`).
-        if matches!(call.args.first(), Some(CmdArg::Dash { .. })) {
-            let Some(prev) = self.oldpwd.clone() else {
-                return Err(ErrorVal::new("custom", "cd: OLDPWD not set").with_span(call.span));
-            };
-            self.change_cwd(prev);
-            return Ok(Value::Path(self.cwd.clone()));
-        }
-        let target = self.cd_target(call)?;
-        self.change_cwd(target);
-        Ok(Value::Path(self.cwd.clone()))
-    }
-
-    /// Resolve a `cd`/`pushd` path argument to an absolute, canonicalized
-    /// directory. A missing argument means `$HOME` (the bare-`cd` case; `pushd`
-    /// never calls this with no argument — that is its swap form). A non-path
-    /// value is an `arg_error`; a path that does not resolve is one too.
-    fn cd_target(&mut self, call: &CmdCall) -> VResult<PathBuf> {
-        let p = call
-            .args
-            .first()
-            .map(|a| self.cmd_arg_value(a))
-            .transpose()?
-            .unwrap_or_else(|| {
-                Value::Path(std::env::home_dir().unwrap_or_else(|| PathBuf::from("/")))
-            });
-        let p = match p {
-            Value::Path(p) => p,
-            Value::Str(s) => PathBuf::from(s),
-            _ => return Err(ErrorVal::new("arg_error", "cd expects path")),
+fn validate_redirect_shape(call: &CmdCall) -> VResult<()> {
+    let mut input = false;
+    let mut output = false;
+    for redirect in &call.redirects {
+        let duplicate = match redirect.kind {
+            RedirectKind::In => std::mem::replace(&mut input, true),
+            RedirectKind::Out | RedirectKind::Append => std::mem::replace(&mut output, true),
         };
-        let joined = if p.is_absolute() { p } else { self.cwd.join(p) };
-        joined
-            .canonicalize()
-            .map_err(|e| ErrorVal::new("arg_error", e.to_string()))
-    }
-
-    /// `pushd [dir]` — the bash directory stack. With a `dir`: push the current
-    /// cwd onto the stack and cd into `dir`. With no argument: swap the current
-    /// cwd with the most-recent stacked directory (an error when the stack is
-    /// empty). Returns the new stack, exactly as `dirs` renders it.
-    fn eval_pushd(&mut self, call: &CmdCall) -> VResult<Value> {
-        self.ensure_cwd_mutable("pushd", call.span)?;
-        if call.args.is_empty() {
-            let Some(top) = self.dir_stack.first().cloned() else {
-                return Err(ErrorVal::new(
-                    "custom",
-                    "pushd: no other directory on the stack to swap with",
-                )
-                .with_span(call.span));
-            };
-            // Swap: the current cwd takes the top slot, we move to the old top.
-            self.dir_stack[0] = self.cwd.clone();
-            self.change_cwd(top);
-            return Ok(self.dir_stack_value());
-        }
-        let target = self.cd_target(call)?;
-        self.dir_stack.insert(0, self.cwd.clone());
-        self.change_cwd(target);
-        Ok(self.dir_stack_value())
-    }
-
-    /// `popd` — pop the most-recent stacked directory and cd into it. An empty
-    /// stack is an error (nothing to pop). Returns the remaining stack.
-    fn eval_popd(&mut self, call: &CmdCall) -> VResult<Value> {
-        self.ensure_cwd_mutable("popd", call.span)?;
-        if self.dir_stack.is_empty() {
-            return Err(
-                ErrorVal::new("custom", "popd: directory stack is empty").with_span(call.span)
-            );
-        }
-        let target = self.dir_stack.remove(0);
-        self.change_cwd(target);
-        Ok(self.dir_stack_value())
-    }
-
-    /// `dirs` — the directory stack as a typed `list<path>`, current directory
-    /// first (`[cwd] ++ dir_stack`). Structured, not text, so it dot-chains:
-    /// `dirs.len()`, `dirs.first()`, `dirs.where(...)`.
-    fn eval_dirs(&mut self, _call: &CmdCall) -> VResult<Value> {
-        Ok(self.dir_stack_value())
-    }
-
-    /// Build the shared `dirs`/`pushd`/`popd` return value: `[cwd] ++ dir_stack`
-    /// as a `list<path>`, current directory first (bash's left-to-right order).
-    fn dir_stack_value(&self) -> Value {
-        let mut out = Vec::with_capacity(self.dir_stack.len() + 1);
-        out.push(Value::Path(self.cwd.clone()));
-        out.extend(self.dir_stack.iter().cloned().map(Value::Path));
-        Value::List(out)
-    }
-
-    pub(crate) fn eval_adapter(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
-        let adapter = self
-            .adapters
-            .lookup(&call.head)
-            .expect("checked adapter")
-            .clone();
-        let (spec, sub, start) = match call.args.first() {
-            Some(CmdArg::Word { text, .. }) if adapter.subs.contains_key(text) => {
-                (adapter.subs[text].clone(), Some(text.clone()), 1)
-            }
-            _ => (adapter.top.clone(), None, 0),
-        };
-        let mut argv = vec![OsString::from(&adapter.bin)];
-        match (&spec.invoke, &sub) {
-            (Some(rewrite), _) => argv.extend(rewrite.iter().map(OsString::from)),
-            (None, Some(sub)) => argv.push(sub.into()),
-            (None, None) => {}
-        }
-        let mut positional = 0usize;
-        let mut i = start;
-        while i < call.args.len() {
-            match &call.args[i] {
-                CmdArg::FlagLong { name, value, .. } => {
-                    let param = spec
-                        .params
-                        .iter()
-                        .find(|p| p.name == *name)
-                        .ok_or_else(|| {
-                            ErrorVal::arg_error(format!(
-                                "{}: unknown flag --{name}; expected {}",
-                                call.head,
-                                signature(&spec)
-                            ))
-                        })?;
-                    // `consumed` flags stay recognized/validated (below) but
-                    // must never reach the child's argv — see the module-level
-                    // "consumed" rule doc in shoal-adapters.
-                    let consumed = spec.consumed.iter().any(|c| c == name);
-                    if !consumed {
-                        // Single-character params emit the POSIX single-dash
-                        // form: git has `-n`, not `--n` — this used to
-                        // validate `--n` and forward it verbatim, which git
-                        // rejects ("ambiguous argument"), leaving the
-                        // adapter's own advertised flag unusable.
-                        let spelled = if name.chars().count() == 1 {
-                            format!("-{name}")
-                        } else {
-                            format!("--{}", name.replace('_', "-"))
-                        };
-                        argv.push(spelled.into());
-                    }
-                    if let Some(value) = value {
-                        let v = self.cmd_arg_value(value)?;
-                        validate_adapter_value(&v, &param.ty)?;
-                        if !consumed {
-                            argv.push(self.argv_value(v)?);
-                        }
-                    } else if !param.ty.trim_end_matches('?').eq("bool") {
-                        i += 1;
-                        let next = call.args.get(i).ok_or_else(|| {
-                            ErrorVal::arg_error(format!("--{name} requires a value"))
-                        })?;
-                        let v = self.cmd_arg_value(next)?;
-                        validate_adapter_value(&v, &param.ty)?;
-                        if !consumed {
-                            argv.push(self.argv_value(v)?);
-                        }
-                    }
-                }
-                CmdArg::FlagShort { chars, .. } => {
-                    let mut kept = String::new();
-                    for ch in chars.chars() {
-                        let Some(pname) = spec.short_flags.get(&ch.to_string()) else {
-                            return Err(ErrorVal::arg_error(format!(
-                                "{}: unknown short flag -{ch}",
-                                call.head
-                            )));
-                        };
-                        // Same "consumed" rule as the long-flag branch above:
-                        // stays a recognized short flag, just dropped from argv.
-                        if !spec.consumed.iter().any(|c| c == pname) {
-                            kept.push(ch);
-                        }
-                    }
-                    if !kept.is_empty() {
-                        argv.push(format!("-{kept}").into());
-                    }
-                }
-                CmdArg::DashDash { .. } => argv.push("--".into()),
-                arg => {
-                    let expected = spec
-                        .positional
-                        .get(positional)
-                        .and_then(|name| spec.params.iter().find(|p| &p.name == name));
-                    let value = self.cmd_arg_value(arg)?;
-                    if let Some(param) = expected {
-                        validate_adapter_value(&value, &param.ty)?;
-                    }
-                    // A parameter typed glob owns expansion; T0/list<path> expansion remains elsewhere.
-                    if matches!(expected.map(|p| p.ty.trim_end_matches('?')), Some("glob")) {
-                        match value {
-                            Value::Glob(g) => argv.push(g.pattern.into()),
-                            v => argv.push(self.argv_value(v)?),
-                        }
-                    } else if matches!(value, Value::Glob(_)) {
-                        for value in self.expand_arg(arg)? {
-                            argv.push(self.argv_value(value)?);
-                        }
-                    } else {
-                        argv.push(self.argv_value(value)?);
-                    }
-                    positional += 1;
-                }
-            }
-            i += 1;
-        }
-        let ok_codes = spec.ok_codes.clone().unwrap_or(adapter.ok_codes);
-        let meta = ExecMeta {
-            ok_codes,
-            class: adapter.class,
-            parse: spec.parse,
-            output_type: spec.output_type,
-        };
-        self.run_argv(
-            argv,
-            position,
-            StdinSpec::Null,
-            &call.env_prefix,
-            call.span,
-            Some(meta),
-        )
-    }
-
-    pub(crate) fn run_argv(
-        &mut self,
-        mut argv: Vec<OsString>,
-        position: Position,
-        stdin: StdinSpec,
-        prefixes: &[EnvPrefix],
-        span: Span,
-        meta: Option<ExecMeta>,
-    ) -> VResult<Value> {
-        let mut env = self.process_env.clone();
-        for p in prefixes {
-            let v = self.cmd_arg_value(&p.value)?;
-            let s = match v {
-                Value::Secret(secret) => OsString::from(secret.value.as_ref()),
-                other => self.argv_value(other)?,
-            };
-            if let Some(pair) = env.iter_mut().find(|x| x.0 == OsString::from(&p.name)) {
-                pair.1 = s;
+        if duplicate {
+            let stream = if redirect.kind == RedirectKind::In {
+                "stdin"
             } else {
-                env.push((OsString::from(&p.name), s));
-            }
-        }
-        // reef spawn-time resolution (site/content/internals/reef-resolution.md). A pure no-op unless
-        // the head is a bare name constrained by a manifest in scope — so a
-        // repo with no `.reef.toml` spawns exactly as before. When reef resolves
-        // the head it hands back the binary's content hash so the leash spawn
-        // gate below can reuse it rather than re-hashing the same file.
-        let reef_hash = self.reef_apply(&mut argv, &mut env, span)?;
-        let force_tui = meta.as_ref().is_some_and(|m| m.class == AdapterClass::Tui);
-        let mode = if force_tui || (self.interactive && position == Position::Statement) {
-            ExecMode::PtyTee
-        } else {
-            ExecMode::Capture
-        };
-        // A PTY child owns the real terminal for its run (site/content/internals/language-conformance-contract.md "byte-
-        // identical to bash"): unless a redirect (`< file`) or `.feed` already
-        // claimed stdin, forward the user's tty — shoal-exec then engages raw
-        // mode on the real terminal and pumps stdin/resizes to the child.
-        // Without this, interactive TUIs (vim, claude, htop) get output-only
-        // PTYs: the cooked-mode line discipline echoes every mouse event and
-        // terminal query response as `^[[…` caret junk and delivers keystrokes
-        // only on Enter.
-        let stdin = if mode == ExecMode::PtyTee && matches!(stdin, StdinSpec::Null) {
-            StdinSpec::Inherit
-        } else {
-            stdin
-        };
-        // Only the PtyTee path streams the child's bytes to the real terminal;
-        // the result renderer suppresses re-rendering exactly these (defect #1).
-        let streamed = mode == ExecMode::PtyTee;
-        let display = argv
-            .iter()
-            .map(|x| x.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        // site/content/internals/language-conformance-contract.md leash activation: under a scoped leash policy, wrap the child
-        // in the strongest available OS backend (Landlock/Seatbelt) before
-        // exec. `resolve_sandbox` returns `None` for the default-permissive
-        // policy (and when no policy is installed), so this is a pure no-op on
-        // the normal path — the child spawns exactly as before.
-        let sandbox = self.resolve_sandbox();
-        // site/content/internals/language-conformance-contract.md spawn-hash pinning: consult the leash effect evaluator with
-        // this spawn's *resolved* binary (post-reef `argv[0]`) before exec. A
-        // pure no-op unless the active principal pins `proc_spawn` — see
-        // `spawn_gate`, which guards against a default-deny regression by only
-        // hashing/evaluating when a non-empty allowlist is actually configured.
-        if let Some(argv0) = argv.first() {
-            self.spawn_gate(argv0, reef_hash.as_deref(), span)?;
-        }
-        // Capture the head before `argv` moves into the spawn spec, so a
-        // `not_found` failure below can offer a command did-you-mean (site/content/internals/language-conformance-contract.md).
-        let failed_head = argv.first().map(|s| s.to_string_lossy().into_owned());
-        // site/content/internals/language-conformance-contract.md disk-spill: for value-position captures only (never PTY,
-        // whose output already reached the terminal), and only when a journal
-        // is installed to adopt the overflow into its CAS. `None` otherwise
-        // preserves the exact pre-spill behavior (bounded RAM buffer, overflow
-        // dropped) — so `-c`/scripts/conformance are wholly untouched.
-        let spill = if mode == ExecMode::Capture {
-            self.journal
-                .as_ref()
-                .and_then(|j| j.spill_dir().ok())
-                .map(|dir| shoal_exec::SpillConfig { dir })
-        } else {
-            None
-        };
-        // Spawn through the Exec port (site/content/internals/roadmap-and-priorities.md). The default
-        // `StdExec` is `shoal_exec::run` verbatim, so this is byte-identical.
-        let exec = self.exec.clone();
-        let mut r = exec
-            .run(
-                ExecSpec {
-                    argv,
-                    cwd: self.cwd.clone(),
-                    env,
-                    stdin,
-                    mode,
-                    sandbox,
-                    spill,
-                },
-                &self.cancel,
-            )
-            .map_err(|e| {
-                let is_not_found = e.kind() == std::io::ErrorKind::NotFound;
-                let err = ErrorVal::new(
-                    if is_not_found { "not_found" } else { "custom" },
-                    e.to_string(),
-                )
-                .with_span(span);
-                // site/content/internals/language-conformance-contract.md: when the head simply isn't a resolvable command,
-                // point at the closest known one (builtins ∪ adapter heads ∪
-                // in-scope callable bindings) — mirrors the method did-you-mean.
-                // The primary `not_found`/"command not found" code+message is
-                // unchanged; we only ADD a hint when a near-miss exists.
-                match failed_head
-                    .as_deref()
-                    .filter(|_| is_not_found)
-                    .and_then(|h| self.command_suggestion(h))
-                {
-                    Some(hint) => err.with_hint(hint),
-                    None => err,
-                }
-            })?;
-        // Job control (site/content/internals/language-conformance-contract.md): a foreground PtyTee child that was *stopped*
-        // (Ctrl-Z → SIGTSTP) rather than finishing. Register it as a suspended
-        // job (so it lists in `jobs` and the REPL `fg`/`bg` can resume its parked
-        // PTY by pid) and return a streamed outcome that renders nothing — the
-        // REPL sees the pending stop and returns to the prompt. Never raise a
-        // `cmd_failed` for a stop: the command did not fail, it is suspended.
-        if r.stopped {
-            self.register_stopped_external(r.pid, r.pgid as i32, display.clone());
-            return Ok(Value::Outcome(Arc::new(OutcomeVal {
-                status: None,
-                signal: None,
-                ok: false,
-                stdout: Arc::new(r.stdout),
-                // A stopped PtyTee job never spills to CAS (capture spill is a
-                // Capture-mode, value-position concern).
-                stdout_ref: None,
-                stderr: Arc::new(Vec::new()),
-                dur_ns: r.dur.as_nanos().min(i64::MAX as u128) as i64,
-                pid: r.pid,
-                cmd: display,
-                parsed: None,
-                // The child's bytes already reached the real terminal via the
-                // PtyTee passthrough, so the result renderer must not reprint.
-                streamed: true,
-                span: Some(span),
-            })));
-        }
-        let ok_codes = meta.as_ref().map_or(&[0][..], |m| m.ok_codes.as_slice());
-        let ok = r.status.is_some_and(|code| ok_codes.contains(&code));
-        let parsed = meta.as_ref().and_then(|m| {
-            shoal_adapters::parse_output(&m.parse, &r.stdout, m.output_type.as_deref())
-        });
-        // Take the resident stdout once (it is the bounded preview when a spill
-        // occurred, the whole thing otherwise) and share the one allocation
-        // between the outcome's `.stdout` and any site/content/internals/language-conformance-contract.md ref-backed view.
-        let stdout = Arc::new(std::mem::take(&mut r.stdout));
-        // site/content/internals/language-conformance-contract.md: if stdout overflowed the RAM cap and spilled to disk, adopt
-        // the spill into the CAS and back `.stdout` with a lazy ref (true
-        // length + on-demand load). `None` on every ordinary capture.
-        let stdout_ref = r
-            .stdout_spill
-            .take()
-            .and_then(|spill| self.adopt_capture_spill(&spill, stdout.clone()));
-        let out = Value::Outcome(Arc::new(OutcomeVal {
-            status: r.status,
-            signal: r.signal,
-            ok,
-            stdout,
-            stdout_ref,
-            stderr: Arc::new(r.stderr),
-            dur_ns: r.dur.as_nanos().min(i64::MAX as u128) as i64,
-            pid: r.pid,
-            cmd: display,
-            parsed,
-            streamed,
-            // Stamp the invocation's source span — the same `span` the sibling
-            // error path below hands to `ErrorVal::with_span`, so a command's
-            // success and failure carry an identical source anchor on the wire
-            // (site/content/internals/kernel-protocol.md).
-            span: Some(span),
-        }));
-        if !ok && position == Position::Statement {
-            let Value::Outcome(failed) = &out else {
-                unreachable!()
+                "stdout"
             };
-            let message = match (failed.status, failed.signal.as_deref()) {
-                (Some(code), _) => format!("`{}` exited with status {code}", failed.cmd),
-                (_, Some(signal)) => format!("`{}` died from {signal}", failed.cmd),
-                _ => format!("`{}` failed", failed.cmd),
-            };
-            Err(ErrorVal::new("cmd_failed", message)
-                .with_status(failed.status)
-                .with_stderr(String::from_utf8_lossy(&failed.stderr).into_owned()))
-        } else {
-            Ok(out)
+            return Err(ErrorVal::arg_error(format!(
+                "a command may have only one {stream} redirect"
+            ))
+            .with_span(redirect.span));
         }
     }
-
-    /// Adopt a value-position capture's disk spill (site/content/internals/language-conformance-contract.md) into the journal
-    /// CAS and hand back a lazy, ref-backed view of the full stdout. `preview`
-    /// is the bounded resident prefix (shared with the outcome's `.stdout`).
-    ///
-    /// Returns `None` — degrading to the resident preview — only if there is no
-    /// journal (so the spill can never have been produced in the first place)
-    /// or adoption fails on I/O; the orphaned spill file is cleaned up in that
-    /// case. On success the blob is durable under its real blake3 and pinned so
-    /// GC keeps it while the value is live.
-    fn adopt_capture_spill(
-        &self,
-        spill: &shoal_exec::CaptureSpill,
-        preview: Arc<Vec<u8>>,
-    ) -> Option<Arc<shoal_value::CasBytesVal>> {
-        let journal = self.journal.as_ref()?;
-        if journal
-            .ingest_spill(&spill.path, &spill.hash, spill.len, true)
-            .is_err()
-        {
-            let _ = self.fs.remove_file(&spill.path);
-            return None;
-        }
-        let loader = CasBytesLoader {
-            cas: journal.cas(),
-            hash: spill.hash.clone(),
-        };
-        Some(Arc::new(shoal_value::CasBytesVal {
-            hash: spill.hash.clone(),
-            len: spill.len,
-            preview,
-            truncated: spill.truncated,
-            loader: Arc::new(loader),
-        }))
-    }
-
-    /// Resolve a `val:blake3:<hash>` content short-ref (the recoverable form
-    /// [`shoal_value::CasBytesVal::reference`] / `.ref` yields) into a lazy
-    /// [`Value::CasBytes`] backed by this session's journal CAS, so a bare ref
-    /// *written as a value* dispatches methods and materializes exactly like the
-    /// spill it came from (this is the in-language mirror of the wire
-    /// `value.get` resolution).
-    ///
-    /// Returns `None` when `s` is not a content ref at all — the caller then
-    /// dispatches the string through the ordinary string-method path unchanged.
-    /// Returns `Some(Err(..))` — a clear `not_found` — when the ref is genuine
-    /// but cannot be resolved: no journal/CAS is installed in this session, or
-    /// no blob is tracked under that hash.
-    pub(crate) fn resolve_content_ref(&self, s: &str, span: Span) -> Option<VResult<Value>> {
-        let hash = shoal_value::CasBytesVal::parse_ref(s)?;
-        Some(self.load_content_ref(hash).map_err(|e| e.with_span(span)))
-    }
-
-    /// The fallible core of [`Self::resolve_content_ref`]: builds the lazy
-    /// [`Value::CasBytes`] for `hash`. `.len` is answered from the `blob` table
-    /// metadata alone (never loading the content); a bare ref carries no resident
-    /// preview, so `render` shows the ref + true length and materialization loads
-    /// on demand through the same [`CasBytesLoader`]/[`shoal_journal::Cas`] seam a
-    /// fresh spill uses.
-    fn load_content_ref(&self, hash: &str) -> VResult<Value> {
-        let prefix = shoal_value::CasBytesVal::REF_PREFIX;
-        let Some(journal) = self.journal.as_ref() else {
-            return Err(ErrorVal::new(
-                "not_found",
-                format!(
-                    "cannot resolve content ref {prefix}{hash}: this session has no journal/CAS"
-                ),
-            ));
-        };
-        let len = journal
-            .blob_len(hash)
-            .map_err(|e| {
-                ErrorVal::new(
-                    "not_found",
-                    format!("cannot resolve content ref {prefix}{hash}: {e}"),
-                )
-            })?
-            .ok_or_else(|| {
-                ErrorVal::new(
-                    "not_found",
-                    format!("no CAS blob for content ref {prefix}{hash}"),
-                )
-            })?;
-        let loader = CasBytesLoader::new(journal.cas(), hash.to_string());
-        Ok(Value::CasBytes(Arc::new(shoal_value::CasBytesVal {
-            hash: hash.to_string(),
-            len,
-            preview: Arc::new(Vec::new()),
-            truncated: false,
-            loader: Arc::new(loader),
-        })))
-    }
-
-    /// The leash spawn gate (site/content/internals/language-conformance-contract.md content-hash pinning). Consulted from
-    /// `run_argv` for every external spawn, just before exec. Returns `Ok(())`
-    /// — allow — in every case EXCEPT when the active principal pins process
-    /// spawns (a non-empty `proc_spawn` allowlist) AND the resolved binary
-    /// matches none of those pins by content hash or name.
-    ///
-    /// Zero-regression guarantee: when no leash policy is installed, or the
-    /// principal declares no `proc_spawn` grants, this returns immediately —
-    /// the binary is never hashed and the spawn proceeds exactly as it does
-    /// today. It deliberately gates on [`shoal_leash::Policy::spawn_pinning_active`]
-    /// rather than calling `evaluate_effect` unconditionally, because an empty
-    /// allowlist evaluates a `ProcSpawn` as `Deny` — consulting the evaluator
-    /// without that guard would default-deny ordinary commands.
-    ///
-    /// `reef_hash` is the content hash reef already computed for a resolved
-    /// binary (reused verbatim); when `None`, and only when pinning is active,
-    /// the resolved binary's own bytes are hashed here.
-    pub(crate) fn spawn_gate(
-        &self,
-        argv0: &OsStr,
-        reef_hash: Option<&str>,
-        span: Span,
-    ) -> VResult<()> {
-        let Some((policy, principal)) = self.leash.as_ref() else {
-            return Ok(());
-        };
-        // Empty/absent `proc_spawn` grants ⇒ allow, exactly as before pinning
-        // existed. This guard is load-bearing: without it, `evaluate_effect`
-        // below would deny every spawn under an otherwise-unrestricted policy.
-        if !policy.spawn_pinning_active(principal) {
-            return Ok(());
-        }
-        // Reuse reef's hash when it resolved `argv[0]`; otherwise hash the
-        // resolved binary's bytes (same blake3-hex as reef and
-        // `shoal_leash::preflight_spawn`). An unlocatable/unreadable binary
-        // yields an empty hash, falling back to name-only matching — still
-        // enforced, never silently allowed.
-        let bin_hash = match reef_hash {
-            Some(h) => h.to_string(),
-            None => self.hash_resolved_bin(argv0).unwrap_or_default(),
-        };
-        let effect = Effect::ProcSpawn {
-            bin_hash,
-            argv0: argv0.to_string_lossy().into_owned(),
-        };
-        match policy.evaluate_effect(principal, &effect) {
-            shoal_leash::Verdict::Allow => Ok(()),
-            _ => Err(ErrorVal::new(
-                "spawn_denied",
-                format!(
-                    "leash: spawn of `{}` denied — its content hash/name is not in principal `{principal}`'s proc_spawn allowlist",
-                    argv0.to_string_lossy()
-                ),
-            )
-            .with_span(span)),
-        }
-    }
-
-    /// Content-hash the binary `argv0` resolves to — an absolute path as-is, or
-    /// a bare name via the ambient `$PATH` (`which`) — returning reef/leash's
-    /// blake3-hex so a pin copied from `reef`/`which` output compares equal.
-    /// `None` when the binary can't be located or read. Reads through the `Fs`
-    /// port so it stays testable without touching a real binary.
-    pub(crate) fn hash_resolved_bin(&self, argv0: &OsStr) -> Option<String> {
-        let candidate = Path::new(argv0);
-        let resolved = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            self.ambient_which(&argv0.to_string_lossy())?
-        };
-        let bytes = self.fs.read(&resolved).ok()?;
-        Some(shoal_reef::hashcache::hash_bytes(&bytes))
-    }
-
-    /// True when `name` resolves as a command (builtin, special head, adapter,
-    /// or an executable on `PATH`) — drives command-in-expression (defect #5).
-    pub(crate) fn is_command_name(&self, name: &str) -> bool {
-        // Builtin command heads come straight from the canonical registry
-        // (`shoal_syntax::commands`, re-exported through `builtins`): structured
-        // builtins via `is_builtin`, the heads special-cased in `eval_command`
-        // via `is_special_head`. Deriving both sides from the same data is what
-        // keeps this in step with dispatch.
-        if builtins::is_builtin(name) || builtins::is_special_head(name) {
-            return true;
-        }
-        if name.contains('/') || name.contains('.') {
-            return false;
-        }
-        if self.adapters.lookup(name).is_some() {
-            return true;
-        }
-        let path = self
-            .process_env
-            .iter()
-            .find(|(k, _)| k == "PATH")
-            .map(|(_, v)| v.as_os_str());
-        shoal_exec::which(OsStr::new(name), path).is_some()
-    }
-
-    /// Command did-you-mean (site/content/internals/language-conformance-contract.md): when a command head fails to resolve,
-    /// find the closest *known* command name so the `not_found` error can carry
-    /// a `did you mean 'X'?` hint — the command-head analogue of the method
-    /// did-you-mean (`shoal_value::methods::suggest`).
-    ///
-    /// The candidate vocabulary is deliberately host-INDEPENDENT so the hint is
-    /// deterministic and testable: the canonical builtin registry
-    /// (`shoal_syntax::commands::builtin_names`), the adapter command heads the
-    /// evaluator holds, and the in-scope callable session bindings (fn/alias
-    /// names). We do NOT scan `$PATH` — that would be noisy and non-reproducible.
-    ///
-    /// Threshold mirrors the method hint: names of ≥ 5 chars tolerate an edit
-    /// distance of 2, shorter names only 1 (at distance 2 a 4-char typo matches
-    /// half the table), and the match must be strictly closer than the typo's
-    /// own length so a short head can't match unrelated noise.
-    fn command_suggestion(&self, head: &str) -> Option<String> {
-        // A reef-rewritten `argv[0]` can be an absolute path, but the user typed
-        // a bare name — compare against the final path component.
-        let head = head
-            .rsplit(['/', std::path::MAIN_SEPARATOR])
-            .next()
-            .unwrap_or(head);
-        let len = head.chars().count();
-        if len == 0 {
-            return None;
-        }
-        let max_d = if len >= 5 { 2 } else { 1 };
-        // Union the deterministic candidate sources, then sort+dedup so ties
-        // break identically every run (the first minimum wins in `min_by_key`).
-        let mut candidates: Vec<String> = builtins::builtin_names()
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        candidates.extend(self.adapters.names().map(str::to_owned));
-        for name in self.env.visible_names() {
-            if self.env.get(&name).is_some_and(|v| v.is_callable()) {
-                candidates.push(name);
-            }
-        }
-        candidates.sort_unstable();
-        candidates.dedup();
-        let (dist, best) = candidates
-            .iter()
-            .map(|c| (shoal_value::methods::levenshtein(head, c), c))
-            .min_by_key(|(d, _)| *d)?;
-        (dist <= max_d && dist < len).then(|| format!("did you mean '{best}'?"))
-    }
-
-    /// Resolve the optional `exit`/`quit` status argument to an `i32`
-    /// (default `0`). Accepts a bare integer word (`exit 3`) or an int-valued
-    /// expression; anything non-integer is an `arg_error`.
-    fn exit_code_arg(&mut self, call: &CmdCall) -> VResult<i32> {
-        let vs = self.collect_cmd_values(call)?;
-        let Some(first) = vs.into_iter().next() else {
-            return Ok(0);
-        };
-        let code = match crate::coerce::coerce_word(first, "int")? {
-            Value::Int(n) => n,
-            other => {
-                return Err(ErrorVal::arg_error(format!(
-                    "exit expects an int status, found {}",
-                    other.type_name()
-                ))
-                .with_span(call.span));
-            }
-        };
-        Ok(code.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
-    }
-
-    /// Collect a command's positional (non-flag) argument values.
-    pub(crate) fn collect_cmd_values(&mut self, call: &CmdCall) -> VResult<Vec<Value>> {
-        let mut vs = Vec::new();
-        for a in &call.args {
-            match a {
-                CmdArg::FlagLong { .. } | CmdArg::FlagShort { .. } | CmdArg::DashDash { .. } => {}
-                _ => vs.extend(self.expand_arg(a)?),
-            }
-        }
-        Ok(vs)
-    }
-}
-
-/// Loads a spilled capture's full bytes from the journal CAS on demand.
-/// Holds a DB-independent [`shoal_journal::Cas`] (just a path), so a ref-backed
-/// [`shoal_value::CasBytesVal`] stays `Send + Sync` and outlives the borrow of
-/// the evaluator that produced it.
-///
-/// Reused verbatim by [`crate::Evaluator::resolve_content_ref`] to back a bare
-/// `val:blake3:<hash>` ref written as a value (see
-/// `site/content/internals/persistence.md`) — same CAS seam as a fresh spill,
-/// so a recovered ref materializes
-/// exactly like the capture it came from.
-pub(crate) struct CasBytesLoader {
-    cas: shoal_journal::Cas,
-    hash: String,
-}
-
-impl CasBytesLoader {
-    pub(crate) fn new(cas: shoal_journal::Cas, hash: String) -> Self {
-        Self { cas, hash }
-    }
-}
-
-impl shoal_value::BytesLoad for CasBytesLoader {
-    fn load(&self) -> std::io::Result<Vec<u8>> {
-        self.cas.read(&self.hash)
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1114,6 +439,32 @@ mod command_did_you_mean_tests {
     // adapters, env) — never the filesystem — so the cwd need not exist.
     fn ev() -> Evaluator {
         Evaluator::new(std::env::temp_dir())
+    }
+
+    #[test]
+    fn programmatic_calls_reject_ambiguous_redirects_before_dispatch() {
+        let target = |name: &str, start: usize| Redirect {
+            kind: RedirectKind::Out,
+            target: CmdArg::Word {
+                text: name.into(),
+                span: Span::new(start, start + name.len()),
+            },
+            span: Span::new(start, start + name.len()),
+        };
+        let call = CmdCall {
+            head: "definitely-not-spawned".into(),
+            forced: false,
+            args: Vec::new(),
+            redirects: vec![target("first", 10), target("second", 20)],
+            env_prefix: Vec::new(),
+            background: true,
+            trailing: None,
+            span: Span::new(0, 26),
+        };
+        let error = validate_redirect_shape(&call).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("only one stdout redirect"));
+        assert_eq!(error.span, Some(Span::new(20, 26)));
     }
 
     #[test]

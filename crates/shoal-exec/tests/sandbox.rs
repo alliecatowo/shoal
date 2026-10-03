@@ -1,8 +1,10 @@
 use shoal_exec::{
-    CancelToken, ExecMode, ExecSpec, StdinSpec, run, run_sandboxed, spawn_capture,
+    CancelToken, ExecMode, ExecSpec, StdinSpec, run, run_bounded, run_sandboxed, spawn_capture,
     spawn_capture_sandboxed,
 };
-use shoal_leash::{EnforcementTier, FsSandbox, NetPolicy, SandboxPolicy, SpawnPreflight};
+use shoal_leash::{
+    EnforcementTier, FsSandbox, NetPolicy, ProcessLimits, SandboxPolicy, SpawnPreflight,
+};
 use std::io::Read;
 use std::time::{Duration, Instant};
 fn spec(script: &str, mode: ExecMode) -> ExecSpec {
@@ -28,6 +30,15 @@ fn grants(path: std::path::PathBuf) -> FsSandbox {
         read,
         write: vec![],
         delete: vec![],
+    }
+}
+
+fn unrestricted_fs_grants() -> FsSandbox {
+    let root = std::path::PathBuf::from("/");
+    FsSandbox {
+        read: vec![root.clone()],
+        write: vec![root.clone()],
+        delete: vec![root],
     }
 }
 #[test]
@@ -86,6 +97,71 @@ fn sandboxed(script: &str, mode: ExecMode, policy: SandboxPolicy) -> ExecSpec {
 }
 
 #[test]
+fn resource_only_cpu_ceiling_reaches_capture_and_pty_children() {
+    for mode in [ExecMode::Capture, ExecMode::PtyTee] {
+        let policy = SandboxPolicy {
+            process_limits: ProcessLimits {
+                cpu_seconds: Some(7),
+                memory_bytes: None,
+            },
+            ..SandboxPolicy::default()
+        };
+        let result = run(sandboxed("ulimit -t", mode, policy), &CancelToken::new())
+            .expect("resource-only launcher must run");
+        assert_eq!(result.status, Some(0));
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains('7'),
+            "child did not observe CPU ceiling: {:?}",
+            result.stdout
+        );
+        let status = result.enforcement.expect("resource status");
+        assert!(status.enforced);
+        assert!(status.cpu_limit_enforced);
+        assert!(!status.memory_limit_enforced);
+        assert!(!status.filesystem_enforced);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn resource_only_address_space_ceiling_reaches_child() {
+    let policy = SandboxPolicy {
+        process_limits: ProcessLimits {
+            cpu_seconds: None,
+            memory_bytes: Some(64 * 1024 * 1024),
+        },
+        ..SandboxPolicy::default()
+    };
+    let result = run(
+        sandboxed("ulimit -v", ExecMode::Capture, policy),
+        &CancelToken::new(),
+    )
+    .expect("resource-only launcher must run");
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "65536");
+    let status = result.enforcement.expect("resource status");
+    assert!(status.memory_limit_enforced);
+}
+
+#[test]
+fn resource_only_policy_does_not_masquerade_as_provider_filesystem_scope() {
+    let policy = SandboxPolicy {
+        process_limits: ProcessLimits {
+            cpu_seconds: Some(7),
+            memory_bytes: None,
+        },
+        ..SandboxPolicy::default()
+    };
+    let output = run_bounded(
+        sandboxed("printf bounded", ExecMode::Capture, policy),
+        Duration::from_secs(1),
+        1024,
+        &CancelToken::new(),
+    )
+    .expect("resource-only bounded provider must not require an FS backend");
+    assert_eq!(output.stdout, b"bounded");
+}
+
+#[test]
 fn execspec_sandbox_allows_one_file_and_denies_sibling_via_run() {
     if shoal_leash::landlock_abi().is_none() {
         eprintln!("Landlock unavailable; skipping enforcement assertion");
@@ -100,8 +176,10 @@ fn execspec_sandbox_allows_one_file_and_denies_sibling_via_run() {
     for mode in [ExecMode::Capture, ExecMode::PtyTee] {
         let policy = SandboxPolicy {
             fs: grants(a.clone()),
+            filesystem_requested: true,
             net: NetPolicy::Unrestricted,
             spawn_hash: None,
+            process_limits: Default::default(),
             hermetic: false,
         };
         let r = run(sandboxed(&script, mode, policy), &CancelToken::new()).unwrap();
@@ -125,8 +203,10 @@ fn execspec_sandbox_via_spawn_capture_reports_enforcement_on_wait() {
     }
     let policy = SandboxPolicy {
         fs: grants("/bin/sh".into()),
+        filesystem_requested: true,
         net: NetPolicy::Unrestricted,
         spawn_hash: None,
+        process_limits: Default::default(),
         hermetic: false,
     };
     let token = CancelToken::new();
@@ -155,8 +235,10 @@ fn execspec_sandbox_degrades_honestly_when_no_backend_is_available() {
     // than breaking the shell, but must NOT claim enforcement happened.
     let policy = SandboxPolicy {
         fs: grants("/bin/sh".into()),
+        filesystem_requested: true,
         net: NetPolicy::Unrestricted,
         spawn_hash: None,
+        process_limits: Default::default(),
         hermetic: false,
     };
     let r = run(
@@ -172,14 +254,123 @@ fn execspec_sandbox_degrades_honestly_when_no_backend_is_available() {
 }
 
 #[test]
-fn execspec_sandbox_hermetic_fails_closed_when_net_deny_cannot_be_enforced() {
-    // net.deny has no enforcement backend anywhere in this crate today, on
-    // any platform — so a `hermetic: true` request for it must always
-    // refuse to spawn rather than silently run with network still open.
+fn execspec_sandbox_hermetic_net_deny_is_enforced_or_fails_closed() {
     let policy = SandboxPolicy {
-        fs: FsSandbox::default(),
+        fs: unrestricted_fs_grants(),
+        filesystem_requested: true,
         net: NetPolicy::Deny,
         spawn_hash: None,
+        process_limits: Default::default(),
+        hermetic: true,
+    };
+    let supported = cfg!(target_os = "macos")
+        || (cfg!(target_os = "linux") && shoal_leash::landlock_abi().is_some_and(|abi| abi >= 4));
+    if supported {
+        let result = run(
+            sandboxed("true", ExecMode::Capture, policy),
+            &CancelToken::new(),
+        )
+        .expect("coarse network denial should be available");
+        let status = result.enforcement.expect("sandbox status");
+        assert!(status.network_enforced);
+        assert!(status.enforced);
+    } else {
+        let error = run(
+            sandboxed("true", ExecMode::Capture, policy),
+            &CancelToken::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn landlock_net_deny_blocks_a_real_local_tcp_connection() {
+    if shoal_leash::landlock_abi().is_none_or(|abi| abi < 4) {
+        eprintln!("Landlock network access control requires ABI 4; skipping");
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.is_file())
+    else {
+        eprintln!("python3 unavailable; skipping real TCP probe");
+        return;
+    };
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let code =
+        format!("import socket; s=socket.create_connection(('127.0.0.1', {port}), 1); s.close()");
+    let python_spec = |sandbox| ExecSpec {
+        argv: vec![
+            python.clone().into_os_string(),
+            "-c".into(),
+            code.clone().into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: std::env::vars_os().collect(),
+        stdin: StdinSpec::Null,
+        mode: ExecMode::Capture,
+        sandbox,
+        spill: None,
+    };
+
+    let baseline = run(python_spec(None), &CancelToken::new()).unwrap();
+    assert_eq!(
+        baseline.status,
+        Some(0),
+        "the local endpoint must be reachable"
+    );
+
+    let denied = run(
+        python_spec(Some(SandboxPolicy {
+            fs: unrestricted_fs_grants(),
+            filesystem_requested: true,
+            net: NetPolicy::Deny,
+            spawn_hash: None,
+            process_limits: Default::default(),
+            hermetic: true,
+        })),
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_ne!(
+        denied.status,
+        Some(0),
+        "Landlock must block a connection that succeeds without the sandbox"
+    );
+    assert!(denied.enforcement.unwrap().network_enforced);
+}
+
+#[test]
+fn execspec_sandbox_hermetic_refuses_an_unresolved_filesystem_scope() {
+    let policy = SandboxPolicy {
+        fs: FsSandbox::default(),
+        filesystem_requested: true,
+        net: NetPolicy::Unrestricted,
+        spawn_hash: None,
+        process_limits: Default::default(),
+        hermetic: true,
+    };
+    let e = run(
+        sandboxed("true", ExecMode::Capture, policy),
+        &CancelToken::new(),
+    )
+    .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().contains("no usable roots"));
+}
+
+#[test]
+fn execspec_sandbox_hermetic_refuses_preexec_identity_pinning() {
+    let policy = SandboxPolicy {
+        fs: grants("/bin/sh".into()),
+        filesystem_requested: true,
+        net: NetPolicy::Unrestricted,
+        spawn_hash: Some("00".repeat(32)),
+        process_limits: Default::default(),
         hermetic: true,
     };
     let e = run(
@@ -188,6 +379,7 @@ fn execspec_sandbox_hermetic_fails_closed_when_net_deny_cannot_be_enforced() {
     )
     .unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+    assert!(e.to_string().contains("TOCTOU"));
 }
 
 #[test]
@@ -201,8 +393,10 @@ fn execspec_sandbox_spawn_hash_pin_matches_and_mismatches() {
     // Correct pin: runs, and the result says the pin was checked.
     let ok_policy = SandboxPolicy {
         fs: grants("/bin/sh".into()),
+        filesystem_requested: true,
         net: NetPolicy::Unrestricted,
         spawn_hash: Some(real.hash.clone()),
+        process_limits: Default::default(),
         hermetic: false,
     };
     let r = run(
@@ -216,8 +410,10 @@ fn execspec_sandbox_spawn_hash_pin_matches_and_mismatches() {
     // Wrong pin: refused before spawn (proc.spawn hash pin, site/content/internals/language-conformance-contract.md).
     let bad_policy = SandboxPolicy {
         fs: grants("/bin/sh".into()),
+        filesystem_requested: true,
         net: NetPolicy::Unrestricted,
         spawn_hash: Some("00".repeat(32)),
+        process_limits: Default::default(),
         hermetic: false,
     };
     let e = run(

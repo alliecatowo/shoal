@@ -8,9 +8,10 @@
 //! Construction is idempotent and concurrent-safe: a fresh temp dir is built and
 //! atomically renamed into place; an already-present view is reused as-is.
 
-use std::ffi::OsString;
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::hashcache::hash_bytes;
 
@@ -104,11 +105,20 @@ pub fn bindings_hash(bindings: &[Binding]) -> String {
 /// a uniquely-named sibling temp dir and atomically renamed into place; a losing
 /// racer whose rename fails because the target exists simply reuses it.
 pub fn synth_path(bindings: &[Binding], cfg: &ViewConfig) -> io::Result<SynthView> {
+    validate_bindings(bindings)?;
+    ensure_private_root(&cfg.root)?;
     let hash = bindings_hash(bindings);
+    let final_dir = cfg.root.join(&hash);
     let view_dir = cfg.root.join(&hash).join("bin");
 
-    if !view_dir.is_dir() {
+    if !view_matches(&final_dir, bindings) {
+        quarantine_invalid_view(&cfg.root, &final_dir)?;
         build_view(&cfg.root, &hash, bindings)?;
+    }
+    if !view_matches(&final_dir, bindings) {
+        return Err(io::Error::other(
+            "content-addressed Reef view failed post-publication validation",
+        ));
     }
 
     let mut parts: Vec<PathBuf> = vec![view_dir.clone()];
@@ -121,13 +131,134 @@ pub fn synth_path(bindings: &[Binding], cfg: &ViewConfig) -> io::Result<SynthVie
     Ok(SynthView { view_dir, path_var })
 }
 
+fn validate_bindings(bindings: &[Binding]) -> io::Result<()> {
+    let mut names = HashSet::new();
+    for binding in bindings {
+        let path = Path::new(&binding.name);
+        let mut components = path.components();
+        let valid_name = matches!(components.next(), Some(Component::Normal(name)) if name == OsStr::new(&binding.name))
+            && components.next().is_none();
+        if binding.name.is_empty() || !valid_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid Reef view binding name {:?}", binding.name),
+            ));
+        }
+        if !names.insert(binding.name.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate Reef view binding name {:?}", binding.name),
+            ));
+        }
+        if !binding.path.is_absolute() || !crate::provider::is_executable(&binding.path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Reef view target for {:?} is not an absolute executable regular file",
+                    binding.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_root(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    std::fs::create_dir_all(root)?;
+    let metadata = std::fs::symlink_metadata(root)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Reef view root is not an owned real directory",
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn expected_links(bindings: &[Binding]) -> BTreeMap<&str, &Path> {
+    bindings
+        .iter()
+        .map(|binding| (binding.name.as_str(), binding.path.as_path()))
+        .collect()
+}
+
+fn view_matches(final_dir: &Path, bindings: &[Binding]) -> bool {
+    let Ok(final_metadata) = std::fs::symlink_metadata(final_dir) else {
+        return false;
+    };
+    let bin = final_dir.join("bin");
+    let Ok(bin_metadata) = std::fs::symlink_metadata(&bin) else {
+        return false;
+    };
+    if !final_metadata.file_type().is_dir() || !bin_metadata.file_type().is_dir() {
+        return false;
+    }
+    let expected = expected_links(bindings);
+    let Ok(entries) = std::fs::read_dir(&bin) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        let Some(target) = expected.get(name.as_str()) else {
+            return false;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if !file_type.is_symlink()
+            || std::fs::read_link(entry.path()).ok().as_deref() != Some(*target)
+        {
+            return false;
+        }
+        seen.insert(name);
+    }
+    seen.len() == expected.len()
+}
+
+fn quarantine_invalid_view(root: &Path, final_dir: &Path) -> io::Result<()> {
+    if std::fs::symlink_metadata(final_dir).is_err() {
+        return Ok(());
+    }
+    let quarantine = root.join(format!(
+        ".quarantine-{}-{}",
+        std::process::id(),
+        next_counter()
+    ));
+    match std::fs::rename(final_dir, &quarantine) {
+        Ok(()) => remove_tree_or_link(&quarantine),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_tree_or_link(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => std::fs::remove_dir_all(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn build_view(root: &Path, hash: &str, bindings: &[Binding]) -> io::Result<()> {
     use std::os::unix::fs::symlink;
 
-    std::fs::create_dir_all(root)?;
     let final_dir = root.join(hash);
-    if final_dir.is_dir() {
-        return Ok(()); // Another builder won the race.
+    if view_matches(&final_dir, bindings) {
+        return Ok(()); // Another equivalent builder won the race.
     }
 
     // Assemble in a unique temp sibling, then atomically rename.
@@ -136,25 +267,22 @@ fn build_view(root: &Path, hash: &str, bindings: &[Binding]) -> io::Result<()> {
         std::process::id(),
         next_counter()
     ));
-    let _ = std::fs::remove_dir_all(&staging);
+    remove_tree_or_link(&staging)?;
     let staging_bin = staging.join("bin");
     std::fs::create_dir_all(&staging_bin)?;
     for b in bindings {
         let link = staging_bin.join(&b.name);
-        // Tolerate a duplicate name within the same set (last wins).
-        let _ = std::fs::remove_file(&link);
         symlink(&b.path, &link)?;
     }
 
     match std::fs::rename(&staging, &final_dir) {
         Ok(()) => Ok(()),
-        Err(_) if final_dir.is_dir() => {
-            // Lost the race; the winner's dir is equivalent (content-addressed).
-            let _ = std::fs::remove_dir_all(&staging);
-            Ok(())
+        Err(_) if view_matches(&final_dir, bindings) => {
+            // Lost the race; reuse only an exactly equivalent winner.
+            remove_tree_or_link(&staging)
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = remove_tree_or_link(&staging);
             Err(e)
         }
     }
@@ -170,6 +298,7 @@ fn next_counter() -> u64 {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
 
     fn fake_bin(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
@@ -237,6 +366,75 @@ mod tests {
         let v2 = synth_path(&bindings, &cfg(root.path(), false)).unwrap();
         assert_eq!(v1.view_dir, v2.view_dir);
         assert!(v1.view_dir.is_dir());
+    }
+
+    #[test]
+    fn tampered_reused_view_is_quarantined_and_rebuilt() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let intended = fake_bin(source.path(), "intended");
+        let replacement = fake_bin(source.path(), "replacement");
+        let bindings = vec![Binding::new("tool", intended.clone())];
+        let first = synth_path(&bindings, &cfg(root.path(), false)).unwrap();
+        let link = first.view_dir.join("tool");
+        std::fs::remove_file(&link).unwrap();
+        symlink(&replacement, &link).unwrap();
+        std::fs::write(first.view_dir.join("extra"), b"not a symlink").unwrap();
+
+        let repaired = synth_path(&bindings, &cfg(root.path(), false)).unwrap();
+        assert_eq!(repaired.view_dir, first.view_dir);
+        assert_eq!(
+            std::fs::read_link(repaired.view_dir.join("tool")).unwrap(),
+            intended
+        );
+        assert!(!repaired.view_dir.join("extra").exists());
+        assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".quarantine-")
+        }));
+    }
+
+    #[test]
+    fn binding_names_cannot_escape_or_collide() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_bin(source.path(), "binary");
+        for name in ["", ".", "..", "../escape", "nested/tool", "/absolute"] {
+            let error = synth_path(
+                &[Binding::new(name, binary.clone())],
+                &cfg(root.path(), false),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+        }
+        assert!(
+            synth_path(
+                &[
+                    Binding::new("same", binary.clone()),
+                    Binding::new("same", binary),
+                ],
+                &cfg(root.path(), false),
+            )
+            .is_err()
+        );
+        assert!(!root.path().join("escape").exists());
+    }
+
+    #[test]
+    fn view_root_must_be_an_owned_real_directory() {
+        let source = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let real_root = parent.path().join("real");
+        std::fs::create_dir(&real_root).unwrap();
+        let linked_root = parent.path().join("linked");
+        symlink(&real_root, &linked_root).unwrap();
+        let binary = fake_bin(source.path(), "binary");
+        let error =
+            synth_path(&[Binding::new("tool", binary)], &cfg(&linked_root, false)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

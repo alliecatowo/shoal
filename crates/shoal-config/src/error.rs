@@ -17,6 +17,14 @@ pub enum ConfigError {
     /// error — every layer is optional (site/content/internals/configuration-reference.md) — this variant is
     /// only for a file that exists but can't be opened/read.
     Io { path: PathBuf, message: String },
+    /// A present config layer exceeded the control-plane byte wall. The
+    /// loader reads at most `max_bytes + 1`, so this is reported before the
+    /// whole file is retained or handed to TOML.
+    TooLarge { path: PathBuf, max_bytes: usize },
+    /// Config files are text and must be valid UTF-8.
+    Utf8 { path: PathBuf },
+    /// TOML nesting exceeded the loader's pre-parse complexity wall.
+    Complexity { path: PathBuf, max_nesting: usize },
     /// Malformed TOML syntax. `message` is `toml`'s own rendered diagnostic
     /// (it already includes a line/column pointer).
     Parse { path: PathBuf, message: String },
@@ -52,7 +60,12 @@ impl ConfigError {
                     *source = Some(path.to_path_buf());
                 }
             }
-            ConfigError::Io { .. } | ConfigError::Parse { .. } | ConfigError::Env { .. } => {}
+            ConfigError::Io { .. }
+            | ConfigError::TooLarge { .. }
+            | ConfigError::Utf8 { .. }
+            | ConfigError::Complexity { .. }
+            | ConfigError::Parse { .. }
+            | ConfigError::Env { .. } => {}
         }
         self
     }
@@ -62,6 +75,19 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Io { path, message } => write!(f, "{}: {message}", path.display()),
+            ConfigError::TooLarge { path, max_bytes } => write!(
+                f,
+                "{}: configuration exceeds the {max_bytes}-byte limit",
+                path.display()
+            ),
+            ConfigError::Utf8 { path } => {
+                write!(f, "{}: configuration is not valid UTF-8", path.display())
+            }
+            ConfigError::Complexity { path, max_nesting } => write!(
+                f,
+                "{}: configuration exceeds the {max_nesting}-level TOML nesting limit",
+                path.display()
+            ),
             ConfigError::Parse { path, message } => write!(f, "{}: {message}", path.display()),
             ConfigError::Type {
                 source,

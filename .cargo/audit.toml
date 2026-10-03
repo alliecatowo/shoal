@@ -1,0 +1,18 @@
+# cargo-audit configuration (HR-F6, site/content/internals/hardening-roadmap.md).
+#
+# `cargo audit` auto-discovers this file at `.cargo/audit.toml` relative to the invocation
+# directory (NOT a bare root-level `audit.toml`, which cargo-audit does not read); the
+# `supply-chain-audit` CI job (.github/workflows/ci.yml) audits both the root `Cargo.lock` and the
+# independently tracked `fuzz/Cargo.lock`. The former 15-entry Wasmtime 37 allowlist was removed
+# after the workspace upgraded to Wasmtime 46.0.1. There are deliberately no ignored advisories:
+# dependency upgrades must resolve findings instead of weakening the CI gate.
+#
+[advisories]
+ignore = []
+
+[output]
+# Beyond known-CVE vulnerabilities (which fail regardless of this section), also fail the gate on
+# unmaintained/unsound informational advisories and yanked crate versions in either lockfile — none
+# are currently present, so this is forward-hardening, not a suppression.
+deny = ["unmaintained", "unsound", "yanked"]
+quiet = false

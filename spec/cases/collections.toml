@@ -14,6 +14,18 @@ src = "[1, 2, 3].first(2)"
 value = "[1, 2]"
 
 [[case]]
+name = "range-eager-materialization-has-hard-limit"
+src = "(1..1000000).collect()"
+error = "range_materialization_limit"
+error_contains = "limited to 16384"
+
+[[case]]
+name = "range-json-materialization-has-the-same-hard-limit"
+src = "json.stringify(1..1000000)"
+error = "range_materialization_limit"
+error_contains = "limited to 16384"
+
+[[case]]
 name = "list-last-n"
 src = "[1, 2, 3].last(2)"
 value = "[2, 3]"

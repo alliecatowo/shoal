@@ -35,6 +35,11 @@ pwd                              # direct path value
 
 Use `^name` to bypass a non-callable value shadow and an adapter. It does **not** bypass a function, alias, other callable binding, or any builtin head; those resolve before the forced flag is consulted. To invoke an external executable that shares a builtin/callable name, use dynamic `run("name", ...)`.
 
+Every canonical head supports `-h` and `--help`. Help includes usage, typed arguments, options,
+subcommands where applicable, result behavior, errors, and examples. It is dispatched only after
+callable-shadow resolution and before expansion or effects, so `rm --help FILE`, `reef --help`, and
+`ls --help > output &` only render help. Use `--` to treat a later `--help` spelling as an operand.
+
 ## Complete inventory
 
 | Head | Signature summary | Primary result |
@@ -92,6 +97,12 @@ out = structured builtin result
 
 Their validation or filesystem failures raise an error rather than returning a non-ok outcome. File-operation failures currently often use the broad code `custom`; do not branch only on a platform-specific message.
 
+Structured builtins that eagerly construct strings, bytes, lists, tables, or records share a
+16,384-value / 16 MiB retained-output wall. They raise `builtin_output_limit` before retaining the
+next value or byte. Narrow the input or move repeated processing into a stream when a result can be
+larger. In particular, production `ls` stops directory iteration at the wall, `cat` reads only the
+remaining aggregate byte budget, and `head` reads line prefixes rather than loading the whole file.
+
 ## Filesystem inspection builtins
 
 ### `ls`
@@ -117,7 +128,7 @@ ls --all .
 (ls src).where(.type == "file").sort_by(.size)
 ```
 
-Hidden entries are skipped unless `-a` or `--all` is present. `ls` is not recursive. A missing/unreadable path raises a filesystem error.
+Hidden entries are skipped unless `-a` or `--all` is present. `ls` is not recursive. A missing/unreadable path raises a filesystem error. More than 16,384 admitted rows or 16 MiB of retained row state raises `builtin_output_limit`; directory enumeration is stopped before an extra production entry is retained.
 
 ### `stat`
 
@@ -150,7 +161,7 @@ Reads every file and concatenates the bytes without inserting separators.
 (cat a.bin b.bin).stdout.save("combined.bin")
 ```
 
-It requires at least one path. `.str()` requires valid UTF-8; `.display()` is the lossy conversion.
+It requires at least one path. `.str()` requires valid UTF-8; `.display()` is the lossy conversion. Concatenated output above 16 MiB raises `builtin_output_limit`; files are read incrementally against the shared budget.
 
 ### `head`
 
@@ -167,7 +178,7 @@ head README.md 3
 (head README.md 5).join(" | ")
 ```
 
-Errors include `arg_error` for no path, negative or invalid count, and `type_error` for a count of the wrong type. Extra positional arguments beyond the count are currently ignored; do not rely on that leniency.
+Errors include `arg_error` for no path, negative or invalid count, `type_error` for a count of the wrong type, and `builtin_output_limit` above 16,384 lines or 16 MiB of retained line state. `head` streams the requested prefixes and does not load the whole file. Extra positional arguments beyond the count are currently ignored; do not rely on that leniency.
 
 ## Filesystem mutation builtins
 
@@ -223,7 +234,39 @@ Errors include:
 - `arg_error` when fewer than two paths are provided;
 - `arg_error` when multiple sources target a non-directory;
 - `arg_error` when a directory is copied without recursion;
+- `arg_error` when source and destination identify the same file (including a hard-link alias), or
+  when a recursive destination resolves inside its source through lexical or symlinked parents;
 - a filesystem error for read/write failures.
+
+Recursive copy inventories every source before the first filesystem mutation. The shared plan is
+limited to 16,384 pending/final operations, 16 MiB of retained path state, and 64 directory levels;
+`builtin_work_limit` means the tree must be split into bounded subtrees. Directory iteration checks
+both entry count and aggregate encoded path bytes while reading. A preflight failure leaves every
+destination untouched. This is an allocation/effect-order guarantee, not an atomicity guarantee for
+an I/O failure that occurs after execution begins.
+
+The copy tree has an explicit portable metadata contract:
+
+- ordinary regular files and directories are accepted; symbolic links (live or broken), FIFOs,
+  sockets, device nodes, sparse files, and Unix setuid/setgid/sticky bits are rejected during the
+  complete preflight;
+- portable/user extended attributes are not silently dropped: a source or existing destination
+  carrying any is rejected before mutation. Mandatory host security labels such as SELinux labels,
+  which policy recreates for every new node, are treated as destination policy rather than portable
+  source metadata;
+- existing destinations must have the matching ordinary node type; symbolic links, special nodes,
+  and multiply-linked destination files are rejected rather than followed or modified through an
+  alias;
+- ordinary read/write/execute permissions are explicitly applied to copied files and directories.
+  Directory permissions are finalized deepest-first after their children are populated;
+- ownership and access/modification/birth timestamps are intentionally not preserved. New nodes are
+  owned by the copying process and timestamps describe the copy operation. Sparse allocation must be
+  materialized deliberately outside `cp` before copying.
+
+Filesystem adapters must implement extended-attribute inspection and permission updates to support
+`cp`; an adapter that cannot prove those parts of the contract fails closed. A hostile filesystem can
+still replace an admitted path between preflight and execution, so this is a deterministic metadata
+policy and effect-order guarantee, not a claim that pathname races are eliminated.
 
 When a journaled statement overwrites a file and the complete prior bytes fit the journal limit, Shoal records a restore inverse for `undo`. A too-large prior file is left non-reversible rather than storing a truncated inverse.
 
@@ -262,12 +305,19 @@ rm --permanent --recursive build
 Safety behavior:
 
 - no paths—including an empty glob—raises `no_matches`;
+- duplicate, relative, and intermediate-symlink aliases (plus hard-link aliases on Unix) raise
+  `rm_path_duplicate` before any trash directory or deletion is created;
+- a directory together with any descendant raises `rm_path_overlap` in either argument order;
 - permanent directory removal requires a recursive flag;
 - non-permanent directory removal is implemented as a rename and does not require recursion;
 - journaled trash moves can be undone while the trash target is intact;
 - trash storage is temporary, not a desktop trash protocol and not durable archival storage.
 
 `--permanent` bypasses the trash and is normally irreversible.
+Identity uses the injected filesystem port's canonicalization. The final component of a symbolic
+link is deliberately not followed because `rm link` removes the link, while symbolic-link aliases
+in parent components are resolved. These checks eliminate deterministic input overlap; they do not
+eliminate a hostile filesystem race between preflight and rename/removal.
 
 ### `ln`
 
@@ -437,6 +487,7 @@ echo ([1, 2, 3]) > values.txt
 ```
 
 `echo` does not append a newline to its structured string value. The external `^printf` remains available for byte-exact formatting.
+An eager result above 16 MiB raises `builtin_output_limit` while the destination string is being built.
 
 ### `env`
 
@@ -454,6 +505,8 @@ env.PATH
 ```
 
 More than one name is `arg_error`. `env.NAME` field syntax reads the session environment through the same evaluator path, and assignment writes it.
+The whole-record form admits entries incrementally and raises `builtin_output_limit` above 16,384
+entries or 16 MiB of retained key/value state.
 
 ### `sleep`
 
@@ -490,6 +543,8 @@ which --all python
 ```
 
 `--all` enumerates raw candidates from every provider without making a lock/conflict decision. Exactly one name is required. Protection states such as conflict, drift, or unlocked are represented as an unresolved report rather than silently lying with an ambient path.
+Candidate tables and nested scope/adapter lists use the shared 16,384-value / 16 MiB builtin result
+wall and raise `builtin_output_limit` rather than returning a partial report.
 
 See [Reef environments](@/docs/reef.md) for the report and lock model.
 
@@ -660,7 +715,7 @@ plan { STATEMENTS }
 -> {id: int, effects: list<str>, reversible: bool, spawns: bool}
 ```
 
-Derives conservative effects without spawning or mutating, stores the parsed program in the evaluator, and returns a session-local integer plan id.
+Derives conservative effects without spawning or mutating, stores the parsed program in the evaluator, and returns a monotonic session-local integer plan id. The evaluator retains the newest 256 executable plans. Eviction removes only the program: ids are never reused or retargeted.
 
 ```shoal
 let p = (plan rm build.log)
@@ -685,7 +740,7 @@ let p = (plan { touch marker })
 apply p
 ```
 
-An invalid value is `arg_error`; an unknown/expired evaluator-local id is `not_found`. The stored program is scoped to that evaluator process and is not durable.
+An invalid value is `arg_error`; an id never issued in this evaluator is `plan_not_found`; an issued id whose program aged out is `plan_expired` with a hint to derive a fresh plan. The stored program is scoped to that evaluator process and is not durable.
 
 ### `explain`
 
@@ -725,6 +780,9 @@ reef doctor
 ```
 
 The detailed discovery, lock, provider, runner, drift, and error contract lives in [Reef environments](@/docs/reef.md).
+Binding, lock, doctor, and candidate tables admit names and rows incrementally against the shared
+16,384-value / 16 MiB builtin result wall. Overflow is `builtin_output_limit`; a mutating lock
+command does not persist its staged lock when result admission fails.
 
 ## Canonical names versus callable builtins
 
@@ -757,7 +815,8 @@ The current builtin parsers are intentionally small, and several do not yet enfo
 - `cd`, `source`, `exit`, `quit`, `apply`, and `explain` primarily consume the first value;
 - `head` ignores values after its count;
 - `journal` accepts only literal `--name=value`/recognized long-flag value shapes;
-- builtins do not provide per-head `--help` output.
+- runtime arity checks and completion are not yet fully generated from the canonical signature
+  schema, so the remaining permissive cases above can still drift from displayed help.
 
 Treat these as current gaps, not extension points. Write the documented signature so stricter validation will not break your scripts.
 

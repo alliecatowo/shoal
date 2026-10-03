@@ -59,21 +59,18 @@ error = "utf8_error"
 [[case]]
 name = "errcode-recursion-limit-on-unbounded-native-recursion"
 # The interpreter's own call-stack guard (site/content/internals/language-conformance-contract.md-adjacent implementation
-# detail, `call_value`'s `call_depth` counter) caps nested calls at 10000,
-# independent of any language-level tail-call optimization. shoal-eval's own
-# `defect9_recursion_guard_returns_error` unit test proves the guard fires
-# correctly, but only by spawning a dedicated 2GiB-stack thread first — the
-# tree-walk interpreter's real per-call native stack usage overflows this
-# harness's default test-thread stack well before the 10000-call counter
-# guard trips (observed: SIGABRT stack-overflow, aborting the whole
-# conformance binary, not a clean case failure) — so this is asserted at the
-# unit-test layer, never safely reachable from this corpus.
+# detail, `call_value`'s `call_depth` counter) caps nested calls at 128,
+# independent of any language-level tail-call optimization. Recursive call
+# dispatch avoids retaining unrelated expression-dispatch frames, and focused
+# tests prove the exact boundary on an explicit 32 MiB stack. This corpus runs on the
+# Rust test harness's smaller default worker stack, so it retains a host-stack
+# skip rather than aborting the complete conformance process.
 src = '''
 fn f(n: int) { f(n + 1) }
 f(0)
 '''
 error = "recursion_limit"
-skip = "10000 nested tree-walk calls overflows this harness's default test-thread native stack before the call_depth counter guard trips (SIGABRT, not a clean failure) — shoal-eval's defect9_recursion_guard_returns_error unit test covers this correctly on a dedicated 2GiB-stack thread instead"
+skip = "the depth-128 guard is proven on an explicit 32 MiB native stack; this conformance harness's smaller default test-worker stack overflows before reaching it"
 
 [[case]]
 name = "errcode-reef-not-found-lock-with-no-manifest"
@@ -102,6 +99,14 @@ name = "errcode-non-ref-string-still-dispatches-string-methods"
 # `.len` is the character count (5), never a content-ref resolution attempt.
 src = '"hello".len'
 value = "5"
+
+[[case]]
+name = "errcode-truncated-content-ref-display-remains-a-string"
+# Human-facing previews and documentation commonly abbreviate hashes. Only a
+# canonical 64-digit lowercase hash is a resolvable content ref; prefix-shaped
+# prose must retain ordinary string semantics.
+src = '"val:blake3:8baef...".len'
+value = "19"
 
 [[case]]
 name = "errcode-lang-block-unbalanced-braces-is-a-parse-error"

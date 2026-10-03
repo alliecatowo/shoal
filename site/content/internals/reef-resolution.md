@@ -7,7 +7,7 @@ template = "docs/page.html"
 [extra]
 group = "Storage & tooling"
 eyebrow = "Reproducible tool resolution"
-status = "Implemented with cache and discovery gaps"
+status = "Implemented"
 audience = "Reef, execution, Leash, prompt, and tooling contributors"
 wide = true
 +++
@@ -82,9 +82,14 @@ Foreign adapters are read-only:
 | `.tool-versions` | first version token on each non-comment line | fallbacks after first token and plugin-specific semantics |
 | user `shoal.toml` | `[reef]` native shape | all other host config |
 
-Parsing APIs return a `ManifestError`; normal scope discovery silently skips unreadable or malformed
-files. `reef doctor` has extra checks for local malformed manifests, but ordinary spawn discovery can
-fall through without surfacing the typo.
+Parsing APIs return a `ManifestError`; normal scope discovery skips unreadable or malformed files so
+farther scopes remain usable and retains each reason in `ScopeChain::warnings`. Retention is capped at
+64 entries of at most 4 KiB each, with a suppression marker at the ceiling. Interactive evaluation
+emits retained warnings once per unchanged discovery identity and remains best-effort. Noninteractive
+script/agent evaluation fails closed before an external spawn until the bad authority is repaired.
+Evaluator discovery uses the installed filesystem capability and bounded regular-file/UTF-8 reads
+rather than ambient whole-file calls. `reef doctor` adds focused invalid-lock and local-manifest
+reporting and remains available for diagnosis.
 
 ## Scope discovery
 
@@ -102,20 +107,21 @@ the same directory. The optional user `[reef]` scope is appended last.
 There is no Git/home boundary and no “nearest manifest only” rule: all accepted scopes participate
 in compatibility checking. This differs from `shoal-config`'s single nearest `.shoal.toml`.
 
-### Empty-tools discovery bug
+### Active-scope admission
 
-`collect_dir` and user-scope discovery only retain a manifest when `manifest.tools` is nonempty. A
-manifest containing only `[runners]` or `[options] hermetic = true` disappears entirely, so its
-runner or hermetic intent cannot take effect. This is a source-level behavior gap; the parser itself
-successfully returns the data.
+Discovery retains a normalized manifest when it constrains a tool, defines a runner, or requests
+hermetic execution. This applies equally to native project manifests and the user `[reef]` scope;
+runner-only and hermetic-only policy therefore takes effect without a dummy tool entry. A completely
+empty/default-only manifest is parsed but omitted because it has no scope-level effect.
 
-### Scope key versus evaluator cache
+### Discovery fingerprint and evaluator cache
 
-`ScopeChain::key()` records every source path and mtime, and its comments claim callers can detect
-staleness. The evaluator does not use that key. `ensure_reef_chain` rebuilds only when cwd changes;
-editing a manifest or lock while remaining in the same cwd leaves the cached chain/lock stale until
-some explicit command invalidates it or cwd changes away/back. Prompt snapshots inherit the same
-staleness.
+The evaluator compares a fixed-size BLAKE3 metadata fingerprint before reusing its parsed chain. It
+covers every possible manifest and adjacent lock path from cwd to root, including missing candidates,
+plus the user scope; file kind, device, inode, byte length, mtime, and ctime participate. Creating,
+editing, replacing, repairing, or removing a manifest or lock therefore reloads both in the same cwd,
+including an equal-length rewrite whose mtime is restored. `ScopeChain::key()` remains the narrower
+identity of already accepted scopes, while `discovery_key_with` is the cache guard.
 
 ## Constraint algebra
 
@@ -150,6 +156,15 @@ constrained in scope; ordinary PATH behavior remains unchanged.
 ## Provider contract and default stack
 
 Providers enumerate candidates without network and, where possible, without running the binary.
+The trait returns `Result<CandidateDiscovery, ProviderError>`, not `Vec<Candidate>`.
+`CandidateDiscovery::push` admits at most 4,096 identities / 16 MiB of tool, version, provider, and
+encoded-path state. Built-in providers use it while enumerating, and external implementations cannot
+construct an accepted discovery without the same admission. Overflow maps to `reef_provider` rather
+than an incomplete candidate set. The same object admits at most 4,096 filesystem visits / 16 MiB
+of encoded visited paths, including misses and malformed entries, before built-in providers inspect
+them. Mise enumeration surfaces iterator and metadata failures instead of silently flattening or
+truncating them. The resolver folds admitted candidates into one current best value; it does not
+duplicate the discovery into a second ranked collection.
 Version probing is separated so the resolver invokes it only for constraints that require a
 concrete version. Fetch is optional and only explicitly invoked by `reef fetch` today.
 
@@ -171,10 +186,18 @@ Regular-file and Unix executable bits are required. Windows/ConPTY layouts are n
 
 ### System version probe
 
-`<binary> --version` is run with null stdin and captured stdout/stderr. Polling uses a 300 ms hard
-deadline, kills/reaps on timeout, and extracts the first dotted version-shaped token, falling back to
-a bare integer. Failure or unparseable output becomes `Version::unknown`. Results cache by path for
-the life of the provider, without mtime/hash invalidation.
+`<binary> --version` is run with null stdin while bounded reader workers drain both pipes. Polling
+uses a 300 ms hard deadline, kills the process group and reaps on timeout, and extracts the first
+dotted version-shaped token, falling back to a bare integer. Failure or unparseable output becomes
+`Version::unknown`. Results cache by path plus device/inode/mtime/ctime/length identity, clear at 1,024
+entries, and discard uncertain state after lock poison.
+
+Library callers can install a pre-probe guard and an explicit provider subprocess context. Evaluator
+callers always do: a restricted principal must allow the opaque effect and any active executable
+name/hash pin, then the probe runs through the evaluator's complete environment, cancellation epoch,
+and Leash filesystem sandbox. A requested filesystem sandbox is fail-closed when the OS backend is
+unavailable. The candidate is never executed after a guard error. Unrestricted library/CLI callers
+retain the bounded direct-probe behavior.
 
 ### Candidate ranking
 
@@ -196,7 +219,10 @@ show `unknown` even when singular constrained resolution would probe.
 
 A `LockEntry` records tool name, version, provider, absolute path, BLAKE3 hash, and resolution
 timestamp. `Lockfile` serializes under repeated `[[tool]]`-style TOML according to its serde model and
-lives conventionally beside a chosen manifest as `reef.lock`.
+lives conventionally beside a chosen manifest as `reef.lock`. Because the path and executable bytes
+are installation- and platform-specific, this is a host-local materialization record rather than a
+portable dependency lock; repositories commit exact manifest constraints and materialize the lock
+after installing tools on each host.
 
 The evaluator chooses the lock path beside the nearest native `.reef.toml`; if none exists, beside
 the first discovered foreign/user scope. One in-memory lock therefore serves the whole active scope
@@ -221,22 +247,30 @@ the constraint relies on the stored version string.
 | interactive | resolve fresh, insert lock, emit one notice | resolve fresh without meaningful project lock use |
 | script | `reef_unlocked` with lock hint | resolve fresh if called directly; evaluator normally bypasses unconstrained heads |
 
-`refresh_lock` removes the entry and forces fresh resolution. Interactive spawn writes a fresh
-in-memory entry and calls best-effort persistence. `persist_reef_lock` deliberately swallows save
-errors, so a command can run after printing an auto-lock notice even when the lock did not reach
-disk. A later script can then fail `reef_unlocked`. Persistence failure should become observable.
+`refresh_lock` removes the entry and forces fresh resolution. Interactive spawn persists a fresh
+candidate lock before rewriting `argv[0]` or publishing the lock in evaluator state. Save failure is
+`reef_provider` and stops before process spawn.
 
-`reef lock` iterates every uniquely constrained name, optionally refreshes, records per-row success
-or code, replaces in-memory lock, and best-effort saves. `reef add` edits the nearest native manifest
-or local `.reef.toml`, invalidates the chain, and attempts a refresh lock; the manifest edit remains
-even if locking fails.
+`reef lock` iterates every uniquely constrained name, optionally refreshes, records per-row
+resolution results, then persists the candidate lock before replacing evaluator state. A save error
+fails the command rather than returning misleading successful rows. `reef add` edits the nearest
+native manifest or local `.reef.toml`, invalidates the chain, and attempts a refresh lock; the
+manifest edit remains when locking or persistence fails, and the returned record says `locked:
+false`. Bare `reef` and `which` use the same persistence-before-publication rule for fresh entries.
+Malformed or inadmissible existing locks remain a retained load error: constrained execution fails
+before resolution/spawn, persistence cannot overwrite the bad file, and `reef doctor` reports it as
+an invalid lockfile. Evaluator lock loads and parent-fsynced atomic replacements run through the
+installed filesystem capability. `reef add` applies the same one MiB input wall and atomic manifest
+replacement before invalidating discovery.
 
 ## Hash cache
 
-File hashing reads BLAKE3 on a cache miss keyed by Unix device, inode, mtime seconds/nanoseconds, and
-length. This invalidates normal in-place rewrites while avoiding repeated reads. It is process-local
-and unbounded. An adversarial rewrite preserving all identity fields could fool the cache; policy
-paths requiring hostile-file guarantees should not rely solely on metadata identity.
+File hashing reads BLAKE3 on a cache miss keyed by Unix device, inode, mtime and ctime
+seconds/nanoseconds, and length. This invalidates ordinary same-inode rewrites, including an
+equal-length rewrite whose mtime is restored, while avoiding repeated reads. It is process-local and
+clears at 4,096 identities rather than growing for process lifetime. A hostile filesystem able to
+preserve or falsify every identity field could still fool this acceleration cache; policy paths
+requiring hostile-file guarantees must not treat metadata identity as content authority.
 
 The same resolution hash is returned to evaluator execution so Leash spawn preflight can reuse it
 instead of reading the executable again. That equality is an important cross-subsystem contract.
@@ -287,8 +321,8 @@ known extension, Reef reads only the first line and recognizes direct interprete
 `/usr/bin/env <tool>`; shebang flags beyond the selected tool are not preserved.
 
 The runner tool is itself a normal command head and is Reef-resolved before spawn. The `self`
-sentinel returns control to Shoal's native `.shl` path. Because runner-only manifests are currently
-dropped during discovery, custom runners require at least one tool entry in the same manifest.
+sentinel returns control to Shoal's native `.shl` path. Runner-only project and user manifests are
+active scopes.
 
 ## Dynamic `with reef:` overrides
 
@@ -307,7 +341,7 @@ the underlying discovered chain; with no discovered manifest, persistence may ha
 | `which <tool> --all` | raw candidates from all providers, no lock/constraint decision |
 | bare `reef` | binding table from current scopes/lock |
 | `reef add tool@ver` | edit manifest and attempt fresh lock |
-| `reef lock [--refresh]` | resolve every constrained name and persist results best-effort |
+| `reef lock [--refresh]` | resolve every constrained name; publish successful rows only after the host-local lock persists |
 | `reef fetch <tool>` | ask providers in order; currently only mise installs |
 | `reef doctor` | rows for drift/unlocked, orphan lock entries, shadowed ambient binaries, malformed local manifests |
 
@@ -317,9 +351,10 @@ than lying with an ambient fallback on conflict or drift.
 
 ## Prompt integration
 
-The prompt snapshot performs no resolution or version probe. It reads the cached scope chain and
-already-loaded lock, returning one row per constrained tool. An unlocked tool has no version/provider.
-This preserves prompt latency but also inherits evaluator cache staleness and cannot detect drift.
+The prompt snapshot performs no resolution or version probe. It first checks the discovery metadata
+fingerprint, then reads the cached parsed scopes and already-loaded lock, returning one row per
+constrained tool. An unlocked tool has no version/provider. This preserves prompt latency without
+same-cwd manifest staleness; executable drift is still checked only when the tool is resolved.
 
 ## Stable errors
 
@@ -336,16 +371,26 @@ copying stable code/message/hint and adding the source span.
 
 ## Failure and security analysis
 
-- Discovery uses direct filesystem APIs and silently skips malformed/unreadable files.
-- Manifest and provider paths are not mediated by evaluator `Fs`/Leash policy.
-- Provider version probing executes candidate binaries before the final command's Leash spawn gate;
-  constrained `Any/latest` usually avoids the probe, but numeric/raw constraints can run it.
-- `reef fetch` can invoke network-capable `mise install`; it is a builtin path that needs explicit
-  effect/policy auditing.
-- View symlinks are created in a user runtime/temp tree; directory permissions and symlink integrity
-  are part of executable selection security.
-- Lock persistence failures are silent.
-- Same-cwd manifest/lock edits are stale in evaluator cache.
+- Evaluator manifest and lock discovery/load/persistence use its `Fs` capability and bounded reads;
+  standalone `shoal-reef` APIs intentionally select the ambient `StdFs` adapter.
+- Provider installation layouts, executable hashing, version probes, and view construction remain
+  host tooling boundaries rather than evaluator `Fs` operations.
+- Provider version probing can execute candidate binaries for numeric/raw constraints. Evaluator
+  integration guards that execution with opaque/spawn-pin policy and runs shipped probes through a
+  300 ms, 16 KiB, cancellation-aware filesystem-sandboxed capability. A requested sandbox is
+  fail-closed if enforcement is unavailable; unrestricted standalone Reef APIs intentionally use
+  the bounded ambient runner.
+- `reef fetch` can invoke network-capable `mise install`. Evaluator execution rechecks opaque policy,
+  spawn pins, and sandbox requirements before entering any provider hook; provider pins restrict
+  which hook may run. The shipped mise hook uses the same injected runner with a 15-minute wall and
+  256 KiB combined-output cap. Leash filesystem grants are OS-enforced or the installer is refused;
+  network access remains represented by the opaque policy decision rather than an OS network sandbox.
+- View symlinks are created beneath an owned, real directory forced to mode `0700`. Binding names
+  must be one non-empty normal path component, targets must be absolute executable regular files,
+  and a reused view must contain exactly the expected symlinks. A mismatch is atomically quarantined,
+  removed, rebuilt, and post-publication validated.
+- Persistence failures are typed and fail before lock state or spawn publication; manifest and lock
+  replacement is atomic, but provider acquisition itself can still have external partial effects.
 - “Hermetic” controls PATH tail only; it is not a filesystem/network/process sandbox.
 
 ## Test map
@@ -356,9 +401,14 @@ idempotence/races, runners, reports, and error strings. Evaluator tests cover sp
 versus interactive lock policy, builtin tables/errors, ambient shadowing, doctor findings, and runner
 integration. Corpus suites `reef.toml` and `reef-provider-errors.toml` pin user-visible behavior.
 
-Missing high-value evidence includes same-cwd cache invalidation, lock-save failure propagation,
-runner-only/hermetic-only manifest discovery, hostile view-directory mutation, and policy tests for
-version probes/fetch.
+Same-cwd creation/edit/removal/repair fingerprints, equal-length restored-mtime rewrites,
+interactive warning-once and strict noninteractive refusal, bounded warning floods, lock-save
+failure propagation, oversized manifest admission, provider flood/timeout descendants, cache
+identity churn, poisoned-cache recovery, and
+runner-only/hermetic-only project and user scope discovery, denied version probes/fetch hooks,
+provider-pinned fetch selection, hostile view-link replacement/extra entries, binding path traversal,
+symlinked view roots, and live Landlock denial from both version probes and mise installers are
+covered. Remaining high-value evidence includes platform-specific provider/view behavior beyond Unix.
 
 ## Change checklist
 

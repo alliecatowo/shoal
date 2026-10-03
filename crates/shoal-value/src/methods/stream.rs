@@ -4,7 +4,6 @@
 //! the statement sink, or a child process) and never reach here.
 
 use super::*;
-use std::fs::OpenOptions;
 use std::io::Write as _;
 
 pub(crate) fn stream_method(
@@ -28,7 +27,9 @@ pub(crate) fn stream_method(
             f => s.take_until_pred(f.clone()).map(stream),
         },
         "dedupe" => no_args(&args).and_then(|_| s.dedupe()).map(stream),
-        "distinct" => no_args(&args).and_then(|_| s.distinct()).map(stream),
+        "distinct" => distinct_limit(&args)
+            .and_then(|limit| s.distinct_bounded(limit))
+            .map(stream),
         "debounce" => s.debounce(dur_arg(&args, 0)?).map(stream),
         "throttle" => s.throttle(dur_arg(&args, 0)?).map(stream),
         "window" => match arg(&args, 0)? {
@@ -40,7 +41,10 @@ pub(crate) fn stream_method(
                 "window expects a positive count or a duration",
             )),
         },
-        "buffer" => s.buffer(int_arg(&args, 0, 1)?).map(stream),
+        "buffer" => {
+            let capacity = int_arg(&args, 0, 1)?;
+            ctx.buffer_stream(s, capacity).map(stream)
+        }
         "enumerate" => no_args(&args).and_then(|_| s.enumerate()).map(stream),
         "merge" => match arg(&args, 0)? {
             Value::Stream(o) => s.merge(o.clone()).map(stream),
@@ -76,6 +80,12 @@ pub(crate) fn stream_method(
         // bounded per-fork queues (`stream/tee.rs`).
         "tee" => {
             let n = int_arg(&args, 0, 2)?;
+            if n == 0 || n > StreamVal::TEE_MAX_FORKS {
+                return Err(ErrorVal::arg_error(format!(
+                    "tee count must be between 1 and {}",
+                    StreamVal::TEE_MAX_FORKS
+                )));
+            }
             if s.is_bounded() {
                 super::list::tee(Value::List(collect_stream(ctx, &s)?), n)
             } else {
@@ -111,10 +121,14 @@ fn stream_save(ctx: &mut dyn CallCtx, s: StreamVal, path: &Value) -> VResult<Val
     } else {
         ctx.cwd().join(p)
     };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p)
+    // Open once through the injected `Fs` port instead of `std::fs::OpenOptions`
+    // (HR-C2): the sink keeps its open-once / append-each-item streaming shape,
+    // but the write now crosses the same enforceable boundary as `path.read`.
+    // `ctx.fs()` borrows `ctx` only for this call and hands back an owned
+    // writer, so `drive_stream` below can still take `ctx` mutably.
+    let mut file = ctx
+        .fs()
+        .open_append(&p)
         .map_err(|e| ErrorVal::new("custom", format!("{}: {e}", p.display())))?;
     let mut up = s.take_upstream()?;
     drive_stream(ctx, &mut *up, |_ctx, v| {
@@ -132,7 +146,7 @@ fn value_line_bytes(v: &Value) -> VResult<Vec<u8>> {
     Ok(match v {
         Value::Str(s) => s.as_bytes().to_vec(),
         Value::Bytes(b) => (**b).clone(),
-        _ => serde_json::to_vec(&value_to_json(v))
+        _ => serde_json::to_vec(&value_to_json(v)?)
             .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
     })
 }
@@ -141,5 +155,24 @@ fn dur_arg(args: &CallArgs, n: usize) -> VResult<std::time::Duration> {
     match args.pos.get(n) {
         Some(Value::Duration(ns)) if *ns >= 0 => Ok(std::time::Duration::from_nanos(*ns as u64)),
         _ => Err(ErrorVal::arg_error("expected a non-negative duration")),
+    }
+}
+
+fn distinct_limit(args: &CallArgs) -> VResult<usize> {
+    if !args.named.is_empty() || args.pos.len() > 1 {
+        return Err(ErrorVal::arg_error(
+            "distinct accepts at most one positional history limit",
+        ));
+    }
+    match args.pos.first() {
+        None => Ok(StreamVal::DISTINCT_MAX_VALUES),
+        Some(Value::Int(limit)) if *limit > 0 => {
+            usize::try_from(*limit).map_err(|_| ErrorVal::arg_error("distinct limit is too large"))
+        }
+        Some(Value::Int(_)) => Err(ErrorVal::arg_error("distinct limit must be positive")),
+        Some(value) => Err(ErrorVal::type_error(format!(
+            "distinct limit must be int, found {}",
+            value.type_name()
+        ))),
     }
 }

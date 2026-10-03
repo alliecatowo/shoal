@@ -8,6 +8,7 @@ use std::{
     cmp::Reverse,
     collections::BTreeSet,
     io::{self, IsTerminal, Write},
+    ops::Range,
 };
 use unicode_segmentation::UnicodeSegmentation;
 #[derive(Debug, Clone)]
@@ -137,6 +138,18 @@ impl Model {
     pub fn selected(&self, original: usize) -> bool {
         self.selected.contains(&original)
     }
+
+    /// Ranked rows visible around the cursor. Navigation may span the complete
+    /// result set, while drawing retains only this fixed-height window.
+    pub fn visible_range(&self, height: usize) -> Range<usize> {
+        let height = height.max(1);
+        let start = if self.cursor < height {
+            0
+        } else {
+            self.cursor + 1 - height
+        };
+        start..(start + height).min(self.ranked.len())
+    }
 }
 pub fn score(query: &str, candidate: &str) -> Option<(i64, Vec<usize>)> {
     if query.is_empty() {
@@ -265,11 +278,13 @@ fn draw(out: &mut impl Write, m: &Model, o: &Options) -> io::Result<()> {
         terminal::Clear(terminal::ClearType::All)
     )?;
     write!(out, "{}{}\r\n", o.prompt, m.query)?;
-    for (i, r) in m.ranked.iter().take(o.height).enumerate() {
+    let visible = m.visible_range(o.height);
+    for (offset, r) in m.ranked[visible.clone()].iter().enumerate() {
+        let index = visible.start + offset;
         write!(
             out,
             "{}{} {}\r\n",
-            if i == m.cursor { "❯" } else { " " },
+            if index == m.cursor { "❯" } else { " " },
             if m.selected(r.original) { "●" } else { " " },
             highlight(&r.display, &r.positions)
         )?
@@ -348,5 +363,55 @@ mod tests {
         row.insert("n".into(), Value::Int(2));
         let values = Value::Table(vec![row.clone()]).into_picker_values();
         assert_eq!(values, vec![Value::Record(row)]);
+    }
+
+    #[test]
+    fn viewport_follows_cursor_through_rows_and_pages() {
+        let values = (0..10).map(Value::Int).collect();
+        let mut model = Model::new(
+            values,
+            &Options {
+                height: 3,
+                ..Options::default()
+            },
+        );
+        assert_eq!(model.visible_range(3), 0..3);
+        model.apply(Action::PageDown);
+        assert_eq!(model.cursor, 3);
+        assert_eq!(model.visible_range(3), 1..4);
+        model.apply(Action::Down);
+        assert_eq!(model.visible_range(3), 2..5);
+        model.apply(Action::PageDown);
+        assert_eq!(model.cursor, 7);
+        assert_eq!(model.visible_range(3), 5..8);
+        model.apply(Action::PageDown);
+        assert_eq!(model.cursor, 9);
+        assert_eq!(model.visible_range(3), 7..10);
+    }
+
+    #[test]
+    fn draw_marks_the_global_cursor_inside_scrolled_window() {
+        let mut model = Model::new(
+            (0..6).map(Value::Int).collect(),
+            &Options {
+                height: 2,
+                ..Options::default()
+            },
+        );
+        model.apply(Action::PageDown);
+        model.apply(Action::Down);
+        let mut output = Vec::new();
+        draw(
+            &mut output,
+            &model,
+            &Options {
+                height: 2,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("❯  3"));
+        assert!(!output.contains("  0\r\n"));
     }
 }

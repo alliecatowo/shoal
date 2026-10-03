@@ -82,6 +82,27 @@ fn env_value_with_braces_and_quotes_round_trips_through_seeding() {
 }
 
 #[test]
+fn render_width_from_config_bounds_block_tables() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run_with_config(
+        home.path(),
+        "version = 1\n[render]\nwidth = 20\n",
+        "[{very_long_column: \"abcdefghijklmno\", second_column: \"1234567890\"}]",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("very_lo…"), "stdout was {stdout:?}");
+    assert!(
+        !stdout.contains("very_long_column"),
+        "configured width was ignored: {stdout:?}"
+    );
+}
+
+#[test]
 fn render_color_false_in_config_suppresses_ansi_without_no_color_env() {
     // A parse error's diagnostic is always colorized unless suppressed
     // (`main.rs::format_diagnostic`); trigger one with a config that sets
@@ -195,5 +216,78 @@ fn config_namespace_reflects_the_host_applied_config() {
         stdout.contains("4242"),
         "config.all() should expose the host-applied resolved config; stdout was {stdout:?}, stderr {:?}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn prompt_print_runs_bounded_custom_module_from_real_config() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config/shoal");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("prompt.toml"),
+        r#"
+[format]
+left = "$custom_probe"
+right = ""
+
+[module.custom.probe]
+command = "printf 'real custom output'"
+cache_ttl = "10s"
+format = "<${output}>"
+"#,
+    )
+    .unwrap();
+    let output = Command::new(BIN)
+        .args(["prompt", "print", "--side", "left"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("NO_COLOR", "1")
+        .current_dir(home.path())
+        .output()
+        .expect("run shoal prompt print");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "<real custom output>"
+    );
+}
+
+#[test]
+fn project_prompt_config_cannot_launch_custom_commands() {
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("project-command-ran");
+    std::fs::write(
+        home.path().join(".shoal.toml"),
+        format!(
+            r#"
+[prompt.format]
+left = "$custom_project"
+
+[prompt.module.custom.project]
+command = "touch {}"
+"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(BIN)
+        .args(["prompt", "print", "--side", "left"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("empty-config"))
+        .env("NO_COLOR", "1")
+        .current_dir(home.path())
+        .output()
+        .expect("run shoal prompt print in untrusted project");
+    assert!(output.status.success());
+    assert!(!marker.exists(), "project prompt command unexpectedly ran");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("module.custom ignored"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

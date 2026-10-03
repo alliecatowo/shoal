@@ -227,11 +227,13 @@ same PTY and marks the row suspended again.
 
 The host marks the row running, prints a background notice, and calls `resume_background`. A detached
 thread attaches an output pump, does not forward stdin, and uses a fresh never-cancelled token so
-foreground Ctrl-C does not kill it. If it stops again, it is re-parked.
+foreground Ctrl-C does not kill it. The worker reports exit, failure, or a later stop through a
+channel; the REPL drains those notifications at prompt/read boundaries and reconciles its evaluator
+row on the owning thread. If the job stops again, it is re-parked and marked suspended.
 
-Current limitation: background completion does not update the evaluator task row. It can remain
-shown as running until session shutdown or another host path retires it. This is a cross-thread
-lifecycle gap, not merely stale rendering.
+A running background PTY still cannot be reattached with `fg`: the detached worker owns the live
+`PtyJob`, so the host reports that limitation instead of retiring the evaluator row. Foregrounding
+would require a control channel into the worker and an explicit terminal-ownership handoff.
 
 ## Task lifecycle versus external jobs
 
@@ -239,9 +241,9 @@ lifecycle gap, not merely stale rendering.
 external PTYs share the `jobs` table shape but do not share one execution mechanism. External task
 hooks signal PGIDs. A generic spawned task may only have a cancellation token or other hooks.
 
-Kernel `task.suspend`/`task.resume` availability must be read against the actual session/handler
-implementation: the local evaluator has methods, while some kernel paths intentionally report task
-control unavailable. Do not infer RPC support from `TaskVal` alone.
+Kernel `task.suspend`/`task.resume` track and signal process groups registered under a task's
+cancellation epoch. They work for process-backed tasks and intentionally report control unavailable
+for evaluator-only computation. Do not infer RPC capability from `TaskVal` hooks alone.
 
 ## Long-lived `PtySession`
 
@@ -348,11 +350,14 @@ different ownership and output contracts.
 ## Known sharp edges
 
 - Job control is Unix/process-global and assumes one local controlling terminal.
-- Background completion does not retire the evaluator row.
+- Background completion notices are reconciled only when the REPL regains control at a read/prompt
+  boundary; they do not asynchronously repaint a currently blocked Reedline prompt.
+- A live background PTY cannot yet be moved back to the foreground.
 - A pump missing its 500 ms drain grace may outlive the serve briefly.
 - PTY tee only retains a bounded prefix and never spills.
 - Programmatic sessions retain no scrollback and expose no push change subscription.
 - Task and PTY registries are separate, so partial transition failures create stale rows/resources.
-- Long-lived `PtySession` close is hard-kill rather than graceful INT/TERM escalation.
+- Explicit long-lived `PtySession` close uses a bounded INT → TERM → KILL ladder; dropping an
+  abandoned handle intentionally remains an immediate hard-kill backstop.
 - Real terminal handoff is raw byte forwarding, not classic controlling-terminal process-group transfer;
   code copied from a conventional shell may be invalid in this model.

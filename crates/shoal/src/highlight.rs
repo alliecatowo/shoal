@@ -1,6 +1,6 @@
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
-use shoal_syntax::commands::builtin_names;
+use shoal_syntax::commands::{CommandFacts, CommandSource, builtin_names, resolve_command_source};
 use shoal_syntax::{Lexer, Mode, Tok};
 use shoal_value::{Env, Value};
 
@@ -218,8 +218,26 @@ impl Highlighter for ShoalHighlighter {
                 // (session `fn`/alias) dispatches CMD and is a known-valid
                 // command even though PATH has never heard of it.
                 let bound = self.binding(name);
-                let callable = bound.as_ref().is_some_and(Value::is_callable);
-                let value_bound = bound.is_some() && !callable;
+                let source = resolve_command_source(
+                    name,
+                    CommandFacts {
+                        session_callable: bound.as_ref().is_some_and(Value::is_callable),
+                        session_value: bound.as_ref().is_some_and(|value| !value.is_callable()),
+                        value_eligible: rest.is_empty()
+                            || rest.starts_with(';')
+                            || rest.starts_with('\n'),
+                        forced: false,
+                        dynamic_run: false,
+                        runner: false,
+                        // The highlighter has no plugin registry snapshot.
+                        plugin: false,
+                        // The highlighter has no adapter catalog; known adapter
+                        // names are still supplied by completion.
+                        adapter: false,
+                    },
+                );
+                let callable = source == CommandSource::SessionCallable;
+                let value_bound = source == CommandSource::BoundValue;
                 let chains = line[end..].starts_with('.')
                     && line.as_bytes()[end + 1..]
                         .first()
@@ -422,20 +440,49 @@ mod tests {
     // `NO_COLOR`/env is process-global; every env-touching test across this
     // bin shares `crate::ENV_TEST_LOCK` (defined in main.rs) so a setter in one
     // module can't leak env state into another module's color assertion.
+    //
+    // Almost every test below asserts specific ANSI colors/styles, so the
+    // color environment must be forced on regardless of whatever ambient
+    // `NO_COLOR` the invoking shell/CI happens to export (deep audit H13):
+    // the product is right to honor `NO_COLOR`, but these tests exercise the
+    // *colored* branch of `highlight()` on purpose and must not silently
+    // degrade to asserting nothing whenever `NO_COLOR=1` is set in the test
+    // runner's environment. `with_forced_color` unsets `NO_COLOR` for the
+    // duration of the closure (still under `ENV_TEST_LOCK`) and restores
+    // whatever was there before, so this suite passes identically whether
+    // invoked as `NO_COLOR=1 cargo test` or with `NO_COLOR` unset.
+    fn with_forced_color<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NO_COLOR");
+        // SAFETY: serialized by `ENV_TEST_LOCK` against every other test in
+        // this binary that reads or writes `NO_COLOR`.
+        unsafe { std::env::remove_var("NO_COLOR") };
+        let result = f();
+        match prev {
+            // SAFETY: same lock/serialization as above.
+            Some(v) => unsafe { std::env::set_var("NO_COLOR", v) },
+            None => unsafe { std::env::remove_var("NO_COLOR") },
+        }
+        result
+    }
 
     fn styles_for(line: &str) -> Vec<(Style, String)> {
-        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
-        ShoalHighlighter::default()
-            .highlight(line, line.len())
-            .buffer
+        with_forced_color(|| {
+            ShoalHighlighter::default()
+                .highlight(line, line.len())
+                .buffer
+        })
     }
 
     /// Highlight with a session env carrying one value binding (`someVar`)
     /// and one callable binding (`deploy`).
     fn styles_with_bindings(line: &str) -> Vec<(Style, String)> {
-        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
+        with_forced_color(|| styles_with_bindings_inner(line))
+    }
+
+    fn styles_with_bindings_inner(line: &str) -> Vec<(Style, String)> {
         let env = Env::root();
-        env.declare("someVar", Value::Int(42), false);
+        env.declare("someVar", Value::Int(42), false).unwrap();
         env.declare(
             "deploy",
             Value::CmdRef(std::sync::Arc::new(shoal_ast::CmdCall {
@@ -449,7 +496,8 @@ mod tests {
                 span: shoal_ast::Span::new(0, 0),
             })),
             false,
-        );
+        )
+        .unwrap();
         ShoalHighlighter::with_env(env)
             .highlight(line, line.len())
             .buffer
@@ -470,6 +518,20 @@ mod tests {
             Some(Color::LightBlue),
             "bound variable must style as a reference, got {spans:?}"
         );
+    }
+
+    #[test]
+    fn ineligible_value_shadow_falls_through_to_builtin_highlighting() {
+        let spans = with_forced_color(|| {
+            let env = Env::root();
+            env.declare("ls", Value::Int(42), false).unwrap();
+            ShoalHighlighter::with_env(env).highlight("ls .", 4).buffer
+        });
+        let head = spans
+            .iter()
+            .find(|(_, text)| text == "ls")
+            .expect("head span");
+        assert_eq!(head.0.foreground, Some(Color::Green), "got {spans:?}");
     }
 
     #[test]

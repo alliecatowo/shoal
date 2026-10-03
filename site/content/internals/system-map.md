@@ -15,9 +15,10 @@ wide = true
 Shoal is not one process with one runtime path. It is a workspace of narrow libraries assembled by
 two principal hosts:
 
-- `shoal` is the human-facing, local shell. It owns Reedline, terminal state, prompt collection,
-  configuration loading, bundled adapters, init files, and a directly embedded evaluator.
-- `shoal-kernel` is a Unix-socket JSON-RPC daemon. It owns named sessions, authentication,
+- `shoal` is the human-facing local shell. It owns Reedline, terminal state, prompt collection,
+  configuration loading, bundled adapters, and init files. Its default REPL uses a listener-free
+  private kernel child over an inherited anonymous descriptor; `--standalone` embeds the evaluator.
+- `shoal-kernel` is a JSON-RPC daemon/private child. It owns principal-private named sessions, authentication,
   transcripts, plans, tasks, long-lived PTYs, event delivery, and an evaluator per session.
   `shoal-mcp` is a stdio MCP facade over that daemon.
 
@@ -35,7 +36,8 @@ accDescr: Shows the components and relationships described in System context.
   Agent["MCP client / agent"] --> MCP["shoal-mcp\nstdio facade"]
   MCP -->|"newline JSON-RPC over Unix socket"| Kernel["shoal-kernel"]
 
-  Shell --> LocalEval["embedded Evaluator"]
+  Shell -->|"default: inherited private descriptor"| Kernel
+  Shell -->|"--standalone"| LocalEval["embedded Evaluator"]
   Kernel --> Sessions["named Session objects"]
   Sessions --> KernelEval["one Evaluator per session"]
 
@@ -53,9 +55,9 @@ accDescr: Shows the components and relationships described in System context.
   KernelEval --> Syntax
 ```
 
-The CLI can also launch companion binaries (`shoal lsp`, `shoal mcp`), but this is process
-orchestration rather than library integration. In particular, the local REPL does **not** route
-normal commands through the kernel.
+The CLI can also launch companion binaries (`shoal lsp`, `shoal mcp`). The default REPL does route
+normal commands through its private kernel, but it never binds or joins the durable public socket;
+standalone mode remains a separate embedded composition root.
 
 Sources: [`shoal` main and REPL](https://github.com/alliecatowo/shoal/tree/main/crates/shoal/src),
 [`shoal-kernel`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-kernel/src), and
@@ -167,10 +169,10 @@ and isolation bugs.
 |---|---|---|---|
 | lexical environment, `cwd`, process env, `it`, functions, aliases | `Evaluator` | evaluator/session | callers of the same evaluator |
 | local line editor state and filtered history | `shoal` REPL | process / history file | local user only |
-| named session transcript and `out[n]` values | kernel `Session` | kernel process | attached clients in that session |
+| named session transcript and `out[n]` values | kernel `Session` | kernel process | clients with the exact principal+Session owner |
 | per-connection `it` reference | kernel attachment/client | connection | no other connection |
-| plans, task wrappers, open PTYs | kernel maps | kernel process | session-scoped lookup |
-| event channel rings and subscribers | kernel `EventBus` | kernel process | permitted session clients |
+| plans, task wrappers, open PTYs | kernel maps | kernel process | exact principal+Session lookup |
+| event channel rings and subscribers | kernel `EventBus` | kernel process | permitted principal+Session clients |
 | durable transcript/journal events | SQLite journal | filesystem | later kernel processes |
 | output blobs | journal CAS | filesystem until GC | any authorized ref lookup |
 | Reef lock and executable view | project/user filesystem | filesystem | processes using that scope |
@@ -199,14 +201,16 @@ Kernel restart currently loses named evaluator state, transcripts held as live `
 task wrappers, PTYs, and in-memory event rings. The journal, CAS, auth store, policy, Reef manifests,
 and Reef locks survive.
 
-## Two host paths, not yet full parity
+## Private-kernel default and explicit standalone path
 
-The local CLI performs host assembly that `Kernel::session` does not currently mirror:
+The interactive CLI performs presentation/bootstrap assembly around either a private kernel-backed
+protocol Session (the default) or an explicit standalone evaluator. A durable public kernel remains
+a separate process/trust domain and does not share the private REPL's live state:
 
 ```mermaid
 flowchart TD
-accTitle: Two host paths, not yet full parity
-accDescr: Shows the components and relationships described in Two host paths, not yet full parity.
+accTitle: Private-kernel default and standalone path
+accDescr: Shows the default isolated private kernel, the explicit local evaluator, and the separate durable machine kernel.
   Config["layered shoal config"] --> CLI["local shoal host"]
   Prompt["prompt config"] --> CLI
   Bundled["bundled + extra adapters"] --> CLI
@@ -218,19 +222,21 @@ accDescr: Shows the components and relationships described in Two host paths, no
   Channel["event channel forwarder"] --> Kernel
   Policy["per-principal leash policy"] --> Kernel
 
-  CLI --> EvalA["Evaluator A"]
-  Kernel --> EvalB["Evaluator B"]
+  CLI --> Private["listener-free private kernel (default)"]
+  CLI --> EvalA["local Evaluator (--standalone)"]
+  Private --> EvalP["principal-private REPL Session"]
+  Kernel --> EvalB["durable machine Session"]
 ```
 
-As implemented, a newly created kernel session installs journal/frecency support and a channel
-forwarder, but does not load the CLI's layered config, aliases, environment overrides, init files,
-bundled/extra adapter directories, or user Reef manifest. This is a parity boundary, not merely a
-documentation omission. Test a feature through the intended host before describing it as universal.
+The shared `SessionBootstrap` supplies layered config, aliases/environment, adapters, plugins, Reef,
+echo, and policy inputs to both local and kernel evaluators. Profile-owned differences remain:
+prompt/editor/history presentation belongs to the CLI; init files run for the standalone or trusted
+private interactive profile, never a durable/headless agent Session; journal/event transport wiring
+belongs to its host.
 
-There is a second parsing difference: the local REPL constructs a `ParseCtx` from session bindings,
-while the kernel `exec` handler parses submitted source without that context. Evaluation can still
-resolve command-shaped callable names, but statement-head classification of session-bound values can
-differ across requests.
+Parser-context parity is shared: the evaluator constructs the live value/callable snapshot used by
+both the local REPL and kernel `exec` plan/run handlers. Public context-free parse/completion RPCs do
+not claim session-bound classification.
 
 Sources: [`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal/src/repl.rs),
 [`shoal-kernel/src/session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/session.rs),
@@ -251,8 +257,10 @@ and [`handlers_exec.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/s
    clients follow refs deliberately.
 7. **Reversibility is evidence-based.** If the journal cannot safely snapshot or invert a mutation,
    the plan must not call it reversible.
-8. **Durability is opt-in and named.** An in-memory transcript or event ring must not be mistaken for
-   journal durability.
+8. **Durability is opt-in and named.** An absent language journal is an explicit no-history mode; an
+   installed journal rejects before effects when its begin row cannot persist and reports
+   post-effect write failure as indeterminate. An in-memory transcript or event ring must not be
+   mistaken for journal durability.
 
 ## Where to continue
 

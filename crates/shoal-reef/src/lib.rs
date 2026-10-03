@@ -63,6 +63,7 @@
 
 pub mod error;
 pub mod hashcache;
+mod input;
 pub mod lock;
 pub mod manifest;
 pub mod provider;
@@ -75,11 +76,19 @@ pub mod version;
 pub mod view;
 
 pub use error::{ReefCode, ReefError, ReefResult};
+pub use input::{
+    REEF_MANIFEST_MAX_BYTES, REEF_MANIFEST_MAX_NESTING, REEF_MAX_RUNNERS, REEF_MAX_SCOPES,
+    REEF_MAX_STRING_BYTES, REEF_MAX_TOOLS,
+};
 pub use lock::{LockEntry, LockError, Lockfile};
 pub use manifest::{ManifestError, ManifestKind, ReefManifest, ToolReq};
-pub use provider::{Candidate, Provider, ProviderCtx, ProviderError};
+pub use provider::{
+    Candidate, CandidateDiscovery, MAX_DISCOVERY_CANDIDATES, MAX_DISCOVERY_RETAINED_BYTES,
+    MAX_DISCOVERY_VISITED_PATH_BYTES, MAX_DISCOVERY_VISITED_PATHS, Provider, ProviderCtx,
+    ProviderError,
+};
 pub use report::{ResolutionReport, ScopeDecision};
-pub use resolve::{LockNotice, Policy, Resolution, Resolver};
+pub use resolve::{LockNotice, Policy, ProbeExecution, Resolution, Resolver};
 pub use runner::{Invocation, RunnerTable, resolve_runner, sniff_shebang};
 pub use scope::{ChainKey, ScopeChain, ScopeEntry};
 pub use version::{Constraint, Version};

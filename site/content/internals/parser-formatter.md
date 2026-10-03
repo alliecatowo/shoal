@@ -181,12 +181,16 @@ temporary value scope before parsing the guard and body, preventing command misc
 
 ## Raw interpreter blocks
 
-The parser has a static `INTERPRETERS` list. A listed head followed by `{ … }` or raw quote syntax is
-read as balanced/verbatim source into `Expr::LangBlock`; the body is not lexed as Shoal. The same head
-without a block remains a normal command.
+The parser has a default `INTERPRETERS` list for standalone parsing, formatting, and editor tools. A
+listed head followed by `{ … }` or raw quote syntax is read as balanced/verbatim source into
+`Expr::LangBlock`; the body is not lexed as Shoal. The same head without a block remains a normal
+command.
 
-Adapter specs can declare `class = "interpreter"`, but they do not extend this list dynamically.
-That seam must be solved with parser context/generated registry, not a syntax → adapter dependency.
+Runtime composition roots add every loaded adapter with `class = "interpreter"` through
+`ParseCtx.interpreter_bound`. The evaluator's context snapshot supplies that set for REPL, kernel,
+source, script, module, and explain parsing. A generated bundled-pack test requires every shipped
+interpreter adapter to remain in the standalone parser list, while configured custom heads remain a
+host-context extension rather than a syntax → adapter dependency.
 
 ## Incomplete-input classification
 
@@ -206,6 +210,13 @@ indentation, normalized spaces/commas/operators, escaped double-quoted strings, 
 base units, quoted non-identifier record keys, and explicit parentheses where atom precedence needs
 them. It does not preserve comments or original whitespace because those are not in the AST.
 
+`format_source_preserving_trivia` is the shared CLI/LSP admission boundary in front of that printer.
+It maps every `#` to semantic AST leaf spans (quoted values/keys, `use` paths, and raw command
+heads/arguments). A hash outside those owned tokens is a comment or shebang and returns a located
+`FormatRefusal`; no replacement text is produced. Interpreter-block payloads containing `#` also
+refuse conservatively until the AST carries the exact payload span. This is a fail-safe bridge, not a
+substitute for the future lossless trivia model.
+
 ```mermaid
 flowchart LR
 accTitle: Canonical formatter
@@ -220,7 +231,7 @@ accDescr: Shows the components and relationships described in Canonical formatte
 ```
 
 Lossless distinctions that matter for formatting remain separate nodes—most visibly postfix `Catch`.
-Comments/doc comments are an exception: only function doc text is retained.
+Only function doc text is retained today; free comments/shebangs are protected by the refusal path.
 
 ## Grammar-change checklist
 
@@ -231,5 +242,6 @@ Comments/doc comments are an exception: only function doc text is retained.
 - Give rejected shell syntax a precise span and teaching hint.
 - Update formatter output and canonical-equivalence round trips.
 - Exercise every valid UTF-8 prefix through `parse_status`.
-- Verify binding-aware local parsing and context-free/kernel parsing explicitly.
+- Verify binding-aware local and kernel-exec parsing plus intentionally context-free public parse
+  endpoints explicitly.
 - Update static interpreter and builtin registries only through their documented workflows.

@@ -5,10 +5,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
+mod frame;
+pub use frame::{
+    MAX_FRAME_LEN, MAX_JSON_CONTAINER_ITEMS, MAX_JSON_DEPTH, MAX_JSON_KEY_BYTES, MAX_JSON_NODES,
+    MAX_JSON_NUMBER_BYTES, read_frame, read_json_frame, validate_json_frame, write_frame,
+};
+
 pub const JSONRPC: &str = "2.0";
+/// Maximum decoded content carried by one raw/blob retrieval response.
+///
+/// This is intentionally below the general 64 KiB encoded-value wall: JSON
+/// escaping can expand a UTF-8 string by up to six times, while base64 expands
+/// bytes by four thirds. Keeping the decoded page at 8 KiB therefore leaves a
+/// hard safety margin for metadata and JSON-RPC framing in both cases.
+pub const RAW_PAGE_MAX_BYTES: usize = 8 * 1024;
 pub type RequestId = Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,7 +107,8 @@ pub mod error_code {
     // --- shoal-kernel server-error range (-32000..=-32099) ---
 
     /// No session is attached on this connection yet. Every handler but
-    /// `session.attach`, `parse`, `complete`, and `cap.request` requires one.
+    /// `session.attach`, `parse`, and `complete` requires one. (`cap.request`
+    /// and `journal.query`, once exempt, now require attachment too — HR-D1/D4.)
     pub const NOT_ATTACHED: i32 = -32000;
     /// The submitted shoal *source* failed to parse (`shoal_syntax::parse`).
     /// Distinct from [`RPC_PARSE_ERROR`]: this is a language-level parse
@@ -129,9 +142,8 @@ pub mod error_code {
     /// The named `plan_ref` (`plan.get`/`plan.apply`/`cap.request`) is
     /// unknown or has expired.
     pub const UNKNOWN_PLAN: i32 = -32012;
-    /// Task suspend/resume is unavailable: a kernel task is a Rust thread
-    /// recursively re-entering `dispatch`, not a single tracked child
-    /// process/group, so there is nothing to signal yet.
+    /// Task suspend/resume is unavailable for the requested execution form or
+    /// state, such as evaluator-only work with no active child process group.
     pub const TASK_CONTROL_UNAVAILABLE: i32 = -32020;
     /// The named `task` ref is unknown, or belongs to another session.
     pub const UNKNOWN_TASK: i32 = -32021;
@@ -146,15 +158,26 @@ pub mod error_code {
     /// kernel has no `TokenStore` configured at all (an ephemeral kernel),
     /// or the given token is missing/expired/revoked.
     pub const AUTH_FAILED: i32 = -32030;
+    /// A configured kernel resource quota was reached. The error data names
+    /// the specific connection/task/PTY/subscription limit.
+    pub const QUOTA_EXCEEDED: i32 = -32040;
 }
 
 impl Response {
     pub fn ok(id: RequestId, value: impl Serialize) -> Self {
-        Self {
-            jsonrpc: JSONRPC.into(),
-            id,
-            result: Some(serde_json::to_value(value).expect("serializable RPC result")),
-            error: None,
+        match serde_json::to_value(value) {
+            Ok(result) => Self {
+                jsonrpc: JSONRPC.into(),
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => Self::err(
+                id,
+                error_code::INTERNAL_ERROR,
+                format!("failed to serialize RPC result: {error}"),
+                None,
+            ),
         }
     }
     pub fn err(id: RequestId, code: i32, message: impl Into<String>, data: Option<Value>) -> Self {
@@ -171,29 +194,6 @@ impl Response {
     }
 }
 
-pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
-    if n == 0 {
-        return Ok(None);
-    }
-    if line.len() > 16 * 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "JSON-RPC frame exceeds 16 MiB",
-        ));
-    }
-    serde_json::from_str(line.trim_end())
-        .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, frame: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, frame).map_err(io::Error::other)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct Ref(pub String);
@@ -205,6 +205,16 @@ impl Ref {
     pub fn kind(&self) -> Option<&str> {
         self.0.split_once(':').map(|x| x.0)
     }
+}
+
+/// Stable identity of a live stream pipeline retained by a kernel session.
+/// `path` addresses a stream nested under the transcript value (for example
+/// an outcome's `out`) without pretending that the stream itself is serializable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StreamCursorRef {
+    pub r#ref: Ref,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -253,6 +263,10 @@ pub enum WireValue {
         status: Option<i32>,
         ok: bool,
         signal: Option<String>,
+        /// True only when this outcome's bytes were already emitted live by
+        /// the interactive PTY tee. Builtins and captured commands are false.
+        #[serde(default)]
+        streamed: bool,
         out: Box<WireValue>,
         /// Lossy UTF-8 of stderr — not a CAS ref; large payloads are still
         /// truncated at the journal layer, this is the live wire copy.
@@ -304,11 +318,13 @@ pub enum WireValue {
         /// Display form; closures are not wire-invocable in v0.1.
         repr: String,
     },
-    /// Stream chunks are deferred (site/content/internals/language-conformance-contract.md promises "ref + chunks"); today a
-    /// stream only wires its label — pulling chunks needs a follow-up
-    /// protocol method that does not exist yet.
+    /// A live, single-consumption stream. Kernel/session projections include a
+    /// cursor that can be driven with `stream.pull` and released with
+    /// `stream.close`; context-free projections may omit it.
     Stream {
         label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<StreamCursorRef>,
     },
     /// Redaction by construction (site/content/internals/language-conformance-contract.md): never the secret material.
     Secret {
@@ -376,6 +392,35 @@ pub struct ClientInfo {
     pub kind: String,
     pub tty: bool,
 }
+
+/// Local authentication requested by a client that does not present a bearer
+/// token. Restricted agent is the safe default for headless bridges; local
+/// human is an explicit same-user trust-root opt-in.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalAuthMode {
+    #[default]
+    RestrictedAgent,
+    LocalHuman,
+}
+
+/// Additive security-negotiation fields returned by hardened kernels from
+/// `session.attach`. They remain a standalone wire projection so older Rust
+/// callers constructing [`AttachResult`] are source-compatible while clients
+/// can fail closed when an older kernel silently ignores `local_auth`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachSecurityMetadata {
+    pub auth_mode: LocalAuthMode,
+    pub session_isolation: String,
+    pub security_epoch: u32,
+}
+
+/// Bumped when attachment authority semantics change incompatibly. Epoch 2
+/// makes explicit that a bearer profile named `local-human` is not evidence
+/// of human presence and carries no implicit approval/admin authority.
+pub const ATTACH_SECURITY_EPOCH: u32 = 2;
+pub const PRINCIPAL_SESSION_ISOLATION: &str = "principal";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AttachParams {
     pub session: Option<String>,
@@ -394,6 +439,10 @@ pub struct AttachResult {
     /// learns at attach time if the wall is real (site/content/internals/kernel-protocol.md).
     #[serde(default)]
     pub caps_enforced: bool,
+    /// Spawn-time OS enforcement forecast. This is deliberately separate from
+    /// `caps_enforced`: planning never means a backend is already active.
+    #[serde(default)]
+    pub enforcement: EnforcementPreview,
     /// The kernel's default elision thresholds, so a client knows the budget
     /// before it tightens/loosens per call.
     #[serde(default)]
@@ -420,6 +469,11 @@ pub struct ExecParams {
     /// ref instead of blocking the caller's context.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Hard execution budget. Unlike `timeout_ms`, expiry requests task
+    /// cancellation and remains visible on the task record. The kernel clamps
+    /// extreme values to its server ceiling.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
     /// Per-call elision budget (site/content/internals/kernel-protocol.md). Tightens or loosens the
     /// kernel defaults; never loosens past the hard cap (64 KiB).
     #[serde(default)]
@@ -449,6 +503,17 @@ pub struct ElideSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskParams {
     pub task: Ref,
+}
+
+/// `task.await` has a bounded connection-worker wait. The task itself keeps
+/// running when the wait budget expires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAwaitParams {
+    pub task: Ref,
+    /// Omitted uses the kernel default, zero is a nonblocking snapshot, and
+    /// oversized values are clamped to the server's hard wait ceiling.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 /// `pty.open` (site/content/internals/kernel-protocol.md): spawn an interactive program on a real PTY
 /// as a long-lived, keyed kernel session with a `vt100`-rendered screen.
@@ -490,6 +555,18 @@ pub struct PtyResizeParams {
     pub rows: u16,
 }
 
+/// Operations that are useful for a task at the instant its record is read.
+/// These are advisory: process-backed work can start or finish immediately
+/// after the snapshot, so control calls must still handle an availability
+/// error.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TaskControls {
+    pub cancel: bool,
+    pub suspend: bool,
+    pub resume: bool,
+    pub active_process_groups: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task: Ref,
@@ -498,7 +575,19 @@ pub struct TaskRecord {
     pub started_ns: i64,
     pub finished_ns: Option<i64>,
     pub result_ref: Option<Ref>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub error: Option<RpcError>,
+    /// Effective hard execution budget installed for this task, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+    /// True only when the deadline watchdog, rather than an explicit client
+    /// cancellation, requested termination.
+    #[serde(default)]
+    pub deadline_exceeded: bool,
+    /// Race-honest control discovery for `task.cancel/suspend/resume`.
+    #[serde(default)]
+    pub controls: TaskControls,
 }
 fn run_mode() -> String {
     "run".into()
@@ -511,6 +600,8 @@ pub struct ExecResult {
     pub r#ref: Ref,
     pub value: Option<WireValue>,
     pub render: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanApplyParams {
@@ -529,6 +620,31 @@ pub struct PlanResult {
     pub reversibility: String,
     pub verdict: String,
     pub approval_pending: bool,
+    /// Honest per-dimension forecast for the principal that owns this plan.
+    #[serde(default)]
+    pub enforcement: EnforcementPreview,
+}
+
+/// What the kernel can enforce for a principal's next external spawn. Actual
+/// activation is still returned by the executor after a child is launched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnforcementPreview {
+    pub available_tier: String,
+    pub activation: String,
+    pub filesystem_requested: bool,
+    pub filesystem_enforceable: bool,
+    pub network_scope_requested: bool,
+    pub network_enforceable: bool,
+    pub spawn_pin_requested: bool,
+    pub spawn_pin_atomic: bool,
+    #[serde(default)]
+    pub process_limits_requested: bool,
+    #[serde(default)]
+    pub process_limits_enforceable: bool,
+    pub hermetic: bool,
+    pub spawn_disposition: String,
+    #[serde(default)]
+    pub limitations: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueGetParams {
@@ -542,6 +658,66 @@ pub struct ValueGetParams {
     /// `"raw"` returns a str verbatim / bytes base64 (other types error).
     #[serde(default)]
     pub format: Option<String>,
+    /// Preferred display width for `format:"render"`. Servers clamp this to
+    /// a defensive range; omitted requests retain the historical 80 columns.
+    #[serde(default)]
+    pub width: Option<usize>,
+}
+
+/// `blob.get` — retrieve one bounded byte page from an owner-scoped CAS blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobGetParams {
+    pub hash: String,
+    /// Byte offset in the uncompressed content. Omitted means zero.
+    #[serde(default)]
+    pub offset: Option<u64>,
+    /// Requested byte count. The server clamps this to
+    /// [`RAW_PAGE_MAX_BYTES`]. Omitted requests one maximum-size page.
+    #[serde(default)]
+    pub length: Option<u64>,
+}
+
+/// `stream.pull` — pull a bounded batch from a session-owned live stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamPullParams {
+    pub cursor: StreamCursorRef,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Total wall-clock wait for this batch. The kernel clamps this to one
+    /// second; omitted means a non-blocking poll.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    /// Hard RPC execution deadline, independent of source wait. A timed-out
+    /// cursor is cancelled and detached. Omitted defaults to one second.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub elide: Option<ElideSpec>,
+}
+
+/// `stream.close` — drop the retained pipeline and release its resources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamCloseParams {
+    pub cursor: StreamCursorRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamItem {
+    pub seq: u64,
+    pub r#ref: Ref,
+    pub value: WireValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamPullResult {
+    pub cursor: StreamCursorRef,
+    pub items: Vec<StreamItem>,
+    pub done: bool,
+    pub timed_out: bool,
+    /// A source/combinator error terminates the cursor but does not discard
+    /// earlier items already pulled into the same batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WireValue>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JournalQueryParams {
@@ -550,22 +726,36 @@ pub struct JournalQueryParams {
     /// dropped. Filtered in the kernel, above the journal store.
     pub until: Option<i64>,
     pub principal: Option<String>,
+    /// Exact semantic entry kind: `statement`, `exec`, or `approval`.
+    pub kind: Option<String>,
     pub head: Option<String>,
     pub ok: Option<bool>,
     /// Keep only entries whose effect set contains every listed effect kind
     /// (e.g. `["fs.write","opaque"]`). Kernel-side post-filter.
     #[serde(default)]
     pub effects: Option<Vec<String>>,
+    /// Maximum rows to return. **Semantics (see kernel RPC reference):**
+    /// omitted/`null` → the kernel's default page size; explicit `0` → **zero
+    /// rows** (an empty page, never "unbounded"); any value is clamped down to
+    /// the kernel's server-side maximum page size. The distinction between
+    /// omitted and an explicit `0` is exactly why this is an `Option`: a bare
+    /// `usize` whose serde default is `0` cannot tell "no limit given" apart
+    /// from "give me nothing".
     #[serde(default)]
-    pub limit: usize,
+    pub limit: Option<usize>,
 }
 
 /// `events.read` — pull the buffered tail of a channel (site/content/internals/kernel-protocol.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsReadParams {
     pub channel: String,
+    /// Exclusive cursor. A bounded response reports `page.next_since` when
+    /// more events remain; pass that value back to continue forward.
     #[serde(default)]
     pub since: Option<u64>,
+    /// Requested forward-page length. Omitted uses the server default,
+    /// explicit zero returns no events, and oversized values are clamped to
+    /// the server maximum before any journal query or allocation.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -619,6 +809,12 @@ pub struct JournalOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub id: i64,
+    /// Semantic role: `statement`, `exec`, or `approval`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Owning coarse execution id for statement rows, when recorded.
+    #[serde(default)]
+    pub parent_id: Option<i64>,
     pub session: String,
     pub principal: String,
     pub ts: i64,
@@ -636,6 +832,8 @@ pub struct JournalEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serializer;
+    use std::io::{self, Read};
     #[test]
     fn frames_are_newline_delimited() {
         let response = Response::ok(Value::from(1), serde_json::json!({"ok":true}));
@@ -645,12 +843,146 @@ mod tests {
         let decoded: Response = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, response);
     }
+
+    #[test]
+    fn response_serialization_failure_becomes_a_wire_error() {
+        struct Fails;
+        impl Serialize for Fails {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                Err(serde::ser::Error::custom("hostile serializer"))
+            }
+        }
+
+        let response = Response::ok(Value::from(7), Fails);
+        let error = response.error.expect("serialization must fail closed");
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert!(error.message.contains("hostile serializer"));
+        assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn attach_security_metadata_has_stable_wire_spellings() {
+        assert_eq!(
+            serde_json::to_value(LocalAuthMode::RestrictedAgent).unwrap(),
+            serde_json::json!("restricted-agent")
+        );
+        assert_eq!(
+            serde_json::to_value(LocalAuthMode::LocalHuman).unwrap(),
+            serde_json::json!("local-human")
+        );
+        let metadata = AttachSecurityMetadata {
+            auth_mode: LocalAuthMode::RestrictedAgent,
+            session_isolation: PRINCIPAL_SESSION_ISOLATION.into(),
+            security_epoch: ATTACH_SECURITY_EPOCH,
+        };
+        assert_eq!(
+            serde_json::to_value(metadata).unwrap(),
+            serde_json::json!({
+                "auth_mode": "restricted-agent",
+                "session_isolation": "principal",
+                "security_epoch": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn read_frame_rejects_unterminated_unbounded_input() {
+        struct Infinite;
+
+        impl Read for Infinite {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        let mut reader = io::BufReader::new(Infinite);
+        let error = read_frame(&mut reader)
+            .expect_err("an unterminated oversized frame must fail without unbounded buffering");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("16 MiB"), "{error}");
+    }
+
+    #[test]
+    fn read_frame_rejects_a_single_oversized_line() {
+        let mut body = "x".repeat(MAX_FRAME_LEN + 1024);
+        body.push('\n');
+        let mut reader = io::BufReader::new(body.as_bytes());
+        let error = read_frame(&mut reader).expect_err("an oversized frame must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("16 MiB"), "{error}");
+    }
+
+    #[test]
+    fn read_frame_still_reads_a_normal_frame() {
+        let request = Request {
+            jsonrpc: JSONRPC.into(),
+            id: Value::from(1),
+            method: "parse".into(),
+            params: serde_json::json!({"src": "1 + 1"}),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let mut reader = io::BufReader::new(bytes.as_slice());
+        assert_eq!(read_frame(&mut reader).unwrap(), Some(request));
+        assert!(read_frame(&mut reader).unwrap().is_none());
+    }
+
     #[test]
     fn non_utf8_path_roundtrips() {
         let original = OsString::from_vec(vec![b'a', 0xff, b'b']);
         let wire = WirePath::encode(&original);
         assert!(wire.raw.is_some());
         assert_eq!(wire.decode().unwrap(), original);
+    }
+
+    #[test]
+    fn blob_get_params_decode_additive_range_fields() {
+        let legacy: BlobGetParams =
+            serde_json::from_value(serde_json::json!({"hash":"abc123"})).unwrap();
+        assert_eq!(legacy.hash, "abc123");
+        assert_eq!(legacy.offset, None);
+        assert_eq!(legacy.length, None);
+
+        let paged: BlobGetParams = serde_json::from_value(serde_json::json!({
+            "hash":"abc123",
+            "offset": u64::MAX,
+            "length": u64::MAX,
+        }))
+        .unwrap();
+        assert_eq!(paged.offset, Some(u64::MAX));
+        assert_eq!(paged.length, Some(u64::MAX));
+    }
+
+    #[test]
+    fn legacy_plan_result_defaults_the_enforcement_preview() {
+        let plan: PlanResult = serde_json::from_value(serde_json::json!({
+            "plan_ref": "plan:legacy",
+            "effects": [],
+            "reversibility": "reversible",
+            "verdict": "allow",
+            "approval_pending": false
+        }))
+        .unwrap();
+        assert_eq!(plan.enforcement, EnforcementPreview::default());
+    }
+
+    #[test]
+    fn legacy_task_record_defaults_to_no_advertised_controls() {
+        let record: TaskRecord = serde_json::from_value(serde_json::json!({
+            "task": "task:1",
+            "session": "session",
+            "state": "running",
+            "started_ns": 1,
+            "finished_ns": null,
+            "result_ref": null,
+            "error": null
+        }))
+        .unwrap();
+        assert_eq!(record.controls, TaskControls::default());
     }
 
     /// Locks the wire contract (refactor guard): every named `error_code`
@@ -678,5 +1010,6 @@ mod tests {
         assert_eq!(UNKNOWN_PTY, -32022);
         assert_eq!(PTY_SPAWN_FAILED, -32023);
         assert_eq!(AUTH_FAILED, -32030);
+        assert_eq!(QUOTA_EXCEEDED, -32040);
     }
 }

@@ -10,7 +10,10 @@
 //! probing is factored into [`Provider::version_of`] so the resolver can probe
 //! lazily, only when a constraint actually needs a concrete version.
 
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::version::{Constraint, Version};
@@ -39,6 +42,108 @@ pub struct Candidate {
     pub ambient: bool,
 }
 
+/// An admitted provider-discovery result. Providers cannot hand the resolver
+/// a raw, potentially unbounded vector: candidates enter this collection one
+/// at a time under shared identity and retained-path walls.
+#[derive(Debug)]
+pub struct CandidateDiscovery {
+    provider: &'static str,
+    candidates: Vec<Candidate>,
+    retained_bytes: usize,
+    visited_paths: usize,
+    visited_path_bytes: usize,
+}
+
+pub const MAX_DISCOVERY_CANDIDATES: usize = 4_096;
+pub const MAX_DISCOVERY_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_DISCOVERY_VISITED_PATHS: usize = 4_096;
+pub const MAX_DISCOVERY_VISITED_PATH_BYTES: usize = 16 * 1024 * 1024;
+
+impl CandidateDiscovery {
+    pub fn new(provider: &'static str) -> Self {
+        Self {
+            provider,
+            candidates: Vec::new(),
+            retained_bytes: 0,
+            visited_paths: 0,
+            visited_path_bytes: 0,
+        }
+    }
+
+    /// Admit one filesystem identity before a provider probes it. This bounds
+    /// work that does not produce a candidate (missing executables, unrelated
+    /// mise backends, and malformed version directories) as well as retained
+    /// result state.
+    pub(crate) fn visit_path(&mut self, path: &Path) -> Result<(), ProviderError> {
+        if self.visited_paths >= MAX_DISCOVERY_VISITED_PATHS {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("filesystem visit limit reached ({MAX_DISCOVERY_VISITED_PATHS})"),
+            ));
+        }
+        let bytes = path.as_os_str().as_encoded_bytes().len();
+        let next = self
+            .visited_path_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| ProviderError::new(self.provider, "path accounting overflowed"))?;
+        if next > MAX_DISCOVERY_VISITED_PATH_BYTES {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("visited path state exceeds {MAX_DISCOVERY_VISITED_PATH_BYTES} bytes"),
+            ));
+        }
+        self.visited_paths += 1;
+        self.visited_path_bytes = next;
+        Ok(())
+    }
+
+    pub fn from_candidates(
+        provider: &'static str,
+        candidates: impl IntoIterator<Item = Candidate>,
+    ) -> Result<Self, ProviderError> {
+        let mut discovery = Self::new(provider);
+        for candidate in candidates {
+            discovery.push(candidate)?;
+        }
+        Ok(discovery)
+    }
+
+    pub fn push(&mut self, candidate: Candidate) -> Result<(), ProviderError> {
+        if self.candidates.len() >= MAX_DISCOVERY_CANDIDATES {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("candidate identity limit reached ({MAX_DISCOVERY_CANDIDATES})"),
+            ));
+        }
+        let retained = candidate
+            .tool
+            .len()
+            .checked_add(candidate.version.to_string().len())
+            .and_then(|bytes| {
+                bytes.checked_add(candidate.path.as_os_str().as_encoded_bytes().len())
+            })
+            .and_then(|bytes| bytes.checked_add(candidate.provider.len()))
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(|| ProviderError::new(self.provider, "candidate accounting overflowed"))?;
+        let next = self.retained_bytes.checked_add(retained).ok_or_else(|| {
+            ProviderError::new(self.provider, "candidate aggregate accounting overflowed")
+        })?;
+        if next > MAX_DISCOVERY_RETAINED_BYTES {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("candidate retained state exceeds {MAX_DISCOVERY_RETAINED_BYTES} bytes"),
+            ));
+        }
+        self.retained_bytes = next;
+        self.candidates.push(candidate);
+        Ok(())
+    }
+
+    pub fn into_candidates(self) -> Vec<Candidate> {
+        self.candidates
+    }
+}
+
 impl Candidate {
     pub fn new(
         tool: impl Into<String>,
@@ -56,15 +161,90 @@ impl Candidate {
     }
 }
 
+/// One bounded provider-side subprocess request. The runner, rather than the
+/// provider, owns environment, sandbox, and cancellation authority.
+pub struct ProviderCommand<'a> {
+    pub program: &'a Path,
+    pub args: &'a [OsString],
+    pub cwd: &'a Path,
+    pub timeout: Duration,
+    pub output_cap: usize,
+}
+
+/// Injectable authority for provider probes and installers.
+pub trait ProviderRunner: Send + Sync {
+    fn run(&self, command: ProviderCommand<'_>) -> io::Result<shoal_exec::BoundedCommandOutput>;
+}
+
+#[derive(Debug, Default)]
+struct AmbientProviderRunner;
+
+impl ProviderRunner for AmbientProviderRunner {
+    fn run(&self, command: ProviderCommand<'_>) -> io::Result<shoal_exec::BoundedCommandOutput> {
+        let mut process = std::process::Command::new(command.program);
+        process.args(command.args).current_dir(command.cwd);
+        shoal_exec::run_bounded_command(&mut process, command.timeout, command.output_cap)
+    }
+}
+
 /// Context passed to provider operations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderCtx {
     pub cwd: PathBuf,
+    runner: Arc<dyn ProviderRunner>,
+    path_env: Option<OsString>,
+}
+
+impl std::fmt::Debug for ProviderCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderCtx")
+            .field("cwd", &self.cwd)
+            .field("path_env", &self.path_env)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderCtx {
     pub fn new(cwd: impl Into<PathBuf>) -> ProviderCtx {
-        ProviderCtx { cwd: cwd.into() }
+        ProviderCtx {
+            cwd: cwd.into(),
+            runner: Arc::new(AmbientProviderRunner),
+            path_env: std::env::var_os("PATH"),
+        }
+    }
+
+    pub fn with_runner(
+        cwd: impl Into<PathBuf>,
+        path_env: Option<OsString>,
+        runner: Arc<dyn ProviderRunner>,
+    ) -> ProviderCtx {
+        ProviderCtx {
+            cwd: cwd.into(),
+            runner,
+            path_env,
+        }
+    }
+
+    pub fn run(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        timeout: Duration,
+        output_cap: usize,
+    ) -> io::Result<shoal_exec::BoundedCommandOutput> {
+        self.runner.run(ProviderCommand {
+            program,
+            args,
+            cwd: &self.cwd,
+            timeout,
+            output_cap,
+        })
+    }
+
+    /// Resolve a provider helper against this context's exact `PATH`, treating
+    /// relative and empty components relative to the provider cwd.
+    pub fn which(&self, name: &OsStr) -> Option<PathBuf> {
+        shoal_exec::which_in(name, self.path_env.as_deref(), &self.cwd)
     }
 }
 
@@ -99,11 +279,11 @@ pub trait Provider: Send + Sync {
     /// Enumerate candidates for `tool`. Must be fast and must **not** probe
     /// `--version` — leave [`Candidate::version`] as [`Version::unknown`] when
     /// the version is not free to compute (e.g. from a directory name).
-    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Vec<Candidate>;
+    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Result<CandidateDiscovery, ProviderError>;
 
     /// Resolve the concrete version of a candidate, probing if necessary and
     /// caching the result. Default: return whatever `discover` already knew.
-    fn version_of(&self, cand: &Candidate) -> Version {
+    fn version_of(&self, cand: &Candidate, _ctx: &ProviderCtx) -> Version {
         cand.version.clone()
     }
 
@@ -123,45 +303,25 @@ pub trait Provider: Send + Sync {
 /// The `--version` probe timeout (site/content/internals/reef-resolution.md).
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// Version probes only need a short banner. Retaining more would let a hostile
+/// tool amplify memory use during ordinary resolution; the executor continues
+/// draining both pipes after this cap so the child cannot block on them.
+const PROBE_OUTPUT_CAP: usize = 16 * 1024;
+
 /// Run `<path> --version` with a hard timeout and parse a version leniently from
 /// its output. Returns [`Version::unknown`] on timeout, spawn failure, or when no
 /// version-shaped token is found. Never blocks longer than [`PROBE_TIMEOUT`].
-pub(crate) fn probe_version(path: &std::path::Path) -> Version {
-    use std::process::{Command, Stdio};
-
-    let mut child = match Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
+pub(crate) fn probe_version(path: &std::path::Path, ctx: &ProviderCtx) -> Version {
+    let args = [OsString::from("--version")];
+    let output = match ctx.run(path, &args, PROBE_TIMEOUT, PROBE_OUTPUT_CAP) {
+        Ok(output) if !output.timed_out => output,
         Err(_) => return Version::unknown(),
+        Ok(_) => return Version::unknown(),
     };
 
-    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Version::unknown();
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => return Version::unknown(),
-        }
-    }
-
-    let mut out = String::new();
-    if let Ok(o) = child.wait_with_output() {
-        out.push_str(&String::from_utf8_lossy(&o.stdout));
-        out.push(' ');
-        out.push_str(&String::from_utf8_lossy(&o.stderr));
-    }
+    let mut out = String::from_utf8_lossy(&output.stdout).into_owned();
+    out.push(' ');
+    out.push_str(&String::from_utf8_lossy(&output.stderr));
     parse_version_token(&out)
 }
 
@@ -198,9 +358,82 @@ pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
+/// Provider discovery distinguishes an absent executable from a path that
+/// exists but cannot be inspected. The former is an ordinary miss; collapsing
+/// permission, symlink-loop, or malformed-path errors into "not installed"
+/// would make resolution silently incomplete.
+pub(crate) fn inspect_executable(
+    provider: &'static str,
+    path: &Path,
+) -> Result<bool, ProviderError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ProviderError::new(
+            provider,
+            format!("cannot inspect {}: {error}", path.display()),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::Instant;
+
+    fn executable_script(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tool");
+        fs::write(&path, format!("#!/bin/sh\n{contents}\n")).expect("write tool");
+        let mut permissions = fs::metadata(&path).expect("tool metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("make tool executable");
+        (dir, path)
+    }
+
+    #[derive(Default)]
+    struct RecordingRunner {
+        calls: Mutex<Vec<RecordedCall>>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedCall {
+        program: PathBuf,
+        args: Vec<OsString>,
+        timeout: Duration,
+        output_cap: usize,
+    }
+
+    impl ProviderRunner for RecordingRunner {
+        fn run(
+            &self,
+            command: ProviderCommand<'_>,
+        ) -> io::Result<shoal_exec::BoundedCommandOutput> {
+            self.calls.lock().unwrap().push(RecordedCall {
+                program: command.program.to_path_buf(),
+                args: command.args.to_vec(),
+                timeout: command.timeout,
+                output_cap: command.output_cap,
+            });
+            Ok(shoal_exec::BoundedCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: b"fixture 7.8.9\n".to_vec(),
+                stderr: Vec::new(),
+                truncated: false,
+                timed_out: false,
+                pgid: 1,
+                duration: Duration::ZERO,
+            })
+        }
+    }
 
     #[test]
     fn parse_version_token_variants() {
@@ -212,8 +445,139 @@ mod tests {
     }
 
     #[test]
+    fn candidate_discovery_rejects_identity_and_retained_byte_overflow() {
+        let candidates = (0..=MAX_DISCOVERY_CANDIDATES).map(|index| {
+            Candidate::new(
+                format!("tool-{index}"),
+                Version::unknown(),
+                PathBuf::from(format!("/bin/tool-{index}")),
+                "fixture",
+            )
+        });
+        let error = CandidateDiscovery::from_candidates("fixture", candidates).unwrap_err();
+        assert!(error.msg.contains("identity limit"));
+
+        let mut discovery = CandidateDiscovery::new("fixture");
+        let error = discovery
+            .push(Candidate::new(
+                "x".repeat(MAX_DISCOVERY_RETAINED_BYTES + 1),
+                Version::unknown(),
+                PathBuf::from("/bin/x"),
+                "fixture",
+            ))
+            .unwrap_err();
+        assert!(error.msg.contains("retained state"));
+        assert!(discovery.into_candidates().is_empty());
+    }
+
+    #[test]
+    fn candidate_discovery_bounds_non_candidate_filesystem_work() {
+        let mut discovery = CandidateDiscovery::new("fixture");
+        for index in 0..MAX_DISCOVERY_VISITED_PATHS {
+            discovery
+                .visit_path(Path::new(&format!("/missing/{index}")))
+                .unwrap();
+        }
+        let error = discovery
+            .visit_path(Path::new("/one-too-many"))
+            .unwrap_err();
+        assert!(error.msg.contains("filesystem visit limit"));
+
+        let mut discovery = CandidateDiscovery::new("fixture");
+        let oversized = PathBuf::from("x".repeat(MAX_DISCOVERY_VISITED_PATH_BYTES + 1));
+        let error = discovery.visit_path(&oversized).unwrap_err();
+        assert!(error.msg.contains("visited path state"));
+    }
+
+    #[test]
     fn probe_missing_binary_is_unknown() {
-        let v = probe_version(std::path::Path::new("/nonexistent/tool/xyz"));
+        let v = probe_version(
+            std::path::Path::new("/nonexistent/tool/xyz"),
+            &ProviderCtx::new("/"),
+        );
         assert!(v.is_unknown());
+    }
+
+    #[test]
+    fn probe_uses_injected_runner_with_exact_resource_budget() {
+        let runner = Arc::new(RecordingRunner::default());
+        let context = ProviderCtx::with_runner("/work", None, runner.clone());
+        let version = probe_version(Path::new("/fixture/tool"), &context);
+        assert_eq!(version.raw(), "7.8.9");
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            vec![RecordedCall {
+                program: PathBuf::from("/fixture/tool"),
+                args: vec![OsString::from("--version")],
+                timeout: PROBE_TIMEOUT,
+                output_cap: PROBE_OUTPUT_CAP,
+            }]
+        );
+    }
+
+    #[test]
+    fn shipped_provider_hooks_do_not_reacquire_process_authority() {
+        for (name, source) in [
+            ("mise", include_str!("mise.rs")),
+            ("system", include_str!("system.rs")),
+        ] {
+            for forbidden in [
+                "std::process::Command",
+                "Command::new(",
+                ".status()",
+                ".output()",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} provider bypasses ProviderRunner with `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probe_drains_flooding_output_without_defeating_deadline() {
+        // Exceed supported Unix pipe capacities without making shell-loop
+        // throughput itself the subject of the 300 ms provider deadline.
+        // The former 50,000 built-in calls crossed that wall on macOS CI even
+        // though the concurrent reader was draining correctly.
+        let (_dir, tool) = executable_script(
+            "printf 'hostile-tool 1.2.3\\n'; i=0; while [ $i -lt 10000 ]; do printf 0123456789; i=$((i+1)); done",
+        );
+        let start = Instant::now();
+        let version = probe_version(&tool, &ProviderCtx::new("/"));
+        assert_eq!(version.raw(), "1.2.3");
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn probe_timeout_kills_forked_descendants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let descendant_path = dir.path().join("descendant.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", descendant_path.display());
+        let (_tool_dir, tool) = executable_script(&script);
+
+        let start = Instant::now();
+        assert!(probe_version(&tool, &ProviderCtx::new("/")).is_unknown());
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        let descendant: libc::pid_t = fs::read_to_string(descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal 0 only checks whether this recorded pid exists.
+            let result = unsafe { libc::kill(descendant, 0) };
+            if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant {descendant} survived"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

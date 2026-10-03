@@ -1,10 +1,12 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use shoal_journal::{EntryRecord, Journal, JournalQuery};
+use shoal_journal::{EntryKind, EntryRecord, Journal, JournalQuery};
 use std::hint::black_box;
 fn bench_suite(c: &mut Criterion) {
     let j = Journal::in_memory().unwrap();
     for i in 0..100_000 {
         j.append(&EntryRecord {
+            kind: EntryKind::Statement,
+            parent_id: None,
             session: "bench".into(),
             principal: "human".into(),
             ts_ns: i,

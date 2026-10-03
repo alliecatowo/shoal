@@ -31,7 +31,10 @@ accDescr: Shows the components and relationships described in One runtime, sever
     KERNEL --> MCP["MCP bridge\ntools + resources + PTYs"]
 ```
 
-The language is shared. Host behavior is not always identical: for example, the local REPL can suspend a foreground process group with `Ctrl-Z`, while kernel task suspend/resume currently returns `TASK_CONTROL_UNAVAILABLE`. The manual calls out those boundaries rather than treating every host as interchangeable.
+The language is shared. Host behavior is not always identical: the local REPL owns terminal
+reattachment and `Ctrl-Z`, while raw kernel task control can stop/resume process-backed work but not
+pure evaluator computation. The manual calls out those boundaries rather than treating every host
+as interchangeable.
 
 ## How a statement chooses its mode
 
@@ -123,7 +126,9 @@ The next line may begin with `.` after an incomplete chain, so long transformati
 - channels to bridge named event flows across language and kernel sessions.
 
 
-Streams do not currently feed a process incrementally. Use `.take(n).collect()` or another bounded sink before `feed`; see [Streams and channels](@/docs/streams-channels.md).
+Streams feed captured process stdin incrementally through a bounded, cancellation-aware pump; they
+do not need to be collected first. Use `.take(n)` when the producer is live and the consumer should
+receive only a bounded prefix; see [Streams and channels](@/docs/streams-channels.md).
 
 ## Results depend on position
 

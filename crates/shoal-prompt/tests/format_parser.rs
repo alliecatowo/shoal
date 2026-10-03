@@ -4,7 +4,8 @@
 use std::path::PathBuf;
 
 use shoal_prompt::{
-    FormatToken, GitSnapshot, PromptConfig, PromptContext, Renderer, Side, parse_format,
+    CustomModule, FormatToken, GitSnapshot, LanguageModule, PromptConfig, PromptContext, Renderer,
+    Side, parse_format,
 };
 
 fn no_color_ctx() -> PromptContext {
@@ -98,4 +99,46 @@ fn repo_relative_directory_and_branch_render_together() {
     let out = r.render_side(Side::Left, &ctx);
     // directory shows "proj/src"; branch shows the ascii "git:main" (no nerd font)
     assert_eq!(out, "proj/src git:main");
+}
+
+#[test]
+fn renderer_admits_every_style_surface_and_warns_before_rendering() {
+    let mut config = PromptConfig::default();
+    config.style.ok = "palette_typo".into();
+    config.module.character.success_style = "ok".into();
+    config
+        .module
+        .leash
+        .style_by_tier
+        .insert("A".into(), "tier_typo".into());
+    config.module.language.insert(
+        "rust".into(),
+        LanguageModule {
+            style: "language_typo".into(),
+            ..LanguageModule::default()
+        },
+    );
+    config.module.custom.insert(
+        "cluster".into(),
+        CustomModule {
+            style: "custom_typo".into(),
+            ..CustomModule::default()
+        },
+    );
+    config.format.left = "[[$character](inner_typo)](outer_typo)".into();
+
+    let (_, warnings) = Renderer::new(config);
+    for invalid in [
+        "palette_typo",
+        "tier_typo",
+        "language_typo",
+        "custom_typo",
+        "inner_typo",
+        "outer_typo",
+    ] {
+        assert!(
+            warnings.iter().any(|warning| warning.contains(invalid)),
+            "missing construction warning for {invalid}: {warnings:?}"
+        );
+    }
 }

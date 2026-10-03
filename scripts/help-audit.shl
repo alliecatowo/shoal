@@ -1,0 +1,46 @@
+#!/usr/bin/env shoal
+# Execute the public help/version surface and verify its installed documentation inputs.
+
+let override = (env SHOAL_BIN_DIR).out
+let bin_dir = path(override ?? "target/debug")
+let binaries = [
+  "shoal",
+  "shoal-kernel",
+  "shoal-mcp",
+  "shoal-lsp",
+  "shoal-token",
+  "shoal-secret",
+  "shoal-history",
+  "shoal-doctor",
+  "shoal-sandbox-exec",
+  "shoal-landlock-helper",
+]
+
+for name in binaries {
+  let executable = bin_dir.join(name)
+  assert(executable.is_file, "missing executable: {executable}")
+  let help = run(executable, "--help")
+  assert(help.ok, "{name} --help failed: {help.err}")
+  assert(help.out.contains("Usage:"), "{name} --help has no Usage section")
+  assert(help.out.lines().len() <= 32, "{name} --help is too long")
+  let version = run(executable, "--version")
+  assert(version.ok, "{name} --version failed: {version.err}")
+  assert(version.out.trim().starts_with("{name} "), "{name} --version is malformed: {version.out}")
+
+  let page = path("man").join("{name}.1")
+  assert(page.is_file, "missing man page: {page}")
+  let source = page.read
+  assert(source.starts_with(".TH "), "{page}: missing TH header")
+  assert(source.contains(".SH NAME"), "{page}: missing NAME section")
+  assert(source.contains(".SH SYNOPSIS"), "{page}: missing SYNOPSIS section")
+}
+
+let shoal = bin_dir.join("shoal")
+let commands = ["fmt", "doctor", "kernel", "lsp", "mcp", "completions", "prompt"]
+for command in commands {
+  let help = run(shoal, command, "--help")
+  assert(help.ok, "shoal {command} --help failed: {help.err}")
+  assert(help.out.contains("Usage: shoal {command}"), "shoal {command} help has the wrong usage")
+}
+
+echo "help audit: {binaries.len()} executables/man pages and {commands.len()} subcommands passed"

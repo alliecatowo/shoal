@@ -221,8 +221,10 @@ Do not simplify this distinction without re-auditing memory bounds and user expe
 
 ## JSON projection into values
 
-`json_to_value` maps JSON primitives normally. JSON arrays become a `Table` when every element is an
-object, otherwise a `List`. Objects become ordered `Record` values.
+`json_to_value` fallibly maps JSON primitives. Signed 64-bit integers remain `Int`; unsigned
+integers above that range return `number_range` instead of becoming an approximate `Float`. JSON
+arrays become a `Table` when every element is an object, otherwise a `List`. Objects become ordered
+`Record` values.
 
 
 This array heuristic is semantic: an empty array vacuously satisfies "all objects" only if the
@@ -260,7 +262,9 @@ function when round-trip fidelity matters.
 - sizes use decimal SI units with up to two trimmed decimals;
 - durations decompose across weeks through nanoseconds;
 - datetimes render their timestamp; times use `HH:MM` or `HH:MM:SS`;
-- bytes render a size marker; lazy bytes also show their content reference;
+- bytes render a size marker; lazy bytes also show their canonical
+  `val:blake3:` reference (exactly 64 lowercase hexadecimal digits; abbreviated displays remain
+  ordinary strings);
 - records preserve insertion order and quote non-identifier-shaped keys;
 - streams/tasks/functions/commands/secrets render opaque descriptors;
 - outcomes render compact status/signal and `ok`, not captured output.

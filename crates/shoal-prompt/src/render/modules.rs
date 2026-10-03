@@ -8,13 +8,13 @@ use super::Renderer;
 use super::helpers::{collapse_home, short_version, strftime_hms, truncate_branch, truncate_path};
 
 impl Renderer {
-    pub(super) fn render_character(&self, ctx: &PromptContext) -> String {
+    pub(super) fn render_character(&self, ctx: &PromptContext, edit_mode: EditMode) -> String {
         let m = &self.config.module.character;
         if !m.enabled {
             return String::new();
         }
         let ok = ctx.last_outcome.as_ref().map(|o| o.ok).unwrap_or(true);
-        let vicmd = ctx.edit_mode == EditMode::ViNormal;
+        let vicmd = matches!(edit_mode, EditMode::ViNormal | EditMode::ViVisual);
         let (symbol, style) = if vicmd {
             (m.vicmd_symbol.as_str(), m.vicmd_style.as_str())
         } else if ok {
@@ -54,7 +54,12 @@ impl Renderer {
             collapse_home(ctx, &m.home_symbol)
         };
         if m.truncate_to > 0 {
-            display = truncate_path(&display, m.truncate_to, self.ellipsis(ctx));
+            display = truncate_path(
+                &display,
+                m.truncate_to,
+                self.ellipsis(ctx),
+                &m.truncate_style,
+            );
         }
         let symbol = &m.symbol;
         let ro = if ctx.read_only {
@@ -192,7 +197,8 @@ impl Renderer {
             .replace("${symbol}", &m.symbol)
             .replace("${total}", &ctx.jobs.total.to_string())
             .replace("${running}", &ctx.jobs.running.to_string())
-            .replace("${suspended}", &ctx.jobs.suspended.to_string());
+            .replace("${suspended}", &ctx.jobs.suspended.to_string())
+            .replace("${completed}", &ctx.jobs.completed.to_string());
         self.paint(&m.style, &text, ctx)
     }
 
@@ -322,10 +328,8 @@ impl Renderer {
         };
         let show = match m.when.as_str() {
             "constrained" => binding.constrained,
-            // "resolved" and "probe" both surface any resolved binding on the
-            // render path; the actual probe subprocess (probe mode) runs in a
-            // background task and only ever populates `ctx.reef`, never here.
-            _ => binding.version.is_some() || binding.constrained,
+            "resolved" => binding.version.is_some(),
+            _ => unreachable!("language visibility is validated by Renderer::new"),
         };
         if !show {
             return String::new();

@@ -83,13 +83,14 @@ command head. `^` explicitly requests command interpretation.
 At the interactive prompt, a leading method chain is attached to the current `it` value. `it` and
 `out` are REPL/session concepts and are rejected in source contexts that do not provide them.
 
-### Context parity warning
+### Context parity
 
-The local REPL builds parser context from its evaluator bindings. Kernel `exec` currently calls the
-context-free parse entry point for each request. Evaluator dispatch can recover some cases—most
-notably command-shaped user functions and bare bound values—but the hosts do not have identical
-statement-head classification. When adding a binding-sensitive syntax rule, write both a multi-line
-local test and a multi-request kernel test.
+The evaluator owns the read-only parser-context snapshot. Both the local REPL and kernel `exec`
+plan/run paths take that snapshot immediately before parsing, so persisted values and callables use
+the same statement-head classification across hosts. The kernel retains its evaluator lock from
+snapshot through execution. Public `parse`/completion endpoints remain context-free because they do
+not operate on an attached session. Binding-sensitive rules require both a multi-line local test and
+a multi-request kernel test.
 
 ## Incomplete input and canonical formatting
 
@@ -140,7 +141,9 @@ calls `process::exit` from the evaluator, because that would kill an embedding k
 Expressions are tree-walk evaluated. Access and binary operations are split into dedicated modules;
 patterns bind through a separate matcher. Calls use `CallArgs` with positional and named values.
 Declared parameters are coerced at the call boundary rather than causing ambient coercion across
-the language.
+the language. That boundary is shared by expression and command calls: string inputs may use the
+declared word conversion, while incompatible already-tagged values fail. Return annotations reuse
+the validator in exact mode and do not convert the result.
 
 Conditions are intentionally strict: boolean values and command outcomes have truth semantics;
 arbitrary strings, numbers, and containers do not become truthy or falsy. This prevents empty-string
@@ -202,13 +205,14 @@ The evaluator is told whether a command appears in statement or value position.
 Kernel evaluators are non-interactive, so normal kernel `exec` captures output even when evaluating
 a statement. Long-lived interactive programs use the kernel's separate `pty.*` API.
 
-## Interpreter blocks and adapter discovery are not fully dynamic
+## Interpreter blocks consume explicit host context
 
-Parser recognition of interpreter block names uses a static list in `shoal-syntax`. Adapter specs
-have an `Interpreter` class, but the syntax crate cannot consult the adapter registry through its
-current dependency direction. Therefore adding an interpreter adapter alone does not necessarily
-teach the parser a new block head. This is a real architecture seam: solve it through an explicit
-parser context or generated registry rather than introducing a syntax → adapters dependency cycle.
+Standalone parsing recognizes the canonical interpreter list in `shoal-syntax`. A configured host
+adds the loaded catalog's `Interpreter` heads to `ParseCtx`, just as it adds live value/callable
+bindings for statement dispatch. Evaluation then lowers `Expr::LangBlock` through the same adapter's
+`bin`, `invoke`, `invoke_payload`, output parser, output type, and accepted exit codes. The syntax
+crate remains independent of adapters; a generated pack parity test keeps shipped default names
+reachable when no host context is present.
 
 ## Language-error boundary
 

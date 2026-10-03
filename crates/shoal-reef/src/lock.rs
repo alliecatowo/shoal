@@ -1,14 +1,17 @@
-//! The lock — `reef.lock`, a committed TOML file recording every resolved tool
-//! (site/content/internals/reef-resolution.md). Lives next to the project manifest, or in the user state dir
-//! for the user scope.
+//! The lock — `reef.lock`, a host-local TOML file recording every materialized
+//! tool binding (site/content/internals/reef-resolution.md). It lives next to
+//! the project manifest and is intentionally not a portable dependency lock:
+//! absolute paths and executable-byte hashes are properties of one host.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use shoal_value::{Fs, StdFs};
 
 /// One locked binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockEntry {
     pub name: String,
     pub version: String,
@@ -22,6 +25,7 @@ pub struct LockEntry {
 
 /// A parsed `reef.lock`: tool name → entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Lockfile {
     #[serde(default, rename = "tool")]
     pub tools: BTreeMap<String, LockEntry>,
@@ -43,11 +47,19 @@ impl Lockfile {
     /// Load a lockfile from disk. A missing file yields an empty lockfile;
     /// malformed TOML is an error.
     pub fn load(path: &Path) -> Result<Lockfile, LockError> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| LockError { msg: e.to_string() }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Lockfile::new()),
-            Err(e) => Err(LockError { msg: e.to_string() }),
-        }
+        Self::load_with(path, &StdFs)
+    }
+
+    /// Load through an explicit filesystem capability with the same bounded,
+    /// regular-file, and UTF-8 checks as [`Self::load`].
+    pub fn load_with(path: &Path, fs: &dyn Fs) -> Result<Lockfile, LockError> {
+        let Some(text) = crate::input::read_optional_with(fs, path).map_err(lock_error)? else {
+            return Ok(Lockfile::new());
+        };
+        crate::input::validate_toml_text(&text).map_err(lock_error)?;
+        let lock: Lockfile = toml::from_str(&text).map_err(lock_error)?;
+        lock.validate()?;
+        Ok(lock)
     }
 
     /// Serialize to a TOML string.
@@ -57,10 +69,26 @@ impl Lockfile {
 
     /// Write the lockfile to disk (creating parent dirs).
     pub fn save(&self, path: &Path) -> Result<(), LockError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| LockError { msg: e.to_string() })?;
+        self.save_with(path, &StdFs)
+    }
+
+    /// Validate and atomically replace a lockfile through an explicit
+    /// filesystem capability. Publication only follows a complete parent-fsynced
+    /// replacement under the production adapter.
+    pub fn save_with(&self, path: &Path, fs: &dyn Fs) -> Result<(), LockError> {
+        self.validate()?;
+        let text = self.to_toml();
+        if text.len() > crate::input::REEF_MANIFEST_MAX_BYTES {
+            return Err(lock_error(format!(
+                "serialized lock exceeds the {}-byte limit",
+                crate::input::REEF_MANIFEST_MAX_BYTES
+            )));
         }
-        std::fs::write(path, self.to_toml()).map_err(|e| LockError { msg: e.to_string() })
+        if let Some(parent) = path.parent() {
+            fs.create_dir_all(parent)
+                .map_err(|e| LockError { msg: e.to_string() })?;
+        }
+        fs.atomic_replace(path, text.as_bytes()).map_err(lock_error)
     }
 
     pub fn get(&self, name: &str) -> Option<&LockEntry> {
@@ -68,11 +96,60 @@ impl Lockfile {
     }
 
     pub fn insert(&mut self, entry: LockEntry) {
+        let _ = self.try_insert(entry);
+    }
+
+    pub fn try_insert(&mut self, entry: LockEntry) -> Result<(), LockError> {
+        if !self.tools.contains_key(&entry.name)
+            && self.tools.len() >= crate::input::REEF_LOCK_MAX_TOOLS
+        {
+            return Err(lock_error(format!(
+                "lock tool identity limit reached ({})",
+                crate::input::REEF_LOCK_MAX_TOOLS
+            )));
+        }
+        validate_entry(&entry)?;
         self.tools.insert(entry.name.clone(), entry);
+        Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> Option<LockEntry> {
         self.tools.remove(name)
+    }
+
+    fn validate(&self) -> Result<(), LockError> {
+        if self.tools.len() > crate::input::REEF_LOCK_MAX_TOOLS {
+            return Err(lock_error(format!(
+                "lock has {} tools; maximum is {}",
+                self.tools.len(),
+                crate::input::REEF_LOCK_MAX_TOOLS
+            )));
+        }
+        for entry in self.tools.values() {
+            validate_entry(entry)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_entry(entry: &LockEntry) -> Result<(), LockError> {
+    let path = entry.path.to_string_lossy();
+    for (kind, value) in [
+        ("lock name", entry.name.as_str()),
+        ("lock version", entry.version.as_str()),
+        ("lock provider", entry.provider.as_str()),
+        ("lock path", path.as_ref()),
+        ("lock hash", entry.blake3.as_str()),
+        ("lock timestamp", entry.resolved_at.as_str()),
+    ] {
+        crate::input::validate_string(kind, value).map_err(lock_error)?;
+    }
+    Ok(())
+}
+
+fn lock_error(error: impl std::fmt::Display) -> LockError {
+    LockError {
+        msg: error.to_string(),
     }
 }
 
@@ -137,5 +214,50 @@ mod tests {
     fn path_next_to_manifest() {
         let p = Lockfile::path_next_to(Path::new("/proj/.reef.toml"));
         assert_eq!(p, PathBuf::from("/proj/reef.lock"));
+    }
+
+    #[test]
+    fn hostile_lockfiles_fail_without_replacing_missing_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reef.lock");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((crate::input::REEF_MANIFEST_MAX_BYTES + 1) as u64)
+            .unwrap();
+        assert!(
+            Lockfile::load(&path)
+                .unwrap_err()
+                .msg
+                .contains("byte limit")
+        );
+
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(Lockfile::load(&path).unwrap_err().msg.contains("UTF-8"));
+        std::fs::write(
+            &path,
+            "[tool.node]\nname='node'\nname='other'\nversion='1'\nprovider='p'\npath='/x'\nblake3='x'\nresolved_at='now'\n",
+        )
+        .unwrap();
+        assert!(Lockfile::load(&path).is_err());
+        std::fs::write(
+            &path,
+            "[tool.node]\nname='node'\nversion='1'\nprovider='p'\npath='/x'\nblake3='x'\nresolved_at='now'\nunknown=true\n",
+        )
+        .unwrap();
+        assert!(Lockfile::load(&path).is_err());
+    }
+
+    #[test]
+    fn lock_identity_and_string_limits_are_enforced_transactionally() {
+        let mut lock = Lockfile::new();
+        for index in 0..crate::input::REEF_LOCK_MAX_TOOLS {
+            lock.try_insert(entry(&format!("tool-{index}"))).unwrap();
+        }
+        let error = lock.try_insert(entry("overflow")).unwrap_err();
+        assert!(error.msg.contains("identity limit"));
+        assert!(lock.get("overflow").is_none());
+
+        let mut huge = entry("huge");
+        huge.provider = "x".repeat(crate::input::REEF_MAX_STRING_BYTES + 1);
+        assert!(Lockfile::new().try_insert(huge).is_err());
     }
 }

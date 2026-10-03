@@ -1,0 +1,23 @@
+.TH SHOAL-TOKEN 1 "July 2026" "Shoal 0.1.0" "User Commands"
+.SH NAME
+shoal-token \- manage Shoal capability tokens
+.SH SYNOPSIS
+.B shoal-token create
+.I principal
+.RI [ profile ]
+.RI [ \-\-cap " cap" ]
+.RI [ \-\-ttl " seconds" ]
+.br
+.B shoal-token list
+.br
+.B shoal-token revoke
+.I id
+.SH DESCRIPTION
+Creates, lists, and revokes credentials used to authenticate kernel clients.
+.SH ENVIRONMENT
+.TP
+.B SHOAL_TOKEN_STORE
+Override the token database path.
+.SH SEE ALSO
+.BR shoal-mcp (1),
+.BR shoal-kernel (1)

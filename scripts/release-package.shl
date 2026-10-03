@@ -1,0 +1,104 @@
+#!/usr/bin/env shoal
+# Cross-build and package the exact public executable set for one target.
+
+assert(args.is_empty() || args.len() == 2, "usage: release-package.shl [TAG TARGET]")
+let tag = (env SHOAL_RELEASE_TAG).out ?? (if (args.len() == 2) { args[0].str() } else { "" })
+let target = (env SHOAL_RELEASE_TARGET).out ?? (if (args.len() == 2) { args[1].str() } else { "" })
+let manifest = toml.parse(path("Cargo.toml").read)
+let version = manifest.workspace["package"].version
+assert(tag == "v{version}", "release tag {tag} does not match workspace version v{version}")
+let targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+assert(target in targets, "unsupported release target: {target}")
+let name = "shoal-{tag}-{target}"
+let archive = path("{name}.tar.gz")
+let dist = path(name)
+let binaries = [
+  "shoal",
+  "shoal-kernel",
+  "shoal-mcp",
+  "shoal-lsp",
+  "shoal-token",
+  "shoal-secret",
+  "shoal-history",
+  "shoal-doctor",
+  "shoal-sandbox-exec",
+  "shoal-landlock-helper",
+]
+
+fn sha256(file: path) {
+  let result = if ((which sha256sum).out != null) {
+    run("sha256sum", file)
+  } else {
+    run("shasum", "-a", "256", file)
+  }
+  let fields = result.out.trim().split(" ").where(field => !field.is_empty())
+  assert(!fields.is_empty(), "checksum tool returned no digest for {file}")
+  fields.first()
+}
+
+if (dist.exists) {
+  rm --permanent --recursive (dist)
+}
+if (archive.exists) {
+  rm --permanent (archive)
+}
+let checksum = path("{archive}.sha256")
+if (checksum.exists) {
+  rm --permanent (checksum)
+}
+
+if target == "aarch64-unknown-linux-gnu" {
+  let update = run("sudo", "apt-get", "update")
+  assert(update.ok, "apt metadata update failed")
+  run("sudo", "apt-get", "install", "-y", "gcc-aarch64-linux-gnu")
+  env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "aarch64-linux-gnu-gcc"
+}
+
+let locks = (reef lock)
+let cargo_lock = locks.find(.name == "cargo")
+assert(cargo_lock != null && cargo_lock.locked, "release could not lock cargo through Reef: {locks}")
+run("cargo", "build", "--release", "--locked", "--workspace", "--bins", "--target", target)
+mkdir (dist)
+
+for binary in binaries {
+  let artifact = path("target").join(target).join("release").join(binary)
+  assert(artifact.is_file, "missing release executable: {artifact}")
+  cp (artifact) (dist.join(binary))
+}
+cp README.md (dist.join("README.md"))
+for license in glob("LICENSE*").expand() {
+  cp (license) (dist.join(license.name))
+}
+if (path("man").is_dir) {
+  cp --recursive man (dist.join("man"))
+}
+cp scripts/install.shl (dist.join("install.shl"))
+
+let metadata_result = run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1")
+let metadata = json.parse(metadata_result.out)
+let artifacts = binaries.map(binary => {
+  let file = dist.join(binary)
+  {name: binary, bytes: file.size, sha256: sha256(file)}
+})
+let provenance = {
+  schema: 1,
+  name: "shoal",
+  version: version,
+  tag: tag,
+  target: target,
+  commit: run("git", "rev-parse", "HEAD").out.trim(),
+  rustc: run("rustc", "--version").out.trim(),
+  cargo: run("cargo", "--version").out.trim(),
+  workspace_packages: metadata.packages.len(),
+  binaries: artifacts,
+}
+json.stringify(provenance, pretty: true).save(dist.join("BUILDINFO.json"))
+
+run("tar", "czf", archive, dist)
+"{sha256(archive)}  {archive.name}\n".save(checksum)
+echo "release package: {archive} + {checksum}"

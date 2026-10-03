@@ -223,7 +223,7 @@ fn expr(e: &Expr) -> String {
         Expr::Cmd { call, .. } => cmd(call),
         Expr::Lambda {
             params: p, body, ..
-        } => format!("({}) => {}", params(p, None), expr(body)),
+        } => format!("({}) => {}", params(p, None), lambda_body(body)),
         Expr::List { items, .. } => format!(
             "[{}]",
             items.iter().map(expr).collect::<Vec<_>>().join(", ")
@@ -327,6 +327,16 @@ fn expr(e: &Expr) -> String {
             if *inclusive { "..=" } else { ".." },
             atom(end)
         ),
+    }
+}
+
+/// A brace immediately after `=>` is deliberately parsed as a closure block.
+/// Parenthesize record-valued bodies so formatting never changes a record
+/// projection into a block whose first field is dispatched as a command.
+fn lambda_body(body: &Expr) -> String {
+    match body {
+        Expr::Record { .. } => format!("({})", expr(body)),
+        _ => expr(body),
     }
 }
 fn atom(e: &Expr) -> String {
@@ -477,6 +487,8 @@ mod tests {
             "fn add(a: int, b: int = 1) { a + b }\nadd(2)",
             "git push --force > out &",
             "if true { [1, 2] } else { [] }",
+            "[{name: \"api\", ready: true}].map(row => ({name: row.name, ready: row.ready}))",
+            "[1, 2].reduce({count: 0}, (acc, n) => ({count: acc.count + n}))",
         ] {
             let a = parse(src).unwrap();
             let text = format_program(&a);

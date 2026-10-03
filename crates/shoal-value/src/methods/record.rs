@@ -1,5 +1,6 @@
 //! Record-only methods (`.keys`/`.values`/`.items`/`.set`/`.merge`).
 
+use super::materialize::MaterializedCollection;
 use super::*;
 
 /// `.set(key, value)` — a new record with `key` inserted or replaced. Records
@@ -42,11 +43,16 @@ pub(crate) fn merge(v: Value, other: Value) -> VResult<Value> {
 
 pub(crate) fn record_side(v: Value, keys: bool) -> VResult<Value> {
     match v {
-        Value::Record(r) => Ok(Value::List(if keys {
-            r.keys().cloned().map(Value::Str).collect()
-        } else {
-            r.into_values().collect()
-        })),
+        Value::Record(r) => {
+            let values: Box<dyn Iterator<Item = Value>> = if keys {
+                Box::new(r.into_keys().map(Value::Str))
+            } else {
+                Box::new(r.into_values())
+            };
+            let mut out = MaterializedCollection::eager();
+            out.extend(values)?;
+            Ok(out.finish())
+        }
         v => Err(ErrorVal::type_error(format!(
             "expected record, found {}",
             v.type_name()
@@ -55,11 +61,13 @@ pub(crate) fn record_side(v: Value, keys: bool) -> VResult<Value> {
 }
 pub(crate) fn items(v: Value) -> VResult<Value> {
     match v {
-        Value::Record(r) => Ok(Value::List(
-            r.into_iter()
-                .map(|(k, v)| Value::List(vec![Value::Str(k), v]))
-                .collect(),
-        )),
+        Value::Record(r) => {
+            let mut out = MaterializedCollection::eager();
+            for (key, value) in r {
+                out.push(Value::List(vec![Value::Str(key), value]))?;
+            }
+            Ok(out.finish())
+        }
         v => Err(ErrorVal::type_error(format!(
             "expected record, found {}",
             v.type_name()

@@ -119,7 +119,7 @@ names
 "alpha\nbeta\n".feed(^wc -l)
 ```
 
-`feed` serializes ordinary values deliberately: strings become their bytes, a list of strings becomes newline-delimited text, and records/tables become compact JSON. Streams cannot currently feed a process incrementally; collect a bounded stream first. The exact serialization rules are in [External commands and data exchange](@/docs/external-commands.md).
+`feed` serializes ordinary values deliberately: strings become their bytes, a list of strings becomes newline-delimited text, and records/tables become compact JSON. A finite or live stream feeds line-framed items incrementally through a bounded, backpressured pipe and stops its pump on cancellation or child exit. The exact serialization rules are in [External commands and data exchange](@/docs/external-commands.md).
 
 ## Write and run a script
 

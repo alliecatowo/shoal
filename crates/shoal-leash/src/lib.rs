@@ -11,11 +11,17 @@ mod seatbelt;
 
 pub use effects::{Effect, Estimates, Plan, Reversibility};
 pub use enforce::{
-    EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy, SandboxPolicy, SpawnPreflight,
-    apply_landlock, apply_macos_sandbox, apply_sandbox, landlock_abi, preflight_spawn,
+    EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy, ProcessLimits, SandboxPolicy,
+    SpawnPreflight, apply_landlock, apply_landlock_policy, apply_macos_sandbox,
+    apply_macos_sandbox_policy, apply_process_limits, apply_sandbox, apply_sandbox_policy,
+    landlock_abi, preflight_spawn,
 };
-pub use policy::{AutoApply, OpaqueMode, Policy, PolicyLoadError, PrincipalPolicy, Verdict};
-pub use seatbelt::seatbelt_profile;
+pub use policy::{
+    AutoApply, OpaqueMode, POLICY_MAX_ASSIGNMENTS, POLICY_MAX_BYTES, POLICY_MAX_GRANT_BYTES,
+    POLICY_MAX_GRANTS_PER_KIND, POLICY_MAX_NESTING, POLICY_MAX_PRINCIPALS, Policy, PolicyLoadError,
+    PolicyParseError, PrincipalPolicy, Verdict,
+};
+pub use seatbelt::{seatbelt_profile, seatbelt_profile_with_net};
 
 #[cfg(test)]
 mod tests {
@@ -115,6 +121,13 @@ opaque = "ask"
             assert_eq!(p.evaluate_effect("agent", &e), Verdict::Allow)
         }
     }
+
+    #[test]
+    fn spawn_preflight_rejects_non_regular_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = preflight_spawn(directory.path(), &[]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
     #[test]
     fn spawn_pinning_active_only_when_proc_spawn_is_set() {
         // The load-bearing no-regression guard: a principal is "pinning" iff it
@@ -181,6 +194,29 @@ opaque = "ask"
     }
 
     #[test]
+    fn plan_evaluation_uses_the_same_optional_spawn_pinning_contract() {
+        let spawn = Plan::new(
+            vec![Effect::ProcSpawn {
+                bin_hash: "anyhash".into(),
+                argv0: "/usr/bin/printf".into(),
+            }],
+            Reversibility::Irreversible,
+            Estimates::default(),
+        );
+        let permissive = Policy::permissive("uid:1000");
+        assert_eq!(
+            permissive.evaluate_plan("uid:1000", &spawn),
+            Verdict::Allow,
+            "the kernel plan gate must not contradict the concrete spawn gate"
+        );
+
+        let pinned =
+            Policy::from_toml("[principal.agent]\nproc_spawn=['cargo']\nauto_apply='in-grant'\n")
+                .unwrap();
+        assert_eq!(pinned.evaluate_plan("agent", &spawn), Verdict::Deny);
+    }
+
+    #[test]
     fn opaque_and_unknown_principal() {
         let p = policy();
         assert_eq!(
@@ -236,18 +272,12 @@ opaque = "ask"
         assert!(!s.enforced);
         assert_eq!(s.active_tier, None);
         // `detect()`'s wording of *why* nothing is enforced is intentionally
-        // platform-specific (this crate installs no backend itself, so the
-        // message just describes what host mechanism is missing): Linux
-        // phrases it as a landlock/seccomp/network mechanism being
-        // "unavailable"; macOS phrases it as the Seatbelt backend being "not
-        // installed"; anything else falls back to "advisory". All three
-        // honestly report the same underlying fact (no OS-level enforcement
-        // is active) in the phrasing appropriate to that platform's branch
-        // in `detect()`.
-        if cfg!(target_os = "linux") {
+        // platform-specific. Detection reports available capability, but does
+        // not claim that a restriction has already been installed.
+        if cfg!(target_os = "linux") && s.landlock_abi.is_none() {
             assert!(s.detail.contains("unavailable"), "{}", s.detail);
-        } else if cfg!(target_os = "macos") {
-            assert!(s.detail.contains("not installed"), "{}", s.detail);
+        } else if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(s.detail.contains("no sandbox applied"), "{}", s.detail);
         } else {
             assert!(s.detail.contains("advisory"), "{}", s.detail);
         }
@@ -280,6 +310,17 @@ opaque = "ask"
         assert!(profile.starts_with("(version 1)\n(deny default)"));
         assert_eq!(profile.matches("file-read* (subpath").count(), 1);
         assert!(profile.contains("quote\\\"and\\\\slash"));
+        assert!(profile.contains("(allow network*)"));
+        let denied = seatbelt_profile_with_net(
+            &FsSandbox {
+                read: vec![weird],
+                write: vec![],
+                delete: vec![],
+            },
+            NetPolicy::Deny,
+        )
+        .unwrap();
+        assert!(!denied.contains("(allow network*)"));
     }
     #[cfg(not(target_os = "macos"))]
     #[test]
@@ -297,6 +338,8 @@ opaque = "ask"
         assert!(p.spawn_hash.is_none());
         assert!(!p.hermetic);
         assert!(p.fs.read.is_empty());
+        assert!(!p.filesystem_requested);
+        assert!(p.process_limits.is_empty());
     }
 
     #[test]
@@ -347,6 +390,7 @@ opaque = "ask"
         assert!(sandbox.fs.delete.is_empty());
         // `hermetic` is carried through from the principal.
         assert!(sandbox.hermetic);
+        assert_eq!(sandbox.net, NetPolicy::Deny);
         assert!(!policy.principal("agent").unwrap().is_fs_unrestricted());
     }
 
@@ -358,6 +402,68 @@ opaque = "ask"
         let policy = Policy::from_toml("[principal.agent]\nopaque='deny'\n").unwrap();
         assert!(policy.sandbox_for("agent").is_none());
         assert!(policy.sandbox_for("nobody").is_none());
+    }
+
+    #[test]
+    fn resource_only_policy_lowers_without_claiming_filesystem_scope() {
+        let policy = Policy::from_toml(
+            "[principal.agent]\nprocess_cpu_seconds=7\nprocess_memory_bytes=67108864\n",
+        )
+        .unwrap();
+        let sandbox = policy
+            .sandbox_for("agent")
+            .expect("resource ceilings require a child launcher");
+        assert!(!sandbox.filesystem_requested);
+        assert!(sandbox.fs.read.is_empty());
+        assert_eq!(sandbox.net, NetPolicy::Unrestricted);
+        assert_eq!(sandbox.process_limits.cpu_seconds, Some(7));
+        assert_eq!(sandbox.process_limits.memory_bytes, Some(67_108_864));
+        assert!(policy.process_limits_active("agent"));
+    }
+
+    #[test]
+    fn zero_process_limits_are_rejected_at_policy_load() {
+        for field in ["process_cpu_seconds", "process_memory_bytes"] {
+            let error = Policy::from_toml(&format!("[principal.agent]\n{field}=0\n"))
+                .expect_err("a zero hard ceiling is nonsensical");
+            assert!(error.to_string().contains("greater than zero"));
+        }
+    }
+
+    #[test]
+    fn hermetic_unresolved_scope_is_preserved_for_fail_closed_spawn() {
+        let hermetic = Policy::from_toml(
+            "[principal.agent]\nhermetic=true\n\n[principal.agent.fs]\nread=[\"/certainly/missing/shoal/**\"]\n",
+        )
+        .unwrap();
+        let sandbox = hermetic
+            .sandbox_for("agent")
+            .expect("hermetic intent must reach the spawn boundary");
+        assert!(sandbox.hermetic);
+        assert!(sandbox.fs.read.is_empty());
+        assert!(hermetic.filesystem_scoping_active("agent"));
+
+        let best_effort = Policy::from_toml(
+            "[principal.agent]\n\n[principal.agent.fs]\nread=[\"/certainly/missing/shoal/**\"]\n",
+        )
+        .unwrap();
+        assert!(best_effort.sandbox_for("agent").is_none());
+    }
+
+    #[test]
+    fn enforcement_intent_predicates_are_explicit() {
+        let policy = Policy::from_toml(
+            "[principal.agent]\nhermetic=true\nnet_connect=[\"example.com:443\"]\nproc_spawn=[\"tool\"]\n",
+        )
+        .unwrap();
+        assert!(policy.hermetic_active("agent"));
+        assert!(!policy.filesystem_scoping_active("agent"));
+        assert!(policy.network_scoping_active("agent"));
+        assert!(policy.spawn_pinning_active("agent"));
+        assert!(!Policy::permissive("human").hermetic_active("human"));
+
+        let listener = Policy::from_toml("[principal.agent]\nnet_listen=[8080]\n").unwrap();
+        assert!(listener.network_scoping_active("agent"));
     }
 
     #[test]
@@ -380,6 +486,14 @@ opaque = "ask"
         // file, so `uid:0` is unknown there (not permissive).
         assert!(loaded.principal("agent").is_some());
         assert!(loaded.principal("uid:0").is_none());
+        std::fs::write(cfg.join("leash.toml"), "[principal.agent\n").unwrap();
+        let quarantined = Policy::load_user_or_permissive("uid:0");
+        assert!(quarantined.is_fail_closed());
+        assert!(quarantined.spawn_pinning_active("uid:0"));
+        assert_eq!(
+            quarantined.evaluate_effect("uid:0", &Effect::Time),
+            Verdict::Deny
+        );
         // With no config file, we get the permissive fallback for the principal.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", d.path().join("empty")) };
         let fallback = Policy::load_user_or_permissive("uid:0");

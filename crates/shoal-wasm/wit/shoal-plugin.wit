@@ -1,18 +1,76 @@
-package shoal:plugin@0.1.0;
+package shoal:plugin@1.0.0;
 
 interface types {
-  record tagged-value { json: string, raw: option<list<u8>> }
-  record effect { kind: string, parameters-json: string }
-  record command { name: string, signature-json: string, effects: list<effect> }
-  record method { type-name: string, name: string, signature-json: string, effects: list<effect> }
-  record completion { value: string, description: option<string> }
+  enum value-kind {
+    null,
+    boolean,
+    signed,
+    unsigned,
+    float,
+    text,
+    bytes,
+    json,
+  }
+
+  /// Versioned, deliberately small value envelope. `payload` is canonical for
+  /// the selected kind: UTF-8 text for scalar/string/JSON values and raw bytes
+  /// only for `bytes`. Streams, secrets, tasks, and host resources never cross
+  /// this boundary as ordinary values.
+  record guest-value {
+    abi-version: u32,
+    kind: value-kind,
+    payload: list<u8>,
+  }
+
+  enum error-kind {
+    invalid-argument,
+    permission-denied,
+    not-found,
+    resource-limit,
+    trap,
+    internal,
+  }
+
+  record guest-error {
+    kind: error-kind,
+    message: string,
+    details-json: option<string>,
+  }
+
+  record declaration {
+    name: string,
+    signature-json: string,
+  }
+
+  record method-declaration {
+    type-name: string,
+    name: string,
+    signature-json: string,
+  }
+
+  record completion {
+    value: string,
+    description: option<string>,
+  }
+}
+
+interface host {
+  use types.{guest-error};
+
+  /// Every call is authorized as the canonical `time` Shoal effect.
+  now-ns: func() -> result<u64, guest-error>;
+
+  /// Every call is authorized as `fs_read` for the exact requested path.
+  read-file: func(path: string) -> result<list<u8>, guest-error>;
 }
 
 world plugin {
-  use types.{tagged-value, command, method, completion};
-  export commands: func() -> list<command>;
-  export methods: func() -> list<method>;
-  export invoke-command: func(name: string, args: list<tagged-value>) -> result<tagged-value, string>;
-  export invoke-method: func(type-name: string, name: string, receiver: tagged-value, args: list<tagged-value>) -> result<tagged-value, string>;
+  import host;
+  use types.{guest-value, guest-error, declaration, method-declaration, completion};
+
+  export commands: func() -> list<declaration>;
+  export methods: func() -> list<method-declaration>;
+  export invoke-command: func(name: string, args: list<guest-value>) -> result<guest-value, guest-error>;
+  export invoke-method: func(type-name: string, name: string, receiver: guest-value, args: list<guest-value>) -> result<guest-value, guest-error>;
   export complete: func(context-json: string) -> list<completion>;
 }

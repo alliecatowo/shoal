@@ -18,6 +18,7 @@ clients share vocabulary without depending on the runtime, but it creates a lock
 between registry membership and dispatch guards.
 
 Sources: [`commands.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-syntax/src/commands.rs),
+`crates/shoal-syntax/src/commands/metadata.rs`,
 [`builtins.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/builtins.rs),
 [`command.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/command.rs), and
 [`host.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/host.rs).
@@ -73,7 +74,10 @@ special-head registry.
 flowchart TD
 accTitle: Command dispatch precedence
 accDescr: Shows the components and relationships described in Command dispatch precedence.
-  Call["CmdCall"] --> BG{"background &?"}
+  Call["CmdCall"] --> Resolve["canonical head resolution"]
+  Resolve --> Help{"resolved builtin + -h/--help?"}
+  Help -->|yes| RenderHelp["render metadata; zero effects"]
+  Help -->|no| BG{"background &?"}
   BG -->|yes| Spawn["desugar to spawn block"]
   BG -->|no| Callable{"bound callable?"}
   Callable -->|yes| CallValue["closure/CmdRef command-call path"]
@@ -109,6 +113,15 @@ types influence parsing of the word list:
 `--help` on a closure synthesizes a signature and documentation string and sends it through the
 statement renderer. This behavior is runtime dispatch, not a separate documentation command.
 
+For a head that actually resolves to a builtin, `-h` and `--help` render the canonical typed command
+schema. Resolution happens first, so a callable shadow still receives callable help. Builtin help
+then returns `null` before background desugaring, glob/expression expansion, environment prefixes,
+redirects, Reef/provider work, filesystem access, process launch, or session mutation. Extra operands
+do not weaken this rule (`rm --help FILE` is help, never removal); `--` ends option recognition.
+Planning applies the identical predicate and derives an empty effect set, including when the source
+contains `&` or redirects. An adversarial matrix exercises both help spellings for all 37 heads with
+denying filesystem, execution, clock, and opener ports.
+
 ## Structured builtin input pipeline
 
 
@@ -129,6 +142,19 @@ The variadic coercion table is:
 strings/paths specially.
 
 ## Structured builtin return contract
+
+`builtins/admission.rs` is the transient allocation boundary for structured builtin results.
+Builders admit at most 16,384 values and 16 MiB of measured retained state before outcome wrapping;
+strings and byte concatenation use the same 16 MiB wall. Breaches raise `builtin_output_limit` with
+a hint to narrow or stream the input. Production filesystem adapters must override bounded
+directory reads so `ls` enforces the row wall during iteration, not after collecting the directory.
+`builtins/copy.rs` separately inventories all recursive-copy sources before effects. Its iterative
+work stack shares count/byte admission with finalized operations, preventing recursive pending
+vectors from multiplying memory by depth; execution begins only after the complete bounded plan is
+valid.
+The same admission module is crate-visible to `reef_builtins.rs`: `which --all`, binding/lock/doctor
+tables, adapter schema lists, and resolution scope chains cannot bypass the structured-result wall.
+Reef lock updates remain staged until every output row is admitted.
 
 | Head | Key arguments/flags | Raw structured result |
 |---|---|---|
@@ -173,7 +199,12 @@ order.
 
 Multiple `cp`/`mv` sources require a directory destination. Copy recurses only with a recursive flag;
 move always uses `Fs::rename`. Recursive copy follows the type information exposed by the `Fs` port
-and creates destination directories as it descends.
+and creates destination directories as it descends. Its portable preflight admits only ordinary
+files/directories without sparse allocation, extended attributes, or Unix special mode bits; it
+rejects links and special nodes rather than inheriting `std::fs::copy`'s follow/open behavior.
+`Fs::has_extended_attributes` and `Fs::set_permissions` make metadata inspection/application explicit
+for adapters. Execution applies file modes after each content copy and directory modes deepest-first;
+ownership and timestamps are intentionally fresh.
 
 `rm` is nonpermanent by default. It creates a per-process temporary trash directory:
 
@@ -281,7 +312,8 @@ command returns `null` so it is not rendered a second time.
 To add a command builtin safely:
 
 1. choose structured or special ownership; never add the same name to both lists;
-2. add the name in `shoal-syntax/src/commands.rs` and update the pinned count;
+2. add typed signature/help metadata in `shoal-syntax/src/commands/metadata.rs`, classify the head in
+   `commands.rs`, and update the pinned count;
 3. for a structured builtin, add its dispatch arm, argument coercion rule, typed return contract,
    flags, cancellation behavior, and error spans;
 4. for a special head, add an explicit `eval_command` branch and keep registry/guard parity tests
@@ -305,5 +337,5 @@ To add a command builtin safely:
   port/event bus in the shown host implementation; child inheritance requires continuing audits.
 - `retry` delay is neither cancellation-aware nor routed through a sleep/clock capability.
 - Builtin outcomes report zero duration and have no invocation span, reducing telemetry fidelity.
-- The registry centralizes names, not signatures or help text; behavioral metadata still lives in
-  multiple evaluator files.
+- Canonical signature/help metadata now exists, but runtime arity validation and every completion/man
+  consumer have not yet been migrated to it.

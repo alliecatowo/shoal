@@ -15,8 +15,11 @@
 //! The lazy combinator stages themselves (`Map`/`Filter`/`Scan`/…) live in
 //! [`ops`], split out for size.
 
+mod cas;
 mod ops;
 mod tee;
+
+pub(crate) use ops::semantic_hash;
 
 use super::*;
 
@@ -35,6 +38,14 @@ enum StreamState {
     Consumed,
 }
 
+const STREAM_STATE_POISONED_CODE: &str = "custom";
+const STREAM_STATE_POISONED_MSG: &str =
+    "stream state is unavailable after a synchronization failure";
+
+fn stream_state_poisoned() -> ErrorVal {
+    ErrorVal::new(STREAM_STATE_POISONED_CODE, STREAM_STATE_POISONED_MSG)
+}
+
 /// One pull from an upstream, honoring an optional deadline.
 pub enum Pull {
     Item(Value),
@@ -44,6 +55,104 @@ pub enum Pull {
     /// channel-backed source or a timing combinator; an in-memory source never
     /// times out).
     Timeout,
+}
+
+/// Machine-readable reason carried by every stream loss marker. The runtime
+/// still represents markers as ordinary records at the language boundary, but
+/// producers construct them through this closed enum so spellings and fields
+/// cannot drift independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamGapReason {
+    SubscriberOverflow,
+    HistoryEvicted,
+    MixedOverflow,
+    TeeOverflow,
+    TailOverflow,
+    WatchOverflow,
+}
+
+impl StreamGapReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscriberOverflow => "subscriber_overflow",
+            Self::HistoryEvicted => "history_evicted",
+            Self::MixedOverflow => "mixed_overflow",
+            Self::TeeOverflow => "tee_overflow",
+            Self::TailOverflow => "tail_overflow",
+            Self::WatchOverflow => "watch_overflow",
+        }
+    }
+}
+
+/// Typed internal representation of an in-band stream gap. `from_seq` and
+/// `to_seq` are populated for sequenced channel events and remain `null` for
+/// sources such as `tail` and `.tee` that have no public sequence space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamGap {
+    pub reason: StreamGapReason,
+    pub dropped: u64,
+    pub from_seq: Option<u64>,
+    pub to_seq: Option<u64>,
+}
+
+impl StreamGap {
+    pub fn new(reason: StreamGapReason, dropped: u64) -> Self {
+        Self {
+            reason,
+            dropped,
+            from_seq: None,
+            to_seq: None,
+        }
+    }
+
+    pub fn with_seq_range(mut self, from_seq: u64, to_seq: u64) -> Self {
+        self.from_seq = Some(from_seq);
+        self.to_seq = Some(to_seq);
+        self
+    }
+
+    /// Merge an older gap into this one while retaining an exact loss count and
+    /// the widest known sequence range.
+    pub fn absorb(&mut self, other: StreamGap) {
+        if self.reason != other.reason {
+            self.reason = StreamGapReason::MixedOverflow;
+        }
+        self.dropped = self.dropped.saturating_add(other.dropped);
+        self.from_seq = match (self.from_seq, other.from_seq) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.to_seq = match (self.to_seq, other.to_seq) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    /// Stable discriminated record shape exposed to Shoal code.
+    pub fn into_record(self) -> Record {
+        let mut r = Record::new();
+        r.insert("marker".into(), Value::Str("stream_gap".into()));
+        r.insert("reason".into(), Value::Str(self.reason.as_str().into()));
+        r.insert(
+            "dropped".into(),
+            Value::Int(self.dropped.min(i64::MAX as u64) as i64),
+        );
+        r.insert(
+            "from_seq".into(),
+            self.from_seq
+                .map_or(Value::Null, |n| Value::Int(n.min(i64::MAX as u64) as i64)),
+        );
+        r.insert(
+            "to_seq".into(),
+            self.to_seq
+                .map_or(Value::Null, |n| Value::Int(n.min(i64::MAX as u64) as i64)),
+        );
+        r
+    }
+
+    pub fn into_value(self) -> Value {
+        Value::Record(self.into_record())
+    }
 }
 
 /// A pull-based source or combinator stage. Closure-bearing stages receive the
@@ -73,10 +182,36 @@ impl Upstream for IterSource {
     }
 }
 
+/// One cursor over shared, immutable replay storage. Collection and bounded
+/// stream `.tee(n)` use one backing allocation rather than cloning the entire
+/// materialized value vector once per fork.
+struct ReplaySource {
+    values: Arc<[Value]>,
+    index: usize,
+}
+
+impl Upstream for ReplaySource {
+    fn pull(
+        &mut self,
+        _ctx: &mut dyn CallCtx,
+        _timeout: Option<std::time::Duration>,
+    ) -> VResult<Pull> {
+        let Some(value) = self.values.get(self.index) else {
+            return Ok(Pull::End);
+        };
+        self.index += 1;
+        Ok(Pull::Item(value.clone()))
+    }
+}
+
 /// Base source over a live channel fed by a background producer (`every`'s timer,
 /// `watch`/`tail`'s notify thread, a `channel().events()` subscription). Supports
 /// timed reads so timing combinators (`debounce`/`throttle`) work.
-struct ChanSource(std::sync::mpsc::Receiver<VResult<Value>>);
+struct ChanSource {
+    rx: std::sync::mpsc::Receiver<VResult<Value>>,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
 impl Upstream for ChanSource {
     fn pull(
         &mut self,
@@ -85,15 +220,26 @@ impl Upstream for ChanSource {
     ) -> VResult<Pull> {
         use std::sync::mpsc::RecvTimeoutError;
         match timeout {
-            None => match self.0.recv() {
+            None => match self.rx.recv() {
                 Ok(r) => r.map(Pull::Item),
                 Err(_) => Ok(Pull::End),
             },
-            Some(d) => match self.0.recv_timeout(d) {
+            Some(d) => match self.rx.recv_timeout(d) {
                 Ok(r) => r.map(Pull::Item),
                 Err(RecvTimeoutError::Timeout) => Ok(Pull::Timeout),
                 Err(RecvTimeoutError::Disconnected) => Ok(Pull::End),
             },
+        }
+    }
+}
+
+impl Drop for ChanSource {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.stop {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
         }
     }
 }
@@ -105,12 +251,26 @@ impl std::fmt::Debug for StreamVal {
 }
 
 impl StreamVal {
+    /// Hard admission ceiling for exact distinct history. Exactness requires
+    /// retaining every previously observed identity, so live streams must fail
+    /// explicitly at a bound rather than evicting and re-emitting old values.
+    pub const DISTINCT_MAX_VALUES: usize = 4_096;
+    const DISTINCT_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+    pub const WINDOW_MAX_VALUES: usize = 4_096;
+    const WINDOW_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+    pub const COLLECT_MAX_VALUES: usize = 16_384;
+    const COLLECT_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+    pub const TEE_MAX_FORKS: usize = 64;
     /// Build a stream from an in-memory / lazy iterator (a bounded source).
     pub fn from_iter<I>(label: impl Into<String>, iter: I) -> StreamVal
     where
         I: Iterator<Item = VResult<Value>> + Send + 'static,
     {
         StreamVal::from_source(label, true, Box::new(IterSource(Box::new(iter))))
+    }
+
+    pub(crate) fn replay_shared(label: impl Into<String>, values: Arc<[Value]>) -> StreamVal {
+        StreamVal::from_source(label, true, Box::new(ReplaySource { values, index: 0 }))
     }
 
     /// Build a stream from a live channel fed by a background producer. Unbounded
@@ -120,7 +280,49 @@ impl StreamVal {
         label: impl Into<String>,
         rx: std::sync::mpsc::Receiver<VResult<Value>>,
     ) -> StreamVal {
-        StreamVal::from_source(label, false, Box::new(ChanSource(rx)))
+        StreamVal::from_source(
+            label,
+            false,
+            Box::new(ChanSource {
+                rx,
+                stop: None,
+                on_drop: None,
+            }),
+        )
+    }
+
+    /// Build a channel-backed stream while preserving the producer's known
+    /// natural boundedness. Used by evaluator-owned pumps such as `.buffer`.
+    pub fn from_buffered_channel(
+        label: impl Into<String>,
+        bounded: bool,
+        rx: std::sync::mpsc::Receiver<VResult<Value>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        on_drop: Box<dyn FnOnce() + Send>,
+    ) -> StreamVal {
+        StreamVal::from_source(
+            label,
+            bounded,
+            Box::new(ChanSource {
+                rx,
+                stop: Some(stop),
+                on_drop: Some(on_drop),
+            }),
+        )
+    }
+
+    /// Build a stream from an evaluator-owned source.
+    ///
+    /// This is the ownership seam for live sources whose receive or pump
+    /// policy cannot be represented by `std::sync::mpsc` (for example a
+    /// bounded event subscription with explicit overflow records). The source
+    /// remains single-consumption and is driven through the normal `CallCtx`.
+    pub fn from_upstream(
+        label: impl Into<String>,
+        bounded: bool,
+        up: Box<dyn Upstream>,
+    ) -> StreamVal {
+        StreamVal::from_source(label, bounded, up)
     }
 
     fn from_source(label: impl Into<String>, bounded: bool, up: Box<dyn Upstream>) -> StreamVal {
@@ -140,7 +342,11 @@ impl StreamVal {
     /// Take the composed upstream, enforcing single-consumption (site/content/internals/language-conformance-contract.md): a
     /// second attempt is `stream_consumed`.
     pub fn take_upstream(&self) -> VResult<Box<dyn Upstream>> {
-        let mut g = self.inner.lock().unwrap();
+        // A stream mutex can be poisoned by arbitrary upstream/evaluator code.
+        // Its cursor and external effects may already have advanced, so do not
+        // reconstruct from the poisoned guard: quarantine it and return one
+        // stable language error on every attempt.
+        let mut g = self.inner.lock().map_err(|_| stream_state_poisoned())?;
         match std::mem::replace(&mut *g, StreamState::Consumed) {
             StreamState::Ready(up) => Ok(up),
             StreamState::Consumed => {
@@ -184,9 +390,10 @@ impl StreamVal {
     pub fn flat_map(self, f: Value) -> VResult<StreamVal> {
         let b = self.bounded;
         self.wrap("value", b, |up| {
-            Box::new(ops::FlatMap {
+            Box::new(ops::FlatMapSequential {
                 up,
                 f,
+                require_bounded_children: b,
                 sub: None,
                 queue: std::collections::VecDeque::new(),
             })
@@ -219,11 +426,24 @@ impl StreamVal {
         self.wrap(l, b, |up| Box::new(ops::Dedupe { up, last: None }))
     }
     pub fn distinct(self) -> VResult<StreamVal> {
+        self.distinct_bounded(Self::DISTINCT_MAX_VALUES)
+    }
+    pub fn distinct_bounded(self, max_values: usize) -> VResult<StreamVal> {
+        if max_values == 0 || max_values > Self::DISTINCT_MAX_VALUES {
+            return Err(ErrorVal::arg_error(format!(
+                "distinct limit must be between 1 and {}",
+                Self::DISTINCT_MAX_VALUES
+            )));
+        }
         let (b, l) = (self.bounded, self.label.clone());
         self.wrap(l, b, |up| {
             Box::new(ops::Distinct {
                 up,
-                seen: Vec::new(),
+                seen: std::collections::HashMap::new(),
+                seen_values: 0,
+                retained_bytes: 0,
+                max_values,
+                max_retained_bytes: Self::DISTINCT_MAX_RETAINED_BYTES,
             })
         })
     }
@@ -249,12 +469,20 @@ impl StreamVal {
         })
     }
     pub fn window_count(self, n: usize) -> VResult<StreamVal> {
+        if n == 0 || n > Self::WINDOW_MAX_VALUES {
+            return Err(ErrorVal::arg_error(format!(
+                "window count must be between 1 and {}",
+                Self::WINDOW_MAX_VALUES
+            )));
+        }
         let b = self.bounded;
         self.wrap("list", b, |up| {
             Box::new(ops::WindowCount {
                 up,
                 n,
                 buf: std::collections::VecDeque::new(),
+                retained_bytes: 0,
+                max_retained_bytes: Self::WINDOW_MAX_RETAINED_BYTES,
             })
         })
     }
@@ -265,14 +493,11 @@ impl StreamVal {
                 up,
                 dur,
                 buf: Vec::new(),
+                retained_bytes: 0,
+                max_values: Self::WINDOW_MAX_VALUES,
+                max_retained_bytes: Self::WINDOW_MAX_RETAINED_BYTES,
             })
         })
-    }
-    pub fn buffer(self, _n: usize) -> VResult<StreamVal> {
-        // Pure pacing decoupler: in a synchronous pull model it has no observable
-        // effect on the item sequence, so it is an identity stage. It exists so
-        // `.buffer(n)` type-checks and reads intentionally in a chain.
-        Ok(self)
     }
     pub fn enumerate(self) -> VResult<StreamVal> {
         let b = self.bounded;
@@ -287,6 +512,7 @@ impl StreamVal {
                 b: other_up,
                 a_done: false,
                 b_done: false,
+                prefer_a: true,
             })
         })
     }
@@ -295,7 +521,14 @@ impl StreamVal {
         let bounded = self.bounded || other.bounded;
         let other_up = other.take_upstream()?;
         self.wrap("list", bounded, |up| {
-            Box::new(ops::Zip { a: up, b: other_up })
+            Box::new(ops::Zip {
+                a: up,
+                b: other_up,
+                pending_a: None,
+                pending_b: None,
+                wait_a: true,
+                done: false,
+            })
         })
     }
 
@@ -313,8 +546,11 @@ impl StreamVal {
     /// them once and replays the full list per fork, preserving exact
     /// whole-stream replay with no cap.
     pub fn tee(self, n: usize) -> VResult<Vec<StreamVal>> {
-        if n == 0 {
-            return Err(ErrorVal::arg_error("tee count must be positive"));
+        if n == 0 || n > Self::TEE_MAX_FORKS {
+            return Err(ErrorVal::arg_error(format!(
+                "tee count must be between 1 and {}",
+                Self::TEE_MAX_FORKS
+            )));
         }
         let (label, bounded) = (self.label.clone(), self.bounded);
         let up = self.take_upstream()?;
@@ -347,6 +583,20 @@ pub fn drive_stream(
 /// Collect a bounded stream into a `Vec`. Errors `stream_unbounded` on an endless
 /// source (site/content/internals/streams-channels.md) — the caller must `.take`/`.take_until` first.
 pub fn collect_stream(ctx: &mut dyn CallCtx, s: &StreamVal) -> VResult<Vec<Value>> {
+    collect_stream_with_limits(
+        ctx,
+        s,
+        StreamVal::COLLECT_MAX_VALUES,
+        StreamVal::COLLECT_MAX_RETAINED_BYTES,
+    )
+}
+
+fn collect_stream_with_limits(
+    ctx: &mut dyn CallCtx,
+    s: &StreamVal,
+    max_values: usize,
+    max_retained_bytes: usize,
+) -> VResult<Vec<Value>> {
     if !s.bounded {
         return Err(
             ErrorVal::new("stream_unbounded", "this stream has no natural end")
@@ -355,11 +605,40 @@ pub fn collect_stream(ctx: &mut dyn CallCtx, s: &StreamVal) -> VResult<Vec<Value
     }
     let mut up = s.take_upstream()?;
     let mut out = Vec::new();
+    let mut retained_bytes = 0usize;
     drive_stream(ctx, &mut *up, |_ctx, v| {
+        if out.len() >= max_values {
+            return Err(stream_collect_limit(format!(
+                "stream collection reached its {max_values}-value limit"
+            )));
+        }
+        let retained = retained_size(
+            &v,
+            RetainedLimits {
+                max_bytes: max_retained_bytes.saturating_sub(retained_bytes),
+                max_depth: 64,
+                max_nodes: 16_384,
+                opaque: OpaqueHandling::Charge(256),
+                allow_secret: true,
+            },
+        )
+        .map_err(|_| {
+            stream_collect_limit(format!(
+                "stream collection exceeds its {max_retained_bytes}-byte retained-value limit"
+            ))
+        })?;
+        retained_bytes = retained_bytes
+            .checked_add(retained)
+            .ok_or_else(|| stream_collect_limit("stream collection accounting overflowed"))?;
         out.push(v);
         Ok(())
     })?;
     Ok(out)
+}
+
+fn stream_collect_limit(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::new("stream_collect_limit", message)
+        .with_hint("use `.take(n)`, an incremental sink such as `.each(f)`, or stream directly")
 }
 
 #[cfg(test)]
@@ -371,8 +650,15 @@ mod tests {
         fn call_closure(&mut self, _f: &Value, _args: Vec<Value>) -> VResult<Value> {
             Err(ErrorVal::new("custom", "no closures in these tests"))
         }
+        fn buffer_stream(&mut self, _stream: StreamVal, _capacity: usize) -> VResult<StreamVal> {
+            unreachable!("stream buffer is not exercised by this pull test context")
+        }
         fn cwd(&self) -> PathBuf {
             std::env::temp_dir()
+        }
+        fn fs(&self) -> &dyn Fs {
+            static STD: StdFs = StdFs;
+            &STD
         }
     }
 
@@ -444,5 +730,127 @@ mod tests {
         let s = endless_marked(1);
         drain(&s);
         assert_eq!(s.tee(2).unwrap_err().code, "stream_consumed");
+
+        let s = endless_marked(1);
+        assert_eq!(
+            s.clone()
+                .tee(StreamVal::TEE_MAX_FORKS + 1)
+                .unwrap_err()
+                .code,
+            "arg_error"
+        );
+        assert_eq!(drain(&s), vec![Value::Int(0)]);
+    }
+
+    #[test]
+    fn distinct_history_is_exact_until_its_typed_limit() {
+        let stream = StreamVal::from_iter(
+            "int",
+            [1, 1, 2, 3].into_iter().map(|value| Ok(Value::Int(value))),
+        )
+        .distinct_bounded(2)
+        .unwrap();
+        let mut upstream = stream.take_upstream().unwrap();
+        assert!(matches!(
+            upstream.pull(&mut C, None).unwrap(),
+            Pull::Item(Value::Int(1))
+        ));
+        assert!(matches!(
+            upstream.pull(&mut C, None).unwrap(),
+            Pull::Item(Value::Int(2))
+        ));
+        let error = match upstream.pull(&mut C, None) {
+            Err(error) => error,
+            Ok(_) => panic!("a third distinct value must exceed the configured limit"),
+        };
+        assert_eq!(error.code, "stream_distinct_limit");
+    }
+
+    #[test]
+    fn invalid_distinct_limit_does_not_consume_the_source() {
+        let stream = StreamVal::from_iter("int", [Ok(Value::Int(1))].into_iter());
+        assert_eq!(
+            stream.clone().distinct_bounded(0).unwrap_err().code,
+            "arg_error"
+        );
+        assert_eq!(drain(&stream), vec![Value::Int(1)]);
+    }
+
+    #[test]
+    fn invalid_count_window_does_not_consume_the_source() {
+        let stream = StreamVal::from_iter("int", [Ok(Value::Int(1))].into_iter());
+        assert_eq!(
+            stream
+                .clone()
+                .window_count(StreamVal::WINDOW_MAX_VALUES + 1)
+                .unwrap_err()
+                .code,
+            "arg_error"
+        );
+        assert_eq!(drain(&stream), vec![Value::Int(1)]);
+    }
+
+    #[test]
+    fn collection_rejects_identity_and_byte_amplification() {
+        let stream = StreamVal::from_iter(
+            "int",
+            [1, 2, 3].into_iter().map(|value| Ok(Value::Int(value))),
+        );
+        let error = collect_stream_with_limits(&mut C, &stream, 2, 1024).unwrap_err();
+        assert_eq!(error.code, "stream_collect_limit");
+
+        let stream = StreamVal::from_iter("str", [Ok(Value::Str("x".repeat(128)))].into_iter());
+        let error = collect_stream_with_limits(&mut C, &stream, 8, 64).unwrap_err();
+        assert_eq!(error.code, "stream_collect_limit");
+    }
+
+    #[test]
+    fn stream_gap_has_a_stable_discriminator_and_merges_ranges() {
+        let mut gap = StreamGap::new(StreamGapReason::HistoryEvicted, 3).with_seq_range(4, 6);
+        gap.absorb(StreamGap::new(StreamGapReason::SubscriberOverflow, 2).with_seq_range(7, 8));
+        assert_eq!(gap.reason, StreamGapReason::MixedOverflow);
+        assert_eq!(gap.dropped, 5);
+        assert_eq!(gap.from_seq, Some(4));
+        assert_eq!(gap.to_seq, Some(8));
+        let record = gap.into_record();
+        assert_eq!(record.get("marker"), Some(&Value::Str("stream_gap".into())));
+        assert_eq!(
+            record.get("reason"),
+            Some(&Value::Str("mixed_overflow".into()))
+        );
+        assert_eq!(record.get("dropped"), Some(&Value::Int(5)));
+        assert_eq!(record.get("from_seq"), Some(&Value::Int(4)));
+        assert_eq!(record.get("to_seq"), Some(&Value::Int(8)));
+    }
+
+    #[test]
+    fn poisoned_stream_state_is_quarantined_with_a_repeatable_error() {
+        let stream = endless_marked(1);
+        let locked = Arc::clone(&stream.inner);
+        let poisoner = std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = locked.lock().expect("stream starts healthy");
+                panic!("inject stream-state poison");
+            }));
+        });
+        poisoner.join().expect("poison injector must be contained");
+
+        let expected = stream_state_poisoned();
+        assert_eq!(stream.take_upstream().err(), Some(expected.clone()));
+        assert_eq!(stream.take_upstream().err(), Some(expected));
+        assert!(
+            stream.inner.is_poisoned(),
+            "quarantined state stays poisoned"
+        );
+    }
+
+    #[test]
+    fn production_stream_locking_has_no_panic_path() {
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module marker remains present");
+        assert!(!production.contains(".lock().unwrap()"));
+        assert!(!production.contains(".lock().expect("));
     }
 }

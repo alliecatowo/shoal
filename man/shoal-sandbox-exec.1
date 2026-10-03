@@ -1,0 +1,16 @@
+.TH SHOAL-SANDBOX-EXEC 1 "July 2026" "Shoal 0.1.0" "User Commands"
+.SH NAME
+shoal-sandbox-exec \- run a process under a Shoal filesystem policy
+.SH SYNOPSIS
+.B shoal-sandbox-exec
+.RI [ \-\-read " path" ]
+.RI [ \-\-write " path" ]
+.RI [ \-\-delete " path" ]
+.B \-\-
+.I command
+.RI [ args ...]
+.SH DESCRIPTION
+Applies the requested filesystem sandbox and replaces itself with COMMAND.
+.SH SEE ALSO
+.BR shoal (1),
+.BR shoal-kernel (1)

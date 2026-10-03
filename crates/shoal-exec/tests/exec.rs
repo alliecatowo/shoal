@@ -8,7 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec, run, spawn_capture, which};
+use shoal_exec::{
+    CancelToken, ExecMode, ExecSpec, StdinSpec, run, spawn_capture, stream_stdin, which,
+};
 
 /// Minimal self-cleaning temp dir (avoids a tempfile dependency).
 struct TempDir(PathBuf);
@@ -106,6 +108,73 @@ fn capture_stdin_bytes_are_fed_and_closed() {
     let res = run(s, &CancelToken::new()).expect("run");
     assert_eq!(res.status, Some(0));
     assert_eq!(res.stdout, b"hello stdin");
+}
+
+#[test]
+fn capture_stream_stdin_consumes_bounded_chunks_until_producer_close() {
+    let (sink, stdin) = stream_stdin(1);
+    let mut s = spec(&["/bin/cat"], ExecMode::Capture);
+    s.stdin = stdin;
+    let producer = std::thread::spawn(move || {
+        sink.try_send(b"first\n".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        sink.try_send(b"second\n".to_vec()).unwrap();
+    });
+    let res = run(s, &CancelToken::new()).expect("run");
+    producer.join().unwrap();
+    assert_eq!(res.status, Some(0));
+    assert_eq!(res.stdout, b"first\nsecond\n");
+}
+
+#[test]
+fn cancellation_epoch_controls_its_live_capture_process_group() {
+    let token = CancelToken::new();
+    let child = spawn_capture(spec(&["/bin/sleep", "30"], ExecMode::Capture), &token)
+        .expect("spawn controlled child");
+
+    assert_eq!(token.suspend_processes().unwrap(), 1);
+    assert_eq!(token.resume_processes().unwrap(), 1);
+    assert_eq!(token.suspend_processes().unwrap(), 1);
+
+    let started = Instant::now();
+    token.cancel();
+    let result = child
+        .wait(&token)
+        .expect("cancel and reap controlled child");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(result.signal.is_some(), "cancel must terminate the child");
+    assert_eq!(token.resume_processes().unwrap(), 0);
+}
+
+#[test]
+fn stream_stdin_capacity_applies_before_execution_claims_the_receiver() {
+    let (sink, _stdin) = stream_stdin(1);
+    sink.try_send(vec![1]).unwrap();
+    assert!(matches!(
+        sink.try_send(vec![2]),
+        Err(shoal_exec::StdinTrySendError::Full(_))
+    ));
+}
+
+#[test]
+fn stream_stdin_clamps_capacity_and_rejects_oversized_chunks() {
+    let (sink, _stdin) = stream_stdin(usize::MAX);
+    for _ in 0..shoal_exec::MAX_STDIN_STREAM_CHUNKS {
+        sink.try_send(vec![1]).unwrap();
+    }
+    assert!(matches!(
+        sink.try_send(vec![2]),
+        Err(shoal_exec::StdinTrySendError::Full(_))
+    ));
+
+    let (sink, _stdin) = stream_stdin(1);
+    let oversized = vec![0; shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES + 1];
+    let error = sink.try_send(oversized).unwrap_err();
+    assert!(matches!(
+        error,
+        shoal_exec::StdinTrySendError::ChunkTooLarge(_)
+    ));
+    sink.try_send(vec![3]).unwrap();
 }
 
 #[test]
@@ -386,6 +455,44 @@ fn run_resolves_argv0_via_the_spec_env_path() {
     assert_eq!(res.stdout, b"resolved-ok");
 }
 
+#[test]
+fn run_resolves_empty_path_component_against_the_child_cwd() {
+    let dir = TempDir::new("resolve-empty-path");
+    write_script(dir.path(), "cwdtool", 0o755);
+    let mut s = spec(&["cwdtool"], ExecMode::Capture);
+    s.cwd = dir.path().to_path_buf();
+    s.env = vec![(OsString::from("PATH"), OsString::from(":"))];
+
+    let res = run(s, &CancelToken::new()).expect("empty PATH entry uses child cwd");
+    assert_eq!(res.status, Some(0));
+    assert_eq!(res.stdout, b"resolved-ok");
+}
+
+#[test]
+fn run_resolves_relative_path_component_against_the_child_cwd() {
+    let dir = TempDir::new("resolve-relative-path");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    write_script(&bin, "reltool", 0o755);
+    let mut s = spec(&["reltool"], ExecMode::Capture);
+    s.cwd = dir.path().to_path_buf();
+    s.env = vec![(OsString::from("PATH"), OsString::from("bin"))];
+
+    let res = run(s, &CancelToken::new()).expect("relative PATH entry uses child cwd");
+    assert_eq!(res.stdout, b"resolved-ok");
+}
+
+#[test]
+fn run_resolves_relative_slash_program_against_the_child_cwd() {
+    let dir = TempDir::new("resolve-relative-slash");
+    write_script(dir.path(), "slash-tool", 0o755);
+    let mut s = spec(&["./slash-tool"], ExecMode::Capture);
+    s.cwd = dir.path().to_path_buf();
+
+    let res = run(s, &CancelToken::new()).expect("relative slash path uses child cwd");
+    assert_eq!(res.stdout, b"resolved-ok");
+}
+
 // -------------------------------------------------------------------- pty
 
 #[test]
@@ -483,6 +590,17 @@ fn pty_stdin_bytes_drive_an_interactive_child() {
         "expected the echoed bytes in the tee, got {:?}",
         String::from_utf8_lossy(&res.stdout)
     );
+}
+
+#[test]
+fn pty_stream_stdin_fails_closed_before_spawning() {
+    let (sink, stdin) = stream_stdin(2);
+    sink.try_send(b"streamed\n".to_vec()).unwrap();
+    drop(sink);
+    let mut s = spec(&["/bin/cat"], ExecMode::PtyTee);
+    s.stdin = stdin;
+    let err = run(s, &CancelToken::new()).expect_err("PTY stream stdin must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
 }
 
 #[test]

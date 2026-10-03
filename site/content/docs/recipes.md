@@ -376,7 +376,7 @@ which rg
 which jq
 ```
 
-Commit the lockfile before expecting script policy to accept constrained tools. Set hermetic scope only when all child tools/interpreters are declared.
+Materialize the host-local lock before expecting script policy to accept constrained tools. Commit exact manifest constraints; do not commit `reef.lock`, whose paths and executable hashes belong to one host. Set hermetic scope only when all child tools/interpreters are declared.
 
 ## Page a large value through MCP
 

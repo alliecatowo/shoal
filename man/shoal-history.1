@@ -1,0 +1,30 @@
+.TH SHOAL-HISTORY 1 "July 2026" "Shoal 0.1.0" "User Commands"
+.SH NAME
+shoal-history \- query and maintain the Shoal journal
+.SH SYNOPSIS
+.B shoal-history
+.RI [ \-\-state-dir " path" ]
+.RI [ \-\-json ]
+.I command
+.RI [ options ]
+.SH COMMANDS
+.TP
+.B query
+Filter journal entries.
+.TP
+.B show
+Show one entry.
+.TP
+.BR pin , unpin
+Manage retained CAS objects.
+.TP
+.B gc
+Preview or apply storage collection.
+.TP
+.B status
+Report database and CAS use.
+.TP
+.B undo
+Apply recorded inverse operations.
+.SH SEE ALSO
+.BR shoal (1)

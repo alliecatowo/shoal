@@ -19,30 +19,42 @@ ports for deterministic effects, and live process/socket/PTY tests for host boun
 
 ## Editor service
 
-`shoal-lsp` is intentionally lexical and parse-based today. It keeps full document text in memory and
-advertises full-document sync, diagnostics, whole-document formatting, completion, and hover.
+`shoal-lsp` is parser- and local-document-based today. It keeps document text plus versioned AST
+analysis in memory and advertises incremental sync, diagnostics, whole-document formatting,
+completion, hover, goto definition, and document symbols.
 
 ```mermaid
 flowchart LR
 accTitle: Editor service
 accDescr: Shows the components and relationships described in Editor service.
   Editor["LSP editor"] --> Backend["shoal-lsp Backend"]
-  Backend --> Docs["URI → full text map"]
+  Backend --> Docs["URI → versioned text + AST + symbols"]
   Docs --> ParseStatus["shoal_syntax::parse_status"]
   ParseStatus --> Diagnostics["one parse diagnostic"]
-  ParseStatus --> Format["canonical AST formatter"]
-  Docs --> Completion["static vocabulary + lexical declarations"]
-  Docs --> Hover["small hard-coded help map"]
+  ParseStatus --> FormatSafety["token-aware trivia admission"]
+  FormatSafety --> Format["canonical AST formatter"]
+  FormatSafety --> Refuse["no edit + format_trivia"]
+  Docs --> Completion["vocabulary + visible scoped symbols"]
+  Docs --> Hover["symbol docs + language help"]
+  Docs --> Definition["local + direct used-module definitions"]
 ```
 
-Completion combines parser-reserved words, a few additional grammar heads, the canonical builtin
-registry, and names found by token-splitting earlier `let`/`var`/`fn`/`alias` declarations. Hover only
-covers a small set of language words. UTF-8 byte offsets are converted to LSP UTF-16 positions.
+Completion and symbols walk the parsed AST, respect lexical scope/visibility and shadowing, and
+include bindings, functions, parameters, aliases, and destructuring patterns. Incremental edits are
+applied sequentially using strict UTF-16 positions and analyzed off the async request thread through
+a four-worker, 32 MiB/64-job scheduler. Same-URI floods retain only the latest pending version; stale
+analysis cannot overwrite a newer version. A bounded stdio pump rejects excessive LSP headers or
+bodies before tower-lsp's codec allocates them. Definition lookup resolves local declarations and
+the exported members/paths of directly used file modules.
 
-It does not currently implement a semantic resolver, scope-aware/type-aware completion, incremental
-sync, go-to-definition, references, rename, signature help, or semantic tokens. Adding one of those
-requires a reusable semantic index; extending the token-splitting heuristic would create false
-confidence rather than a real language service.
+Formatting and `shoal fmt` share `shoal-syntax`'s token-aware admission. Because the current AST
+does not retain free trivia, comments/shebangs produce no LSP edit and a located `format_trivia`
+warning instead of a destructive whole-document replacement. Semantic hashes inside quoted values
+and raw command tokens remain formatable.
+
+It does not currently implement a workspace/project index, references, rename, signature help,
+semantic tokens, code actions, file watching, or type-aware completion. Those features require a
+reusable cross-document semantic graph beyond the current direct-module lookup.
 
 Source: [`shoal-lsp/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-lsp/src/lib.rs).
 
@@ -60,22 +72,19 @@ checks and exit codes 0, 1, or 2. It checks:
 - an isolated SQLite journal open/write cycle;
 - TOML syntax for core config and full policy parsing.
 
-`Options::from_env` currently derives `state_dir` from `$XDG_DATA_HOME` (or
-`~/.local/share/shoal`), while evaluator/kernel state uses `$XDG_STATE_HOME` (or
-`~/.local/state/shoal`). Its writable-state and isolated-journal probes can therefore validate a
-different tree from the live REPL/kernel, the same default-root divergence as `shoal-history`.
-Passing an explicit shared state directory avoids the mismatch; default doctor success does not
-currently prove the active state root is healthy.
+`Options::from_env`, the evaluator/kernel, and `shoal-history` use the shared `ShoalPaths` state root.
+Doctor and history also load layered config and honor `journal.state_dir`, resolving relative values
+from startup cwd. A caller that starts components from different cwd values while using a relative
+custom state path can still point them at different trees; the default path contract itself is shared.
 
 
 The journal probe uses a temporary subdirectory, so it proves SQLite/CAS prerequisites without
-polluting normal history. The config probe currently checks generic TOML syntax rather than running
-the full `shoal-config` layered schema loader, a diagnostic coverage gap for unknown/type-invalid
-core keys.
+polluting normal history. Config and policy file probes call the authoritative bounded core loaders;
+typed schema errors, structural limits, and policy-specific admission therefore match production.
 
 ## Normative conformance corpus
 
-`spec/cases/` contains 77 TOML suite files and 1,310 `[[case]]` records. Cases declare globally named
+`spec/cases/` contains 79 TOML suite files and 1,364 `[[case]]` records. Cases declare globally named
 source, expected rendered value or stable error code, optional message substring, parse-error
 expectation, filesystem fixtures, and an explicit skip reason.
 
@@ -159,19 +168,34 @@ resolves through the live kernel. Keep the expensive layer focused but real.
 
 ## Fuzz targets
 
-The `fuzz/` workspace has three libFuzzer targets:
+The `fuzz/` workspace has eight libFuzzer targets:
 
 | Target | Current operation |
 |---|---|
-| `lexer` | walk valid UTF-8 in expression mode while spans advance |
-| `parser` | call `parse_status` on valid UTF-8 |
-| `proto_frame` | append newline and call protocol `read_frame` on arbitrary bytes |
+| `lexer` | require progress while walking valid UTF-8 in both expression and command mode |
+| `parser` | format every complete parse and require the formatted source to parse completely |
+| `proto_frame` | decode up to 64 frames, require cursor progress, and round-trip valid requests |
+| `planner` | derive a plan for every complete parse without executing it |
+| `value_wire` | normalize JSON values idempotently and round-trip valid wire values |
+| `data_codecs` | exercise JSON/YAML/TOML/CSV parse/stringify admission, output walls, and evaluator recovery |
+| `stream` | compose bounded closure-free stream operations and pin single consumption |
+| `policy` | evaluate parsed policies against decoded plans and each effect |
 
-These are useful panic/non-progress smoke targets but shallow. The lexer target does not cross CMD
-mode or mode transitions; the parser target asserts no semantic properties; the protocol target does
-not exercise multi-frame streams, response/notification shapes, wire values, or bounded partial-line
-behavior. CI only builds fuzz targets and marks that job `continue-on-error`, so fuzz health is not a
-release gate and no timed fuzz run occurs.
+These are useful panic/non-progress and invariant smoke targets, not exhaustive semantic proof. The
+`ci.yml` `fuzz-build` job is a blocking compile check for every target on every push/PR; building
+alone still cannot catch a crash. Both fuzz workflows explicitly set `RUSTUP_TOOLCHAIN=nightly`; otherwise the root
+stable pin would override the installed nightly toolchain required by cargo-fuzz. Each workflow first
+runs locked Cargo metadata against `fuzz/Cargo.toml`: cargo-fuzz does not expose Cargo's `--locked`
+flag, so this preflight rejects dependency changes that would otherwise rewrite `fuzz/Cargo.lock`
+silently during the build/run.
+
+A separate `.github/workflows/fuzz-nightly.yml` (HR-F4) runs each target for a bounded 120-second
+libFuzzer budget (`cargo fuzz run <target> --fuzz-dir fuzz -- -max_total_time=120`) on a daily cron
+schedule plus manual `workflow_dispatch`, one job per target, and fails (no `continue-on-error`) on
+a crash/timeout/OOM, uploading the libFuzzer artifact for triage. 120 seconds per target is a
+deliberate smoke-not-exhaustive budget chosen to keep the schedule cheap; it will not find a deep
+bug the way a multi-hour/day corpus-accumulating campaign would, but it does mean a fast regression
+(an immediate panic/non-progress case) surfaces within a day instead of never.
 
 ## Local and CI gates
 
@@ -188,6 +212,15 @@ cargo bench -p shoal-exec --bench spawn
 
 The table benchmark retains one million rows and the journal benchmark seeds 100,000 entries, so
 these are review jobs rather than ordinary unit tests. The inherited performance budgets are:
+
+`table_1m_where_sort` (HR-F5, deep audit I12) now builds a real `shoal_value::Value::Table` and
+drives it through the actual `shoal_value::methods::call_method` dispatcher — the same `where`/
+`sort` entry point `shoal-eval` calls for every language-level `.where(...)`/`.sort(...)` — instead
+of hand-filtering/sorting a bare `Vec<i64>` with plain Rust code, which is what it did before and
+which measured nothing about table-method performance. Closure evaluation itself is stood in by a
+small bench-local `CallCtx` (mirroring `shoal-value`'s own unit-test harness) because interpreting a
+real AST closure needs `shoal-eval`, which sits above `shoal-value` in the dependency graph; the
+bench file's own doc comment states exactly what is and is not measured.
 
 | Workload | Review budget |
 |---|---:|
@@ -207,7 +240,7 @@ When reporting a result, record CPU/OS, build profile, sample count, dataset con
 revision, and whether caches are warm. A raw local wall-clock number without that context is not a
 release guarantee.
 
-`scripts/check.sh` runs:
+`scripts/check.shl` runs through Shoal:
 
 ```text
 cargo fmt --all -- --check
@@ -217,20 +250,96 @@ cargo build --workspace --release
 ```
 
 GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the conformance harness,
-checks fmt/Clippy, and performs release builds. Release automation produces binaries for x86_64 and
-AArch64 on Linux and macOS.
+checks fmt/Clippy, and performs release builds. Each native release-build job also recreates an
+archive-shaped directory, installs it into a disposable prefix, byte-checks all ten executables and
+man pages, exercises the installed Reef command, validates bash/zsh/fish completions, injects a
+mid-commit failure to prove rollback, performs a clean reinstall, and proves scoped uninstall leaves
+unrelated files intact. Release automation produces binaries for x86_64 and AArch64 on Linux and
+macOS; archives carry the same `install.shl` used by this gate.
+
+### Workflow supply-chain policy
+
+Every third-party `uses:` entry is pinned to a full 40-character commit SHA. The trailing version
+comment records the reviewed upstream line without turning a moving tag into executable authority.
+Dependabot checks the `github-actions` ecosystem weekly; action updates must resolve the proposed SHA
+back to the expected upstream tag/branch and pass the same workflow review before merge. Rust jobs
+likewise pin 1.97.0 exactly; only fuzzing deliberately uses a dated immutable snapshot of nightly.
+Workflow-installed Rust tools are version-pinned as well (`cargo-fuzz` 0.13.2 and `cargo-audit`
+0.22.2): Cargo's `--locked` flag locks a selected release's dependencies but does not choose that
+release.
+
+Workflow token permissions default to read-only or empty. CI and fuzz receive only `contents: read`;
+the Pages build/deploy jobs receive Pages and OIDC rights only where used; the release job alone gets
+`contents: write` to create and upload a tag release. New jobs must declare the smallest permission
+set their API calls require instead of inheriting write authority at workflow scope.
+
+### Supply-chain advisories (HR-F6)
+
+Hundreds of registry dependencies are real supply-chain surface with no advisory audit before this
+task (deep audit H9). The `supply-chain-audit` job in `ci.yml` installs `cargo-audit` and audits both
+the root `Cargo.lock` and the independently tracked `fuzz/Cargo.lock` on every push/PR to `main`.
+
+The documented allowlist lives at **`.cargo/audit.toml`** — this is `cargo-audit`'s own
+auto-discovered config path (a bare root-level `audit.toml` is silently ignored by the tool; this
+was verified locally before landing the CI job). The workspace upgraded `shoal-wasm` from Wasmtime
+37 to **46.0.1**, retiring all 15 advisories that had required a major-version bump; the explicit
+allowlist is now empty. Any future ignored `RUSTSEC-*` ID must carry its root cause and revisit
+condition in that file. The
+config also sets `output.deny = ["unmaintained", "unsound", "yanked"]`, so an unmaintained/unsound
+crate or a yanked version newly appearing in either lockfile fails the gate even though none exist
+today. Re-run both CI audit commands after dependency bumps and prune allowlist entries that no
+longer apply.
+
+### The `shoal-wasm` compile cost decision (HR-F8)
+
+`shoal-wasm` is now a runtime dependency of `shoal-eval`: validated component commands participate
+in canonical command resolution and execute through the preview ABI. It pulls in Wasmtime 46.0.1 with
+the `cranelift` codegen backend, which is by far the largest single dependency subtree in this
+workspace (dozens of `wasmtime-internal-*`/`cranelift-*` crates) — `cargo build --workspace
+--all-targets` pays that compile/cache cost on every CI run, now for shipped evaluator behavior.
+
+Decision: **keep it in ordinary workspace CI; the runtime path is load-bearing.** Reasoning:
+
+- Feature-gating it out of the default workspace build would need `shoal-wasm`'s own
+  `Cargo.toml`/`Cargo.lock` and CI matrix changes (a dependency-shape change, not a lint/doc one);
+  evaluator integration needs the same locked graph and gate as other command dispatch paths;
+  splitting it into a separate job would no longer test the real workspace composition.
+- Shoal's host wrapper is split across a few small modules and is much cheaper to compile than its
+  backend; the cost is dominated by `wasmtime`/`cranelift`, and `Swatinem/rust-cache` already
+  amortizes that across CI runs on the
+  same OS/lockfile, so the marginal per-PR cost after a cache hit is low.
+- Runtime/evaluator tests exercise validation, resource limits, deadlines, cancellation, and the
+  declared host calls; compiling only the leaf crate would miss that integration.
+
+Runtime component compilation has a separate admission boundary: a process-wide semaphore admits
+at most two synchronous compilers, the configurable wait defaults to two seconds and cannot exceed
+ten seconds, and Wasmtime's optional parallel-compilation feature is not enabled. Component and
+registry byte ceilings still apply. An admitted `Component::new` call is not epoch-interruptible;
+this policy bounds concurrency amplification and admission delay, not the duration of the compiler
+call itself.
+
+Revisit this decision (feature flag or a carefully equivalent matrix) only if measured CI cost
+justifies preserving the same evaluator integration coverage another way.
 
 
-The root manifest declares workspace lint settings, but member crates do not opt in with
-`[lints] workspace = true`; the effective lint gate today is the explicit Clippy CI command.
+Every member crate opts in with `[lints] workspace = true` (HR-F1,
+[hardening roadmap](@/internals/hardening-roadmap.md)), so the root manifest's lint table is
+actually active per-crate, not merely staged. `rust-toolchain.toml` at the repository root pins
+1.97.0 and every non-fuzz CI job installs that exact `dtolnay/rust-toolchain@1.97.0` toolchain
+(HR-F2). Fuzz jobs explicitly override it with nightly. `rustup` picks the root pin up automatically
+for local `cargo`/`rustc`/`clippy`/`fmt` invocations unless the environment supplies a stronger
+override, so a compiler change requires a deliberate file/workflow update.
 
-### Ambient-environment test debt
+### Ambient-environment test debt (resolved, HR-F3)
 
-This audit environment exports `NO_COLOR=1`. Under that environment, `cargo test --workspace` fails
-seven color-asserting highlighter tests; all 13 highlighter tests pass when run with `NO_COLOR`
-unset. The product is right to honor `NO_COLOR`; the tests incorrectly inherit ambient policy while
-asserting colored output. Those tests should set/unset their environment explicitly or inject color
-policy so workspace results do not depend on the invoking shell.
+`crates/shoal/src/highlight.rs`'s test module previously inherited whatever `NO_COLOR` the invoking
+shell/CI exported; under an ambient `NO_COLOR=1` (as this audit environment set), seven of the
+thirteen color-asserting highlighter tests failed even though the product was correctly honoring
+`NO_COLOR` — a test-isolation defect (deep audit H13), not a product bug. `styles_for`/
+`styles_with_bindings` now route through a shared `with_forced_color` helper that unsets `NO_COLOR`
+under `crate::ENV_TEST_LOCK` for the duration of the call and restores whatever was there before.
+All 13 highlighter tests now pass identically with `NO_COLOR=1 cargo test -p shoal` and with
+`NO_COLOR` unset; verify with both invocations after touching this module.
 
 ## Choosing the right test
 

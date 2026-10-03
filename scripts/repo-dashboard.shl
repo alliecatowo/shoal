@@ -1,0 +1,32 @@
+#!/usr/bin/env shoal
+# A fast, read-only operational dashboard for the current checkout.
+
+let metadata_result = run("cargo", "metadata", "--format-version", "1", "--no-deps")
+assert(metadata_result.ok, "cargo metadata failed: {metadata_result.stderr}")
+let packages = metadata_result.out.packages
+let rust = glob("crates/**/*.rs").expand()
+let shoal_programs = glob("scripts/**/*.shl").expand()
+let corpus = glob("spec/cases/*.toml").expand()
+let cases = corpus.map(file => file.read.matches(re"(?m)^\[\[case\]\]").len()).sum()
+let git_status = run("git", "status", "--short")
+assert(git_status.ok, "git status failed: {git_status.stderr}")
+let changes = git_status.out.str().lines().where(line => !line.is_empty())
+let branch = run("git", "branch", "--show-current").out.str().trim()
+let head = run("git", "rev-parse", "--short=12", "HEAD").out.str().trim()
+
+{
+  git: {branch: branch, head: head, clean: changes.is_empty(), changes: changes},
+  workspace: {
+    crates: packages.len(),
+    rust_files: rust.len(),
+    rust_lines: rust.map(file => file.read.lines().len()).sum(),
+    shoal_programs: shoal_programs.len(),
+  },
+  conformance: {suites: corpus.len(), cases: cases},
+  automation: {
+    workflows: glob(".github/workflows/*.yml", hidden: true).expand().len(),
+    man_pages: glob("man/*.1").expand().len(),
+    adapters: glob("adapters/*.toml").expand().len(),
+    fuzz_targets: glob("fuzz/fuzz_targets/*.rs").expand().len(),
+  },
+}

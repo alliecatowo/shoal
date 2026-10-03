@@ -11,6 +11,16 @@ use super::*;
 
 impl Evaluator {
     pub fn eval_expr(&mut self, expr: &Expr, position: Position) -> VResult<Value> {
+        if let Expr::FnCall { name, args, .. } = expr {
+            return self.eval_fn_call_expr(name, args, position, expr.span());
+        }
+        self.eval_non_fn_expr(expr, position)
+    }
+
+    /// Non-call expression dispatch is intentionally a separate native frame.
+    /// A recursive function call can therefore enter `eval_fn_call_expr`
+    /// without retaining the locals for every unrelated expression variant.
+    fn eval_non_fn_expr(&mut self, expr: &Expr, position: Position) -> VResult<Value> {
         let span = expr.span();
         let result = match expr {
             Expr::Null { .. } => Ok(Value::Null),
@@ -34,17 +44,17 @@ impl Evaluator {
             Expr::Var { name, span } => {
                 // A name that isn't a variable but *is* a command resolves by
                 // invoking it zero-arg in value position (defect #5, site/content/internals/language-conformance-contract.md).
-                if let Some(v) = self.env.get(name) {
+                if let Some(v) = self.exec.shell.env.get(name) {
                     Ok(v)
                 } else if name == "now" {
                     // Relative anchor (site/content/internals/language-conformance-contract.md): live wall-clock datetime.
                     Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
-                        self.clock.as_ref(),
+                        self.host.clock.as_ref(),
                     ))))
                 } else if name == "today" {
                     // Relative anchor (site/content/internals/language-conformance-contract.md): today at midnight.
                     Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
-                        self.clock.as_ref(),
+                        self.host.clock.as_ref(),
                     ))))
                 } else if self.is_command_name(name) {
                     let call = CmdCall {
@@ -126,7 +136,7 @@ impl Evaluator {
                 // Namespace constant access (`math.pi`, `config.<key>`): a
                 // namespace name that isn't shadowed by a binding (site/content/internals/roadmap-and-priorities.md).
                 if let Expr::Var { name: ns, .. } = &**recv
-                    && self.env.get(ns).is_none()
+                    && self.exec.shell.env.get(ns).is_none()
                     && crate::namespaces::is_namespace(ns)
                 {
                     crate::namespaces::field(self, ns, name)
@@ -164,6 +174,7 @@ impl Evaluator {
                     // `SHOAL_SECRET_DIR`/`XDG_DATA_HOME`/`HOME` directory and
                     // opens the same `shoal_secret::SecretStore` as before.
                     let value = self
+                        .host
                         .secrets
                         .get(secret_name)
                         .map_err(|e| ErrorVal::new("permission", e))?
@@ -186,7 +197,7 @@ impl Evaluator {
                 // by a binding (site/content/internals/roadmap-and-priorities.md). Handled here (not methods.rs) because
                 // several members reach the evaluator (session env, network, cwd).
                 if let Expr::Var { name: ns, .. } = &**recv
-                    && self.env.get(ns).is_none()
+                    && self.exec.shell.env.get(ns).is_none()
                     && crate::namespaces::is_namespace(ns)
                 {
                     let a = self.eval_args(args)?;
@@ -200,89 +211,14 @@ impl Evaluator {
                     self.dispatch_method(v, name, args, span)
                 }
             }
-            Expr::FnCall { name, args, .. } => {
-                // Structured builtins that take closures/thunks (site/content/internals/language-conformance-contract.md).
-                match name.as_str() {
-                    "parallel" => return self.builtin_parallel(args),
-                    "retry" => return self.builtin_retry(args),
-                    "on" => return self.builtin_on(args),
-                    // Relative anchors as functions (site/content/internals/language-conformance-contract.md): `now()`/`today()`.
-                    "now" if args.pos.is_empty() && args.named.is_empty() => {
-                        return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
-                            self.clock.as_ref(),
-                        ))));
-                    }
-                    "today" if args.pos.is_empty() && args.named.is_empty() => {
-                        return Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
-                            self.clock.as_ref(),
-                        ))));
-                    }
-                    "assert" => {
-                        let a = self.eval_args(args)?;
-                        return self.builtin_assert(&a).map_err(|e| e.or_span(span));
-                    }
-                    "run" => {
-                        let mut a = self.eval_args(args)?;
-                        if a.pos.is_empty() {
-                            return Err(ErrorVal::arg_error("run expects a path or command name"));
-                        }
-                        let target = a.pos.remove(0);
-                        return self.run_poly(target, a.pos, position);
-                    }
-                    "save" => {
-                        let a = self.eval_args(args)?;
-                        return self.builtin_save(a.pos);
-                    }
-                    "open" => {
-                        let a = self.eval_args(args)?;
-                        return self.builtin_open(a.pos);
-                    }
-                    _ => {}
-                }
-                let a = self.eval_args(args)?;
-                if let Some(value) = self.call_constructor(name, &a)? {
-                    return Ok(value);
-                }
-                if let Some(f) = self.env.get(name) {
-                    return self.call_value(&f, a);
-                }
-                // A name that isn't a fn but *is* a command resolves by invoking
-                // it with the given args in value position (defect #5).
-                if self.is_command_name(name) {
-                    let mut call = CmdCall {
-                        head: name.clone(),
-                        forced: false,
-                        args: vec![],
-                        redirects: vec![],
-                        env_prefix: vec![],
-                        background: false,
-                        trailing: None,
-                        span,
-                    };
-                    for v in a.pos {
-                        call.args.push(self.value_cmd_arg(v, span)?);
-                    }
-                    for (n, v) in a.named {
-                        call.args.push(CmdArg::FlagLong {
-                            name: n,
-                            value: Some(Box::new(self.value_cmd_arg(v, span)?)),
-                            span,
-                        });
-                    }
-                    return self.eval_command(&call, Position::Value);
-                }
-                Err(ErrorVal::new(
-                    "undefined_var",
-                    format!("undefined function `{name}`"),
-                ))
-            }
+            Expr::FnCall { .. } => unreachable!("function calls dispatch before non-call forms"),
             Expr::Lambda { params, body, .. } => Ok(Value::Closure(Arc::new(ClosureVal {
                 name: None,
                 params: params.clone(),
                 rest: None,
                 ret: None,
                 body: *body.clone(),
-                env: self.env.clone(),
+                env: self.exec.shell.env.clone(),
                 doc: None,
             }))),
             Expr::Block { block, .. } => match self.eval_block(block, false)? {
@@ -311,13 +247,13 @@ impl Evaluator {
             } => match self.block_value(body) {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    let old = self.env.clone();
-                    self.env = old.child();
+                    let old = self.exec.shell.env.clone();
+                    self.exec.shell.env = old.child();
                     if let Some(p) = pattern {
                         self.bind_pattern(p, Value::Error(Arc::new(e)), false)?;
                     }
                     let r = self.block_value(handler);
-                    self.env = old;
+                    self.exec.shell.env = old;
                     r
                 }
             },
@@ -329,14 +265,20 @@ impl Evaluator {
             } => match self.eval_expr(expr, Position::Value) {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    let old = self.env.clone();
-                    self.env = old.child();
-                    if let Some(n) = binder {
-                        self.env
-                            .declare(n.clone(), Value::Error(Arc::new(e)), false);
+                    let old = self.exec.shell.env.clone();
+                    self.exec.shell.env = old.child();
+                    if let Some(n) = binder
+                        && let Err(limit) =
+                            self.exec
+                                .shell
+                                .env
+                                .declare(n.clone(), Value::Error(Arc::new(e)), false)
+                    {
+                        self.exec.shell.env = old;
+                        return Err(limit);
                     }
                     let r = self.eval_expr(handler, Position::Value);
-                    self.env = old;
+                    self.exec.shell.env = old;
                     r
                 }
             },
@@ -359,6 +301,91 @@ impl Evaluator {
         result.map_err(|e| e.or_span(span))
     }
 
+    /// Keep function-call dispatch out of `eval_expr`'s native frame. This is
+    /// the recursive hot path, so retaining every unrelated expression-branch
+    /// local here would multiply that frame by the Shoal call depth.
+    fn eval_fn_call_expr(
+        &mut self,
+        name: &str,
+        args: &Args,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        // Structured builtins that take closures/thunks (site/content/internals/language-conformance-contract.md).
+        match name {
+            "parallel" => return self.builtin_parallel(args),
+            "retry" => return self.builtin_retry(args),
+            "on" => return self.builtin_on(args),
+            // Relative anchors as functions (site/content/internals/language-conformance-contract.md): `now()`/`today()`.
+            "now" if args.pos.is_empty() && args.named.is_empty() => {
+                return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
+                    self.host.clock.as_ref(),
+                ))));
+            }
+            "today" if args.pos.is_empty() && args.named.is_empty() => {
+                return Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
+                    self.host.clock.as_ref(),
+                ))));
+            }
+            "assert" => {
+                let args = self.eval_args(args)?;
+                return self
+                    .builtin_assert(&args)
+                    .map_err(|error| error.or_span(span));
+            }
+            "run" => {
+                let mut args = self.eval_args(args)?;
+                if args.pos.is_empty() {
+                    return Err(ErrorVal::arg_error("run expects a path or command name"));
+                }
+                let target = args.pos.remove(0);
+                return self.run_poly(target, args.pos, position);
+            }
+            "save" => {
+                let args = self.eval_args(args)?;
+                return self.builtin_save(args.pos);
+            }
+            "open" => {
+                let args = self.eval_args(args)?;
+                return self.builtin_open(args.pos);
+            }
+            _ => {}
+        }
+        let args = self.eval_args(args)?;
+        if let Some(value) = self.call_constructor(name, &args)? {
+            return Ok(value);
+        }
+        if let Some(function) = self.exec.shell.env.get(name) {
+            return self.call_value(&function, args);
+        }
+        // A name that isn't a fn but *is* a command resolves by invoking it
+        // with the given args in value position (defect #5).
+        if self.is_command_name(name) {
+            let mut call = CmdCall {
+                head: name.to_owned(),
+                forced: false,
+                args: vec![],
+                redirects: vec![],
+                env_prefix: vec![],
+                background: false,
+                trailing: None,
+                span,
+            };
+            for value in args.pos {
+                call.args.push(self.value_cmd_arg(value, span)?);
+            }
+            for (name, value) in args.named {
+                call.args.push(CmdArg::FlagLong {
+                    name,
+                    value: Some(Box::new(self.value_cmd_arg(value, span)?)),
+                    span,
+                });
+            }
+            return self.eval_command(&call, Position::Value);
+        }
+        Err(ErrorVal::new("undefined_var", format!("undefined function `{name}`")).with_span(span))
+    }
+
     /// Evaluate an interpreter block (site/content/internals/values-streams-execution.md): resolve `tool` as a command
     /// and hand it `src` as its program via the tool's inline-eval convention
     /// (`lang_block_invocation`). `stdin` is whatever `.feed` supplies (or
@@ -372,11 +399,41 @@ impl Evaluator {
         position: Position,
         span: Span,
     ) -> VResult<Value> {
-        let (tail, stdin_src) = lang_block_invocation(tool, src);
+        let adapter = self
+            .host
+            .adapters
+            .lookup(tool)
+            .filter(|adapter| adapter.class == AdapterClass::Interpreter)
+            .cloned();
+        let (argv, stdin_src, meta) = if let Some(adapter) = adapter {
+            let mut argv = vec![OsString::from(&adapter.bin)];
+            if let Some(invoke) = &adapter.top.invoke {
+                argv.extend(invoke.iter().map(OsString::from));
+            }
+            let stdin_src = match adapter.invoke_payload {
+                InvokePayload::Arg => {
+                    argv.push(OsString::from(src));
+                    None
+                }
+                InvokePayload::Stdin => Some(src.as_bytes().to_vec()),
+            };
+            let meta = ExecMeta {
+                ok_codes: adapter.top.ok_codes.clone().unwrap_or(adapter.ok_codes),
+                class: adapter.class,
+                parse: adapter.top.parse,
+                output_type: adapter.top.output_type,
+            };
+            (argv, stdin_src, Some(meta))
+        } else {
+            let (tail, stdin_src) = lang_block_invocation(tool, src);
+            let mut argv = vec![OsString::from(tool)];
+            argv.extend(tail);
+            (argv, stdin_src, None)
+        };
         // A tool whose convention is "program on stdin" cannot also accept fed
         // bytes — the two would collide on the single stdin channel.
         let stdin = match (stdin_src, &stdin) {
-            (Some(_), StdinSpec::Bytes(_) | StdinSpec::File(_)) => {
+            (Some(_), StdinSpec::Bytes(_) | StdinSpec::File(_) | StdinSpec::Stream(_)) => {
                 return Err(ErrorVal::type_error(format!(
                     "`{tool}` takes its program on stdin, so it cannot also be fed data"
                 ))
@@ -385,9 +442,7 @@ impl Evaluator {
             (Some(bytes), _) => StdinSpec::Bytes(bytes),
             (None, _) => stdin,
         };
-        let mut argv = vec![OsString::from(tool)];
-        argv.extend(tail);
-        self.run_argv(argv, position, stdin, &[], span, None)
+        self.run_argv(argv, position, stdin, &[], span, meta)
     }
 }
 
@@ -405,6 +460,7 @@ pub fn lang_block_invocation(tool: &str, src: &str) -> (Vec<OsString>, Option<Ve
         "php" => flag("-r"),
         "deno" => (vec![OsString::from("eval"), OsString::from(src)], None),
         "jq" => (vec![OsString::from(src)], None),
+        "yq" => (vec![OsString::from("-o=json"), OsString::from(src)], None),
         _ => (vec![], Some(src.as_bytes().to_vec())),
     }
 }
@@ -444,6 +500,7 @@ mod lang_block_tests {
         assert_eq!(lang_block_invocation("deno", "X").0, os(&["eval", "X"]));
         // jq: filter as the sole arg, data left for stdin.
         assert_eq!(lang_block_invocation("jq", ".a").0, os(&[".a"]));
+        assert_eq!(lang_block_invocation("yq", ".a").0, os(&["-o=json", ".a"]));
     }
 
     #[test]
@@ -451,5 +508,44 @@ mod lang_block_tests {
         let (tail, stdin) = lang_block_invocation("wat", "prog");
         assert!(tail.is_empty());
         assert_eq!(stdin.as_deref(), Some(b"prog".as_slice()));
+    }
+
+    #[test]
+    fn configured_interpreter_is_parsed_and_lowered_through_its_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("embedded.toml"),
+            r#"
+[cmd.embedded]
+bin = "/bin/sh"
+class = "interpreter"
+invoke = ["-c"]
+output = { parse = "lines", type = "list<str>" }
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = shoal_adapters::AdapterCatalog::load_dir(directory.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut evaluator = crate::Evaluator::new(directory.path().to_path_buf());
+        evaluator.set_adapters(catalog);
+
+        let program = shoal_syntax::parse_with_ctx(
+            "embedded { printf 'alpha\\nbeta\\n' }",
+            evaluator.parse_context(false),
+        )
+        .unwrap();
+        let value = evaluator.eval_program(&program).unwrap();
+        let shoal_value::Value::Outcome(outcome) = value else {
+            panic!("expected adapter outcome");
+        };
+        assert_eq!(outcome.stdout.as_slice(), b"alpha\nbeta\n");
+        assert_eq!(
+            outcome.parsed,
+            Some(shoal_value::Value::List(vec![
+                shoal_value::Value::Str("alpha".into()),
+                shoal_value::Value::Str("beta".into()),
+            ]))
+        );
+        assert!(outcome.cmd.starts_with("/bin/sh -c "), "{}", outcome.cmd);
     }
 }

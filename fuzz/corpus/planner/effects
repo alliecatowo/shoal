@@ -1,0 +1,1 @@
+with cwd: ./work, env: {TOKEN: "redacted"} { cat input.txt | lines() }

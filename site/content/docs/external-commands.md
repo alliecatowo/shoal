@@ -134,7 +134,11 @@ effects = ["fs.read(cwd)"]
 
 Supported output parsers are `json`, `ndjson`, `csv`, `tsv`, `z-records`, `porcelain-v2`, `cols`, `cols2`, `tsv-headerless`, `lines`, `kv`, and `none`.
 
-Malformed adapter files produce warnings while valid siblings continue loading. Current preview caveat: the host loads the bundled directory and configured directories in order, but the evaluator catalog setter replaces the active catalog; with custom directories configured, the final directory can become the active execution catalog rather than a true merged overlay. Completion may still see names from all catalogs. Treat cross-directory layering as unfinished and keep a needed combined pack in one directory for now.
+Malformed adapter files produce warnings while valid siblings continue loading. The host overlays
+the bundled directory followed by configured directories into one evaluator catalog: later commands
+replace same-named earlier commands, while disjoint commands remain. It emits an override warning
+for each replaced command. Completion retains the per-directory catalogs with the same later-wins
+lookup order, so execution and completion agree.
 
 ## Feed a finite value to stdin
 
@@ -172,14 +176,19 @@ path("input.txt").read.feed(^consumer)
 path("input.bin").read_bytes.feed(^consumer)
 ```
 
-Secrets, tasks, closures, errors, globs, regexes, and streams are not feedable. The stream restriction is current implementation, not a philosophical limit: incremental stream-to-process stdin has not been wired. Bound and collect first:
+Secrets, tasks, closures, errors, globs, and regexes are not feedable. Streams feed a process
+incrementally through a bounded stdin queue; each item uses the same serialization rules and is
+line-framed. This works for finite and live streams, and stops the upstream pump when the command
+exits or fails to spawn:
 
 ```text
 tail(path("input.log"), from_start: true)
   .take(100)
-  .collect()
   .feed(^consumer)
 ```
+
+An endless stream keeps the command alive until the command exits, the stream is bounded, or the
+operation is cancelled.
 
 ## Redirect command output
 
@@ -189,7 +198,14 @@ tail(path("input.log"), from_start: true)
 ^tool < ./input.txt
 ```
 
-Redirection applies to builtins and externals. If captured stdout spilled to content-addressed storage, output redirection loads the full content rather than writing only its resident preview.
+Output redirection applies to builtins and externals. Redirect targets are evaluated and type-checked
+once before dispatch, so an invalid target cannot be discovered only after a command has already
+mutated state or spawned. Process-backed externals and adapters accept `<`; structured builtins reject
+redirected stdin before performing any effect because they do not expose a byte-stdin contract.
+
+If captured stdout spilled to content-addressed storage, output redirection copies the full content
+incrementally from its verified reader rather than materializing the blob or writing only its resident
+preview.
 
 Overwriting an existing file can participate in journal undo when the prior bytes fit the journal cap. Creating a new file by redirection currently records no delete-on-undo inverse. Append/overwrite behavior and limitations are in [Filesystem, jobs, history, and undo](@/docs/filesystem-jobs-history.md).
 
@@ -217,7 +233,12 @@ Known inline conventions are:
 | `php` | `-r PROGRAM` |
 | `deno` | `eval PROGRAM` |
 | `jq` | program as positional argument |
-| unknown interpreter-class convention | program on stdin |
+| `yq` | `-o=json PROGRAM` |
+| configured interpreter adapter | its declared `invoke` plus `invoke_payload` |
+
+The fallback conventions apply when an AST is evaluated without a matching adapter. In a normal
+configured host, an interpreter-class adapter is authoritative for the executable, invocation
+prefix, argument-vs-stdin delivery, output parser, and accepted status codes.
 
 Source and data are separate channels when the interpreter supports an inline-program argument:
 

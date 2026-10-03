@@ -48,7 +48,7 @@ impl Kernel {
         argv.push(OsString::from(&p.cmd));
         argv.extend(p.args.iter().map(OsString::from));
         let (cwd, mut env) = {
-            let evaluator = session.evaluator.lock().unwrap();
+            let evaluator = session.lock_evaluator()?;
             (evaluator.cwd().to_path_buf(), evaluator.env_vars().to_vec())
         };
         for (k, v) in &p.env {
@@ -71,7 +71,7 @@ impl Kernel {
         // empty allowlist would default-deny every spawn. `sandbox_for` returns
         // `None` for the permissive human, so the child runs unconfined.
         if self.policy.spawn_pinning_active(&actor) {
-            let bin_hash = shoal_exec::resolve_and_hash(&argv, &env).unwrap_or_default();
+            let bin_hash = shoal_exec::resolve_and_hash_in(&argv, &env, &cwd).unwrap_or_default();
             let effect = Effect::ProcSpawn {
                 bin_hash,
                 argv0: p.cmd.clone(),
@@ -99,6 +99,10 @@ impl Kernel {
         }
         let sandbox = self.policy.sandbox_for(&actor);
 
+        let owner = session.key.owner();
+        self.reap_terminal_ptys(&owner)?;
+        let active_slot = self.ptys.reserve(&owner)?;
+
         let pty_session = shoal_exec::PtySession::open(shoal_exec::PtyOpenSpec {
             argv,
             cwd,
@@ -118,17 +122,35 @@ impl Kernel {
         // `pty.read` still reports `changed:true`).
         let (cols, rows) = pty_session.size();
 
-        let pty_id = self.next_pty.fetch_add(1, Ordering::Relaxed);
-        let pty_ref = Ref::new("pty", pty_id);
-        self.ptys.lock().unwrap().insert(
-            pty_ref.clone(),
-            Arc::new(PtyEntry {
-                session_id: session.id.clone(),
-                principal: actor,
-                cmd: display.clone(),
-                session: Mutex::new(pty_session),
+        let (_, pty_ref) = self.ptys.allocate();
+        let entry = Arc::new(PtyEntry {
+            owner,
+            cmd: display.clone(),
+            session: Mutex::new(pty_session),
+            lifecycle: Mutex::new(PtyLifecycle {
+                session_lease: Some(session),
+                active_slot: Some(active_slot),
+                terminal_since: None,
             }),
-        );
+        });
+        if let Err(error) = self.ptys.insert(pty_ref.clone(), entry.clone()) {
+            if let Ok(mut session) = entry.session.lock() {
+                let _ = session.close();
+            }
+            let _ = entry.mark_terminal();
+            return Err(error);
+        }
+
+        // A single registry-wide sweeper detects self-exited children and
+        // releases their leases. Thread count stays constant as PTYs grow.
+        if let Err(error) = self.ptys.ensure_reaper() {
+            let _ = self.ptys.remove(&pty_ref);
+            if let Ok(mut session) = entry.session.lock() {
+                let _ = session.close();
+            }
+            let _ = entry.mark_terminal();
+            return Err(error);
+        }
         encode(json!({
             "pty_id": pty_ref,
             "pid": pid,
@@ -147,18 +169,16 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtySendParams = decode(params)?;
-        let entry = self.pty(&p.pty_id, &session_id)?;
+        let entry = self.pty(&p.pty_id, &owner)?;
         let bytes = encode_input(&p.input).map_err(|message| RpcError {
             code: INVALID_PARAMS,
             message,
             data: None,
         })?;
-        entry
-            .session
-            .lock()
-            .unwrap()
+        self.ptys
+            .lock_session(&p.pty_id, &entry)?
             .send(&bytes)
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
@@ -179,10 +199,31 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtyRefParams = decode(params)?;
-        let entry = self.pty(&p.pty_id, &session_id)?;
-        let snap = entry.session.lock().unwrap().read_screen();
+        let entry = self.pty(&p.pty_id, &owner)?;
+        let snap = {
+            let mut session = self.ptys.lock_session(&p.pty_id, &entry)?;
+            match session.read_screen() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if !shoal_exec::PtySession::is_renderer_quarantined_error(&error) {
+                        return Err(RpcError {
+                            code: INTERNAL_ERROR,
+                            message: format!("pty read failed: {error}"),
+                            data: None,
+                        });
+                    }
+                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let _ = session.close();
+                    return Err(rpc);
+                }
+            }
+        };
+        if !snap.alive {
+            self.ptys.mark_terminal(&p.pty_id, &entry)?;
+            self.reap_terminal_ptys(&owner)?;
+        }
         encode(json!({
             "pty_id": p.pty_id,
             "cmd": entry.cmd,
@@ -209,20 +250,43 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtyResizeParams = decode(params)?;
-        let entry = self.pty(&p.pty_id, &session_id)?;
-        entry
-            .session
-            .lock()
-            .unwrap()
-            .resize(p.cols, p.rows)
-            .map_err(|e| RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("pty resize failed: {e}"),
-                data: None,
-            })?;
-        let snap = entry.session.lock().unwrap().read_screen();
+        let entry = self.pty(&p.pty_id, &owner)?;
+        let snap = {
+            let mut session = self.ptys.lock_session(&p.pty_id, &entry)?;
+            if let Err(error) = session.resize(p.cols, p.rows) {
+                if shoal_exec::PtySession::is_renderer_quarantined_error(&error) {
+                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let _ = session.close();
+                    return Err(rpc);
+                }
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("pty resize failed: {error}"),
+                    data: None,
+                });
+            }
+            match session.read_screen() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if !shoal_exec::PtySession::is_renderer_quarantined_error(&error) {
+                        return Err(RpcError {
+                            code: INTERNAL_ERROR,
+                            message: format!("pty read after resize failed: {error}"),
+                            data: None,
+                        });
+                    }
+                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let _ = session.close();
+                    return Err(rpc);
+                }
+            }
+        };
+        if !snap.alive {
+            self.ptys.mark_terminal(&p.pty_id, &entry)?;
+            self.reap_terminal_ptys(&owner)?;
+        }
         encode(json!({"pty_id": p.pty_id, "cols": snap.cols, "rows": snap.rows}))
     }
 
@@ -235,12 +299,13 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtyRefParams = decode(params)?;
-        // Ownership check first, then remove: another session's ref stays put.
-        let entry = self.pty(&p.pty_id, &session_id)?;
-        self.ptys.lock().unwrap().remove(&p.pty_id);
-        let (status, signal) = entry.session.lock().unwrap().close();
+        // Ownership check and removal are one registry transaction: exactly
+        // one concurrent closer owns teardown, and foreign refs stay opaque.
+        let entry = self.take_pty(&p.pty_id, &owner)?;
+        let (status, signal) = self.ptys.lock_session(&p.pty_id, &entry)?.close();
+        self.ptys.mark_terminal(&p.pty_id, &entry)?;
         encode(json!({
             "pty_id": p.pty_id,
             "closed": true,
@@ -263,35 +328,36 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         // Snapshot the matching entries (clone the Arcs, drop the registry lock)
         // before touching any per-session lock, so this never holds `ptys` and a
         // `PtyEntry::session` lock at once.
-        let mut entries: Vec<(u64, Arc<PtyEntry>)> = self
-            .ptys
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, entry)| entry.session_id == session_id)
-            .map(|(pty_ref, entry)| (pty_id_num(pty_ref), entry.clone()))
-            .collect();
+        let mut entries: Vec<(Ref, Arc<PtyEntry>)> =
+            self.ptys.snapshot_owner(&owner)?.into_iter().collect();
         // Stable, ascending order (open order) so the list is deterministic.
-        entries.sort_by_key(|(id, _)| *id);
+        entries.sort_by_key(|(pty_ref, _)| pty_id_num(pty_ref));
         let ptys: Vec<Json> = entries
             .iter()
-            .map(|(id, entry)| {
-                let mut session = entry.session.lock().unwrap();
+            .map(|(pty_ref, entry)| -> Result<Json, RpcError> {
+                let mut session = self.ptys.lock_session(pty_ref, entry)?;
                 let (cols, rows) = session.size();
-                json!({
-                    "pty_id": Ref::new("pty", id),
+                let pid = session.pid();
+                let alive = session.alive();
+                drop(session);
+                if !alive {
+                    self.ptys.mark_terminal(pty_ref, entry)?;
+                }
+                Ok(json!({
+                    "pty_id": pty_ref,
                     "cmd": entry.cmd,
-                    "pid": session.pid(),
+                    "pid": pid,
                     "cols": cols,
                     "rows": rows,
-                    "alive": session.alive(),
-                })
+                    "alive": alive,
+                }))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
+        self.reap_terminal_ptys(&owner)?;
         encode(json!({ "ptys": ptys }))
     }
 }

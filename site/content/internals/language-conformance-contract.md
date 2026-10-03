@@ -62,6 +62,10 @@ does mean prose alone cannot declare an unimplemented feature “done.”
 
 Shoal source is UTF-8 and lexing is modal. The parser requests tokens in expression or command mode
 according to grammar position; the lexer does not inspect runtime bindings.
+All file/stdin entry points admit at most 4 MiB, the parser's own source wall. CLI scripts and
+formatter input stream through a limit-plus-sentinel reader; evaluator `source`, `.shl` scripts,
+modules, and interactive init files use the same wall through the evaluator's inherited filesystem
+port. Oversized and non-UTF-8 inputs fail with path-aware diagnostics before parsing.
 
 ### Common lexical invariants
 
@@ -198,17 +202,14 @@ Evaluation is strict and left-to-right. Positional and named arguments bind in s
 defaults are evaluated according to the closure/call implementation; variadic tails collect
 remaining arguments. Adapter signatures can translate long and short flags before argv assembly.
 
-Current implementation does **not** provide complete runtime type soundness for user annotations:
-
-- expression-call paths do not uniformly enforce parameter annotations;
-- command word coercion converts recognized word forms, but already-typed non-string values can
-  pass through;
-- declared return annotations are not enforced.
-
-Annotations are therefore useful call metadata/coercion hints, not a proof of static or dynamic
-type safety. The canonical call chapter documents exact behavior. A future enforcement change is a
-language behavior change and needs corpus coverage for expression calls, command calls, defaults,
-variadics, and return values.
+User-function annotations are runtime contracts at the closure call boundary shared by expression
+and command surfaces. Parameter strings use the declared word conversion; a UTF-8 `path` can
+convert to `str` for path-shaped command words, and all other already-tagged values must match.
+`list<T>` validates recursively, `table<T>` admits record rows, `T?` admits `null`, and defaults and
+variadic items use the same path. Declared returns are checked exactly, without output conversion.
+Invalid type names or generic shapes fail with `type_error` when the callable is invoked. The
+`function-type-soundness.toml` corpus pins expression/command calls, named arguments, defaults,
+variadics, nested containers, optionals, invalid annotations, and return failures.
 
 ## Scope, modules, cwd, and environment
 
@@ -216,6 +217,11 @@ variadics, and return values.
 - Blocks and closures use lexical environments.
 - Modules load source files, evaluate them in a module environment, and expose exports through a
   module value.
+- A session admits at most 4,096 live lexical binding identities across its ordinary, child, script,
+  and module scopes. Binding names are capped at 256 UTF-8 bytes; one materialized value is capped
+  at 1 MiB, depth 64, and 16,384 structural nodes; all live scopes share a 16 MiB retained-value
+  budget. Replacing an existing name remains legal at the identity cap, and dropping a scope
+  releases its charges.
 - Session cwd and environment are evaluator state; scoped `with` behavior must restore state on all
   exits.
 - Host-injected ports, configuration, Reef, policy, event bus, and journal are not ordinary lexical
@@ -246,16 +252,19 @@ Streams are pull-driven values with single-consumption state. Finite and unbound
 distinguished so terminal operations can reject unsafe collection. Operators compose lazily where
 implemented; bounded channels/tee paths must express backpressure or drop behavior explicitly.
 
-Do not use the word “bounded” as a blanket claim. Some bridges use bounded synchronous channels,
-while the evaluator's in-language event bus has unbounded live subscriber channels behind a bounded
-replay ring. The separate kernel EventBus uses bounded 256-event subscriber queues and coalesced gap
-summaries; the two buses must not be described as one identical backpressure implementation.
+Do not use the word “bounded” as a blanket claim. Some bridges use bounded synchronous channels.
+The evaluator and kernel event buses now both bound replay and subscriber state by count and bytes,
+but use distinct admission limits and gap records; they must not be described as one identical
+backpressure implementation.
 The stream/channel chapter is the source-derived matrix.
 
 ## Builtin and method contract
 
-Names are never pinned by prose lists. The canonical builtin command-head registry is
-`shoal_syntax::commands::builtin_names()`, consumed by parser/host tooling and evaluator dispatch.
+Names are never pinned by prose lists. The canonical builtin command-head registry and typed
+signature/help metadata are exposed by `shoal_syntax::commands::{builtin_names, builtin_specs}` and
+consumed by parser/host tooling and evaluator dispatch. Every registered head has positional arity
+and types, flags, subcommands, result, error, and example metadata; `-h`/`--help` renders that schema
+after command resolution but before argument expansion or effects.
 The discoverable value-method metadata lives in `shoal-value/src/methods/suggest.rs`; actual method
 behavior lives in the dispatch modules. They are intended to agree but currently have known drift,
 so neither may be treated as a generated perfect registry yet.
@@ -269,8 +278,8 @@ Adding a builtin or method requires:
 5. completion/highlighter/LSP audit;
 6. external reference and focused internal ledger update.
 
-Current registry/dispatch drift is documented rather than hidden. Do not “fix” prose to claim they
-match until tests prove it.
+Registry completeness and zero-effect help dispatch are executable invariants. Runtime arity and
+completion consumers are not all schema-driven yet, so remaining drift there stays documented.
 
 ## Canonical render contract
 
@@ -297,8 +306,10 @@ source-emitted families include:
 |---|---|
 | syntax/evaluation | `parse_error`, `type_error`, `arg_error`, `undefined_var`, `field_missing`, `index_range` |
 | execution/filesystem | `not_found`, `cmd_failed`, `io_error`, `permission`, `utf8_error`, `no_matches`, `feed_error` |
-| numeric/control | `div_zero`, `overflow`, `recursion_limit`, `assert_failed` |
-| streams/events | `stream_consumed`, `stream_unbounded`, `channel_closed` |
+| numeric/control | `div_zero`, `overflow`, `number_range`, `recursion_limit`, `assert_failed` |
+| lexical retention | `binding_name_limit`, `binding_identity_limit`, `binding_value_limit`, `binding_aggregate_limit` |
+| journal integrity | `journal_begin_failed`, `journal_commit_indeterminate`, `journal_read_failed` |
+| streams/events | `stream_consumed`, `stream_unbounded`, `channel_closed`, `channel_poisoned`, `channel_name_limit`, `channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, `channel_payload_type` |
 | network/general | `net_error`, `custom` |
 | Reef | `reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`, `reef_provider` |
 | language runners | `runner_not_found` |
@@ -318,8 +329,9 @@ Rules for codes:
 
 ## Normative conformance corpus
 
-`spec/cases/*.toml` is the behavioral specification. At the 2026-07-16 audit it contains 77 suite
-files and 1,310 globally named cases. A case has this conceptual shape:
+`spec/cases/*.toml` is the behavioral specification. At the 2026-07-16 audit it contained 77 suite
+files and 1,310 globally named cases; the reconciled tree now contains 79 suites and 1,374 cases. A
+case has this conceptual shape:
 
 ```toml
 [[case]]
@@ -373,7 +385,7 @@ explicitly skipped with a reason.
 
 ### Current corpus state
 
-The live audit result was 1,306 passed, 0 failed, and 4 skipped. The skips cover a native-thread
+The 2026-07-18 observed result is 1,360 passed, 0 failed, and 4 skipped. The skips cover a native-thread
 recursion-stack condition, a Node block, a jq feed composition, and full-chain Reef `which`. Counts
 are evidence from that run, not a permanently hardcoded health claim; release notes must run the
 corpus again.
@@ -381,7 +393,7 @@ corpus again.
 ### Exhaustive suite ledger
 
 Every suite is named below so a language area cannot disappear behind an aggregate count. Counts
-come from `[[case]]` records in the current tree and sum to 1,310. This table should eventually be
+come from `[[case]]` records in the current tree and sum to 1,364. This table should eventually be
 generated and checked in CI; until then, adding, renaming, or splitting a suite requires updating it.
 
 #### Core syntax, control flow, and diagnostics
@@ -399,6 +411,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `desugar.toml` | 13 | primary background/env/redirect/implicit/catch desugaring |
 | `edges.toml` | 18 | boundary cases and stable error behavior |
 | `fn-param-binding-more.toml` | 7 | function parameter/default/named binding extensions |
+| `function-type-soundness.toml` | 24 | parameter coercion/checking, variadics, optionals, and exact returns |
 | `iife.toml` | 6 | immediately invoked function/lambda forms |
 | `lambda-and-record-strict.toml` | 17 | lambda parsing and strict record access |
 | `match-guard-lambda.toml` | 6 | guarded arms and lambda interaction |
@@ -417,7 +430,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `coercion-cells-3.toml` | 12 | nested/cell coercion strictness |
 | `coercion-more.toml` | 6 | additional word/value coercions |
 | `coercion.toml` | 62 | numeric, quantity, boolean, datetime, and invalid coercion matrix |
-| `collections.toml` | 38 | list/record/table construction, access, transforms |
+| `collections.toml` | 40 | list/record/table construction, range expansion limits, access, transforms |
 | `datetime-fields.toml` | 12 | datetime field projection and missing-field behavior |
 | `datetime-methods.toml` | 9 | datetime method operations |
 | `datetime-more.toml` | 9 | additional datetime arithmetic/parsing edges |
@@ -473,6 +486,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `io.toml` | 14 | feed, shell blocks, runners, stdin/output boundaries |
 | `outcome-more.toml` | 4 | additional outcome fields/composition |
 | `outcome.toml` | 15 | status/signal/success/output and condition behavior |
+| `plan-effects.toml` | 16 | derived plan effects, reversibility, and estimates |
 
 #### Reef
 
@@ -489,7 +503,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `streams-3.toml` | 2 | third-wave stream regressions |
 | `streams-backpressure.toml` | 6 | boundedness, timeout, and pressure behavior |
 | `streams-more.toml` | 7 | additional transformations and consumption rules |
-| `streams.toml` | 33 | source/operator/sink baseline, single consumption, unbounded errors |
+| `streams.toml` | 45 | source/operator/sink baseline, lazy range expansion, bounded collection/fan-out, fairness, single consumption, bounded-history and unbounded-source errors |
 
 ### Two-runner risk
 

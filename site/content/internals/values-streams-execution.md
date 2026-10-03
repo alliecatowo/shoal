@@ -77,18 +77,29 @@ or allocate a large blob.
 | Value | Feed encoding |
 |---|---|
 | string | raw UTF-8, no automatic newline |
-| bytes / CAS bytes | raw bytes, loading CAS content on demand |
+| bytes / CAS bytes | raw bytes; resident storage stays shared and CAS content opens incrementally |
 | scalar | canonical textual form |
 | list of strings | newline-delimited with a trailing newline |
 | records, tables, heterogeneous lists | compact JSON |
 | outcome | its structured/parsed output when available, otherwise raw output |
 | path | rejected rather than silently reading the file |
 | secret/task/closure and other unsafe kinds | rejected |
-| stream | **currently rejected**; streaming stdin feed is not implemented |
+| stream | `feed_bytes` rejects eager conversion; `.feed(command)` uses the incremental path below |
 
-The stream case is a known gap, not an implicit eager collect. The error directs callers toward a
-bounded collection, preserving the rule that unbounded streams cannot silently become unbounded
-memory use.
+The scalar helper deliberately rejects streams so a generic conversion cannot silently collect an
+unbounded source. The evaluator owns a separate finite-body boundary: strings move into owned bytes,
+resident byte vectors stay shared, and CAS-backed bytes/outcome captures open a reader rather than
+calling `resolve`. Structured JSON encoding is admitted against 16 MiB retained/output, depth 128,
+and 131,072-node walls; its explicit transient budget is the source, JSON projection, and output
+(three bounded payload representations), and secrets are rejected recursively. Evaluator
+`.feed(command)` recognizes both
+live streams and finite readers and drives them through a capture-only queue capped at 16 chunks of
+64 KiB each. The queue applies lossless backpressure, and cancellation, child exit, upstream end, or
+an upstream/reader error tears down the pump.
+
+HTTP reuses the finite boundary but imposes a 16 MiB total request wall. Resident bodies preserve
+ureq's sized `Content-Length` path; CAS bodies open the verified reader and use chunked transfer so a
+one-byte sentinel can detect content that exceeds the declared/admitted bound.
 
 
 ## Outcomes unify commands
@@ -111,18 +122,19 @@ language errors.
 
 
 Operators such as mapping/filtering/taking/merging/zipping compose lazy upstreams. `collect` rejects
-an unbounded stream unless the caller first establishes a bound. Sources include iterable values and
+an unbounded stream unless the caller first establishes a bound, then caps retained output at 16,384
+values and 16 MiB. Sources include iterable values and
 runtime channel/time/file producers implemented by the evaluator.
 
 ### Tee behavior
 
-For a bounded stream, tee can materialize once and replay exact values to each branch. A live stream
-uses a bounded queue per fork (currently 64 items). A slow fork can lose items and receives an
+For a bounded stream, tee can materialize once within the collection walls and replay exact values to each branch. A live stream
+uses a bounded queue per fork (64 items / 1 MiB), with at most 64 forks. A slow fork or oversized item can lose values and receives an
 explicit dropped marker rather than silently pretending delivery was lossless.
 
 
-`buffer(n)` is currently an identity operation in the synchronous pull model; do not infer an
-independent asynchronous prefetch worker from its name.
+`buffer(n)` owns an asynchronous, cancellation-aware producer pump with exact bounded backpressure;
+`buffer(0)` is a lossless rendezvous and positive `n` retains exactly `n` queued items.
 
 ## Tasks
 
@@ -130,10 +142,11 @@ independent asynchronous prefetch worker from its name.
 and resume hooks. Evaluator-spawned language tasks and parked local external jobs can install useful
 control hooks. A task's value is identity-bearing and may resolve to a value or error.
 
-Kernel task wrappers are different: async/timeout RPC execution runs recursive dispatch on a Rust
-thread. The wrapper cannot identify one child process group to signal, so kernel `task.suspend` and
-`task.resume` intentionally return `TASK_CONTROL_UNAVAILABLE`. Cancellation is supported through
-the task path; suspend/resume are not.
+Kernel async/timeout wrappers run recursive dispatch on a Rust thread. External children register
+their process groups with the task's cancellation epoch, so raw kernel `task.suspend`/`task.resume`
+control process-backed work. Pure evaluator computation cannot be stopped independently without
+freezing the shared session evaluator and therefore returns `TASK_CONTROL_UNAVAILABLE`. Cancellation
+is supported for both forms.
 
 ## External execution modes
 
@@ -179,8 +192,8 @@ adding direct libc calls, global `chdir`, or ad-hoc signal handlers.
 ## Wire-stream limitation
 
 The kernel wire can encode a stream as a typed `WireValue::Stream` label/ref, but the protocol has no
-follow-up “pull next chunk” RPC. This is separate from the missing process-stdin stream feed: one is a
-wire transport gap, the other a local byte-conversion gap. Until a bounded pull protocol exists,
+follow-up “pull next chunk” RPC. Local `.feed(command)` is incremental and bounded; it does not make
+that process-local upstream addressable across the wire. Until a bounded pull protocol exists,
 agents should receive materialized bounded values or a domain-specific resource/ref.
 
 ## Invariants and failure modes

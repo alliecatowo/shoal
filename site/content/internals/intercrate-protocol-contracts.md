@@ -127,19 +127,29 @@ accDescr: Shows the components and relationships described in Evaluator port con
 
 ### `Fs`
 
-The filesystem port covers whole-file read/string read, seekable read, write, append, touch,
-metadata/symlink metadata, regular-file check, directory enumeration, directory creation/removal,
-file removal, rename, copy, hardlink, and symlink. The standard adapter delegates to `std::fs`.
+The filesystem port covers whole-file read/string read, seekable read, write, append,
+**open-for-append** (`open_append`, the open-once incremental writer backing the stream sink),
+touch, metadata/symlink metadata, regular-file check, directory enumeration, directory
+creation/removal, file removal, rename, copy, permission updates, extended-attribute inspection,
+hardlink, and symlink. The standard adapter delegates
+to `std::fs`. `open_append`'s trait default fails closed (`ErrorKind::Unsupported`) so an adapter
+that mediates effects must implement it rather than let a streamed append escape.
 
-It does **not** currently cover every filesystem observation needed by the evaluator. Direct calls
-remain around `Path::exists/is_dir/canonicalize`, module/frecency discovery, script paths, stream
-sources, and value/stream save paths. In particular, path `.save`/`.append` and stream `.save` use
-direct `OpenOptions` rather than `Fs`. The architectural contract is the desired single boundary;
-the current implementation is partial and must not be described as fully hexagonal.
+Every language-visible filesystem read, probe, navigation, and write crosses `Fs`: path/value
+`.save`/`.append` route through `CallCtx::fs().write`/`.append`, stream sinks use
+`CallCtx::fs().open_append`, and module/script/frecency/builtin/path operations use metadata,
+canonicalization, enumeration, and read methods on the same injected adapter. Filesystem event
+registration crosses the evaluator-owned `WatchPort`; its standard adapter is the only owner of
+`notify`. The in-process ledger in
+[`effects-plans-security.md`](@/internals/effects-plans-security.md) inventories the boundary.
+
+`CallCtx` (the eval↔methods bridge) exposes `fs() -> &dyn Fs` so value methods reach the same port;
+it is compile-required, and a host must explicitly return `StdFs` or its injected port in its
+`CallCtx` impl for value-method writes to consult that port.
 
 Adding an effectful filesystem operation should extend `Fs` and its fakes unless there is a
-documented host-only reason. A repair needs a port-spy test proving the operation crosses the port,
-not merely a successful temp-directory test.
+documented host-only reason; event registration extends `WatchPort`. A repair needs a port-spy test
+proving the operation crosses the port, not merely a successful temp-directory test.
 
 ### `Clock`
 
@@ -162,15 +172,18 @@ The standard implementation lives in `shoal-eval` so the value leaf does not dep
 
 ### `BytesLoad`
 
-Lazy CAS-backed bytes retain a small preview, true length/hash, and a thread-safe loader. Operations
-that require full content call `BytesLoad::load`; length/render can stay cheap. The concrete journal
-CAS adapter lives above `shoal-value` to preserve the leaf boundary.
+Lazy CAS-backed bytes retain a small preview, true length/hash, and a thread-safe loader. Explicit
+resident operations call `BytesLoad::load`; line streaming and filesystem sinks call
+`BytesLoad::open` and remain bounded-memory. Other resident method fallback preflights a 16 MiB
+wall. Length/render stay metadata-only. The concrete journal CAS adapter lives above `shoal-value`
+to preserve the leaf boundary.
 
 ### `ConfigPort`
 
 `ConfigPort::snapshot` returns the already-resolved value tree. No-config evaluators return `{}` and
 `config.get` returns null. This is intentionally not a file reader. Child evaluators must inherit the
-same Arc/snapshot when semantic continuity is required; several current constructors fail to do so.
+same Arc/snapshot when semantic continuity is required; the authoritative `ChildContext` constructor
+does so for spawn, script, parallel, channel-handler, and stream-pump children.
 
 ### `Exec`
 
@@ -184,7 +197,7 @@ The exact public types live in `crates/shoal-exec/src/lib.rs`; the stable behavi
 
 - `ExecSpec.argv[0]` identifies the program; no shell is implicitly inserted;
 - cwd and environment are complete inputs, not ambient deltas;
-- stdin is null, inherited, bytes, or file;
+- stdin is null, inherited, bytes, file, or a one-shot bounded chunk stream (capture mode only);
 - mode is pipe capture or PTY tee;
 - optional sandbox policy is lowered before exec and actual enforcement is reported honestly;
 - optional spill directory enables bounded-memory stdout spill in capture mode;
@@ -254,8 +267,11 @@ Consumers may rely on:
 ## Wire framing contract
 
 `shoal-proto` uses JSON-RPC 2.0 objects separated by one newline over a Unix byte stream. A frame is
-read with `read_line`; EOF before another line returns no request; a line over 16 MiB is invalid.
-Writing serializes one object, appends newline, and flushes.
+read through a bounded `read_line`; EOF before another line returns no request; JSON content over
+16 MiB is invalid. Before `serde_json` allocates a tree, a fixed-stack lexical preflight enforces
+valid JSON strings/escapes/numbers plus depth 64, 65,536 total values, 16,384 members/items per
+container, 64 KiB decoded object keys, and 1 KiB numeric tokens. Writing first serializes into a
+16 MiB bounded buffer, applies the same complexity preflight, then appends newline and flushes.
 
 ```mermaid
 sequenceDiagram
@@ -270,9 +286,10 @@ accDescr: Shows the components and relationships described in Wire framing contr
   P-->>C: one JSON object + newline
 ```
 
-The 16 MiB check occurs after `read_line` has accumulated the line, so it limits accepted frames but
-does not prevent allocation proportional to an untrusted unterminated/oversized line. Socket peer
-authentication and filesystem permissions are therefore part of framing safety.
+The byte cap is applied during accumulation, so an untrusted unterminated/oversized line cannot grow
+the buffer beyond the cap and terminator sentinel. A wide-but-byte-valid JSON document cannot
+amplify into an unbounded `serde_json::Value` tree because complexity is checked before decoding.
+One large source/result string may still consume the full frame budget.
 
 Notifications and responses share the same stream. Clients must demultiplex by presence of response
 ID versus notification method, and must not assume a request gets the next physical frame when
@@ -307,15 +324,16 @@ Key serialization rules:
   aspirational;
 - `Ref` elision retains type/count/schema/preview/render head plus a fetch URI.
 
-Two current byte-level discrepancies must be treated as contract debt:
+One current byte-level discrepancy remains contract debt:
 
 - `WireValue::DateTime` is documented by the protocol type as RFC 3339, but kernel conversion in
   `wire.rs` currently emits `timestamp().to_string()`: a Unix-seconds decimal string. Clients must
   not assume the declared RFC 3339 shape until conversion and compatibility tests are repaired.
-- `value.get {format:"raw"}` materializes the complete resident or CAS-backed byte value and returns
-  `raw_base64` without the ordinary 64 KiB elision clamp. The MCP resource adapter special-cases
-  `raw` but not `raw_base64`, leaving the full payload in `structuredContent`. This is a context- and
-  memory-boundary bypass, not an endorsed exception to elision.
+
+Raw retrieval is now an explicit bounded contract: `value.get format=raw` pages by the existing
+Unicode-scalar/byte `slice`, `blob.get` pages by byte `offset`/`length`, and both carry at most 8 KiB
+of decoded content plus `total_len`/`next_offset`/`done` metadata. The MCP facade forwards only that
+bounded page in `structuredContent`.
 
 Wire-value evolution is a client compatibility change. Add serde round trips, old fixture decoding,
 kernel conversion tests, and MCP live tests before shipping a variant/field change.
@@ -334,7 +352,10 @@ Important defaults include:
 - optional timeout can convert synchronous work into a task result;
 - elision overrides are optional and hard-clamped by the kernel;
 - `mode: approved` requires a verified stored plan and is not a caller-asserted privilege;
-- journal and event limits/defaults are applied above/below storage as documented by handlers.
+- `JournalQueryParams.limit` is `Option<usize>`: omitted → default page (100), explicit `0` → zero
+  rows, any value clamped to the server maximum (10,000). The `Option` exists so the kernel can
+  distinguish "no limit given" from "give me nothing"; `journal.query` also requires attachment;
+- event limits/defaults are applied above/below storage as documented by handlers.
 
 ## Stable JSON-RPC error taxonomy
 
@@ -355,7 +376,7 @@ Numeric codes are centralized in `shoal_proto::error_code` and pinned by a unit 
 | -32010 | `LEASH_DENIED` | denied or invalid-cross-authority approved/plan access |
 | -32011 | `APPROVAL_REQUIRED` | policy requires an approval flow |
 | -32012 | `UNKNOWN_PLAN` | missing/expired plan ref |
-| -32020 | `TASK_CONTROL_UNAVAILABLE` | suspend/resume unavailable for task model |
+| -32020 | `TASK_CONTROL_UNAVAILABLE` | requested task/state has no process-control backend |
 | -32021 | `UNKNOWN_TASK` | absent or cross-session task |
 | -32022 | `UNKNOWN_PTY` | absent/closed/cross-session PTY |
 | -32023 | `PTY_SPAWN_FAILED` | resolution, sandbox, PTY, or spawn failure |
@@ -367,21 +388,27 @@ split only with a protocol compatibility plan and client fallbacks.
 
 ## Session and authority contract
 
-Most kernel handlers require `session.attach`. Attach establishes session, principal, capabilities,
-cwd/environment identity, AST version, enforcement honesty, elision defaults, and channel list.
+Every stateful kernel handler requires `session.attach`; only `session.attach`, `parse`, and
+`complete` are public. Attach establishes session, principal, capabilities, cwd/environment identity,
+AST version, enforcement honesty, elision defaults, and channel list.
 
 Stable security properties:
 
 - Unix socket ownership/permissions and peer UID are the first boundary;
 - agent tokens are validated through `TokenStore::validate`;
+- `cap.request` and `journal.query` require attachment (no unattached approval mutation or journal
+  read); `cap.request` binds the attached principal as the approver, distinct from the requester by
+  default (self-acknowledgement is an explicit opt-in), and writes an auditable approval record;
 - a named session does not make refs globally visible—handlers still scope every lookup;
 - plans, tasks, PTYs, events, values, and approvals are checked against session/principal rules;
 - `caps_enforced` states actual OS enforcement availability, not merely policy configuration;
 - secret material never crosses the wire through a `Secret` value;
-- per-client `it` state must remain distinct even inside a shared session.
+- per-client `it` state remains distinct inside the same principal-private session.
 
-Current risk: the first principal attached to a named session can determine session-owned evaluator
-state that later principals share. Treat cross-principal named sessions as a security review area.
+The session registry and retained refs use an exact `(principal, Session)` owner. Equal visible names
+under different principals do not share evaluator state, transcripts, journals, tasks, PTYs, or
+quota accounting; one kernel process still shares global memory and CPU and is not a hostile-tenant
+boundary.
 
 ## Compatibility review matrix
 

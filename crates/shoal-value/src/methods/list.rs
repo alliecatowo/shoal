@@ -2,14 +2,19 @@
 //! couple of receiver-polymorphic ones (`.contains`, `.get`) that don't
 //! cleanly belong to any single receiver type.
 
+use super::materialize::{
+    BoundedString, EAGER_COLLECTION_MAX_RETAINED_BYTES, EAGER_COLLECTION_MAX_VALUES,
+    MaterializationBudget, MaterializedCollection,
+};
 use super::*;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 pub(crate) fn seq(v: Value) -> VResult<Vec<Value>> {
     match v {
         Value::List(x) => Ok(x),
         Value::Table(x) => Ok(x.into_iter().map(Value::Record).collect()),
-        Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
+        Value::Range(r) => r.materialize(),
         // Streams are intercepted at the top of `dispatch` and driven with `ctx`;
         // a stream nested inside another collection is materialized by the
         // stream sink path, not here — reaching this arm means a raw stream was
@@ -35,20 +40,30 @@ pub(crate) fn cmp(a: &Value, b: &Value) -> VResult<Ordering> {
 }
 
 pub(crate) fn len(v: Value) -> VResult<Value> {
-    Ok(Value::Int(match v {
+    if let Value::Range(range) = v {
+        return i64::try_from(range.len()).map(Value::Int).map_err(|_| {
+            ErrorVal::new(
+                "range_length_overflow",
+                "range length exceeds the language integer limit",
+            )
+        });
+    }
+    let len = match v {
         Value::Str(s) => s.chars().count(),
         Value::Bytes(b) => b.len(),
         Value::List(x) => x.len(),
         Value::Table(x) => x.len(),
         Value::Record(x) => x.len(),
-        Value::Range(r) => r.len(),
         v => {
             return Err(ErrorVal::type_error(format!(
                 ".len unsupported on {}",
                 v.type_name()
             )));
         }
-    } as i64))
+    };
+    i64::try_from(len)
+        .map(Value::Int)
+        .map_err(|_| ErrorVal::new("collection_length_overflow", "collection is too large"))
 }
 
 /// `.first()`/`.last()` return a single element; `.first(n)`/`.last(n)` return
@@ -64,19 +79,21 @@ pub(crate) fn first_last(v: Value, args: &CallArgs, first: bool) -> VResult<Valu
         });
     }
     let n = super::int_arg(args, 0, 0)?;
-    let x = seq(v)?;
-    let out: Vec<Value> = if first {
-        x.into_iter().take(n).collect()
+    let mut x = seq(v)?;
+    let selected: Box<dyn Iterator<Item = Value>> = if first {
+        Box::new(x.into_iter().take(n))
     } else {
         let skip = x.len().saturating_sub(n);
-        x.into_iter().skip(skip).collect()
+        Box::new(x.drain(skip..))
     };
-    Ok(Value::List(out))
+    let mut out = MaterializedCollection::eager();
+    out.extend(selected)?;
+    Ok(out.finish())
 }
 
 pub(crate) fn collect(v: Value) -> VResult<Value> {
     match v {
-        Value::Range(r) => Ok(Value::List(r.iter().map(Value::Int).collect())),
+        Value::Range(r) => r.materialize().map(Value::List),
         x @ Value::List(_) | x @ Value::Table(_) => Ok(x),
         v => Err(ErrorVal::type_error(format!(
             "cannot collect {}",
@@ -91,7 +108,12 @@ pub(crate) fn to_stream(v: Value) -> VResult<Value> {
     let items: Vec<Value> = match v {
         Value::List(x) => x,
         Value::Table(x) => x.into_iter().map(Value::Record).collect(),
-        Value::Range(r) => r.iter().map(Value::Int).collect(),
+        Value::Range(r) => {
+            return Ok(Value::Stream(StreamVal::from_iter(
+                "int",
+                r.iter().map(|value| Ok(Value::Int(value))),
+            )));
+        }
         Value::Str(s) => s.lines().map(|l| Value::Str(l.to_string())).collect(),
         Value::Bytes(b) => String::from_utf8_lossy(&b)
             .lines()
@@ -111,32 +133,37 @@ pub(crate) fn to_stream(v: Value) -> VResult<Value> {
 }
 
 pub(crate) fn tee(v: Value, n: usize) -> VResult<Value> {
-    if n == 0 {
-        return Err(ErrorVal::arg_error("tee count must be positive"));
+    if n == 0 || n > StreamVal::TEE_MAX_FORKS {
+        return Err(ErrorVal::arg_error(format!(
+            "tee count must be between 1 and {}",
+            StreamVal::TEE_MAX_FORKS
+        )));
     }
-    let x = seq(v)?;
-    Ok(Value::List(
-        (0..n)
-            .map(|_| Value::Stream(StreamVal::from_iter("value", x.clone().into_iter().map(Ok))))
-            .collect(),
-    ))
+    let values: std::sync::Arc<[Value]> = admitted_seq(v)?.into();
+    let mut forks = MaterializedCollection::eager();
+    for _ in 0..n {
+        forks.push(Value::Stream(StreamVal::replay_shared(
+            "value",
+            std::sync::Arc::clone(&values),
+        )))?;
+    }
+    Ok(forks.finish())
 }
 pub(crate) fn map(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
-    Ok(Value::List(
-        seq(v)?
-            .into_iter()
-            .map(|x| ctx.call_closure(f, vec![x]))
-            .collect::<VResult<_>>()?,
-    ))
+    let mut out = MaterializedCollection::eager();
+    for x in seq(v)? {
+        out.push(ctx.call_closure(f, vec![x])?)?;
+    }
+    Ok(out.finish())
 }
 pub(crate) fn filter(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
-    let mut out = vec![];
+    let mut out = MaterializedCollection::eager();
     for x in seq(v)? {
         if ctx.call_closure(f, vec![x.clone()])?.as_condition()? {
-            out.push(x)
+            out.push(x)?;
         }
     }
-    Ok(Value::List(out))
+    Ok(out.finish())
 }
 pub(crate) fn each(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
     for x in seq(v)? {
@@ -173,16 +200,36 @@ pub(crate) fn find(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value>
     Ok(Value::Null)
 }
 pub(crate) fn flat_map(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
-    let mut o = vec![];
+    flat_map_with_limits(
+        ctx,
+        v,
+        f,
+        EAGER_COLLECTION_MAX_VALUES,
+        EAGER_COLLECTION_MAX_RETAINED_BYTES,
+    )
+}
+
+fn flat_map_with_limits(
+    ctx: &mut dyn CallCtx,
+    v: Value,
+    f: &Value,
+    max_values: usize,
+    max_retained_bytes: usize,
+) -> VResult<Value> {
+    let mut out = MaterializedCollection::new(max_values, max_retained_bytes);
     for x in seq(v)? {
-        o.extend(seq(ctx.call_closure(f, vec![x])?)?)
+        out.extend(seq(ctx.call_closure(f, vec![x])?)?)?;
     }
-    Ok(Value::List(o))
+    Ok(out.finish())
 }
 pub(crate) fn sort_by(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
     let mut keyed = vec![];
+    let mut budget = MaterializationBudget::eager();
     for x in seq(v)? {
-        keyed.push((ctx.call_closure(f, vec![x.clone()])?, x));
+        let key = ctx.call_closure(f, vec![x.clone()])?;
+        budget.admit(&x)?;
+        budget.charge_retained(&key)?;
+        keyed.push((key, x));
     }
     // Pre-validate the keys and PROPAGATE the comparison error, exactly like
     // `sort()` below (and unlike a bare `unwrap_or(Equal)`, which silently
@@ -195,7 +242,7 @@ pub(crate) fn sort_by(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Val
     Ok(Value::List(keyed.into_iter().map(|x| x.1).collect()))
 }
 pub(crate) fn sort(v: Value) -> VResult<Value> {
-    let mut x = seq(v)?;
+    let mut x = admitted_seq(v)?;
     for pair in x.windows(2) {
         cmp(&pair[0], &pair[1])?;
     }
@@ -206,20 +253,27 @@ pub(crate) fn reverse(v: Value) -> VResult<Value> {
     match v {
         Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
         v => {
-            let mut x = seq(v)?;
+            let mut x = admitted_seq(v)?;
             x.reverse();
             Ok(Value::List(x))
         }
     }
 }
 pub(crate) fn uniq(v: Value) -> VResult<Value> {
-    let mut out = vec![];
-    for x in seq(v)? {
-        if !out.contains(&x) {
-            out.push(x)
+    let mut out = MaterializedCollection::eager();
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for x in admitted_seq(v)? {
+        let hash = crate::stream::semantic_hash(&x);
+        let exists = buckets
+            .get(&hash)
+            .is_some_and(|indices| indices.iter().any(|index| out.values()[*index] == x));
+        if !exists {
+            let index = out.values().len();
+            out.push(x)?;
+            buckets.entry(hash).or_default().push(index);
         }
     }
-    Ok(Value::List(out))
+    Ok(out.finish())
 }
 pub(crate) fn sum(v: Value) -> VResult<Value> {
     // Accumulate from the first element (not Int(0)) so a homogeneous list of a
@@ -248,20 +302,28 @@ pub(crate) fn minmax(v: Value, max: bool) -> VResult<Value> {
     Ok(best)
 }
 pub(crate) fn flatten(v: Value) -> VResult<Value> {
-    let mut o = vec![];
+    flatten_with_limits(
+        v,
+        EAGER_COLLECTION_MAX_VALUES,
+        EAGER_COLLECTION_MAX_RETAINED_BYTES,
+    )
+}
+
+fn flatten_with_limits(v: Value, max_values: usize, max_retained_bytes: usize) -> VResult<Value> {
+    let mut out = MaterializedCollection::new(max_values, max_retained_bytes);
     for x in seq(v)? {
-        o.extend(seq(x)?)
+        out.extend(seq(x)?)?;
     }
-    Ok(Value::List(o))
+    Ok(out.finish())
 }
 pub(crate) fn enumerate(v: Value) -> VResult<Value> {
-    Ok(Value::List(
-        seq(v)?
-            .into_iter()
-            .enumerate()
-            .map(|(i, x)| Value::List(vec![Value::Int(i as i64), x]))
-            .collect(),
-    ))
+    let mut out = MaterializedCollection::eager();
+    for (index, value) in seq(v)?.into_iter().enumerate() {
+        let index = i64::try_from(index)
+            .map_err(|_| ErrorVal::new("collection_length_overflow", "index exceeds int"))?;
+        out.push(Value::List(vec![Value::Int(index), value]))?;
+    }
+    Ok(out.finish())
 }
 pub(crate) fn slice_count(v: Value, n: usize, take: bool) -> VResult<Value> {
     // `.take`/`.skip` also slice a `str` — by char, returning a substring — so
@@ -276,56 +338,80 @@ pub(crate) fn slice_count(v: Value, n: usize, take: bool) -> VResult<Value> {
         return Ok(Value::Str(sliced));
     }
     let x = seq(v)?;
-    Ok(Value::List(if take {
-        x.into_iter().take(n).collect()
+    let selected: Box<dyn Iterator<Item = Value>> = if take {
+        Box::new(x.into_iter().take(n))
     } else {
-        x.into_iter().skip(n).collect()
-    }))
+        Box::new(x.into_iter().skip(n))
+    };
+    let mut out = MaterializedCollection::eager();
+    out.extend(selected)?;
+    Ok(out.finish())
 }
 pub(crate) fn chunks(v: Value, n: usize) -> VResult<Value> {
     if n == 0 {
         return Err(ErrorVal::arg_error("chunk size must be positive"));
     }
-    Ok(Value::List(
-        seq(v)?.chunks(n).map(|x| Value::List(x.to_vec())).collect(),
-    ))
+    let mut input = admitted_seq(v)?.into_iter();
+    let mut out = MaterializedCollection::eager();
+    loop {
+        let chunk: Vec<Value> = input.by_ref().take(n).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        out.push(Value::List(chunk))?;
+    }
+    Ok(out.finish())
 }
 pub(crate) fn zip(a: Value, b: Value) -> VResult<Value> {
-    Ok(Value::List(
-        seq(a)?
-            .into_iter()
-            .zip(seq(b)?)
-            .map(|(a, b)| Value::List(vec![a, b]))
-            .collect(),
-    ))
+    let mut out = MaterializedCollection::eager();
+    for (a, b) in seq(a)?.into_iter().zip(seq(b)?) {
+        out.push(Value::List(vec![a, b]))?;
+    }
+    Ok(out.finish())
 }
 pub(crate) fn group(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
     let mut groups: Vec<(Value, Vec<Value>)> = vec![];
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut budget = MaterializationBudget::eager();
     for x in seq(v)? {
         let k = ctx.call_closure(f, vec![x.clone()])?;
-        if let Some((_, g)) = groups.iter_mut().find(|(a, _)| a == &k) {
-            g.push(x)
+        budget.admit(&x)?;
+        let hash = crate::stream::semantic_hash(&k);
+        let existing = buckets
+            .get(&hash)
+            .and_then(|indices| indices.iter().copied().find(|index| groups[*index].0 == k));
+        if let Some(index) = existing {
+            groups[index].1.push(x)
         } else {
-            groups.push((k, vec![x]))
+            budget.charge_retained(&k)?;
+            let index = groups.len();
+            groups.push((k, vec![x]));
+            buckets.entry(hash).or_default().push(index);
         }
     }
-    Ok(Value::List(
-        groups
-            .into_iter()
-            .map(|(k, v)| {
-                let mut r = Record::new();
-                r.insert("key".into(), k);
-                r.insert("values".into(), Value::List(v));
-                Value::Record(r)
-            })
-            .collect(),
-    ))
+    let mut out = MaterializedCollection::eager();
+    for (key, values) in groups {
+        let mut record = Record::new();
+        record.insert("key".into(), key);
+        record.insert("values".into(), Value::List(values));
+        out.push(Value::Record(record))?;
+    }
+    Ok(out.finish())
+}
+
+fn admitted_seq(v: Value) -> VResult<Vec<Value>> {
+    let mut out = MaterializedCollection::eager();
+    out.extend(seq(v)?)?;
+    Ok(out.finish_vec())
 }
 pub(crate) fn join(v: Value, sep: &str) -> VResult<Value> {
-    let mut out = vec![];
-    for x in seq(v)? {
+    let mut out = BoundedString::eager();
+    for (index, x) in seq(v)?.into_iter().enumerate() {
+        if index > 0 {
+            out.push_str(sep)?;
+        }
         match x {
-            Value::Str(s) => out.push(s),
+            Value::Str(s) => out.push_str(&s)?,
             v => {
                 return Err(ErrorVal::type_error(format!(
                     "join expects str elements, found {}",
@@ -334,7 +420,7 @@ pub(crate) fn join(v: Value, sep: &str) -> VResult<Value> {
             }
         }
     }
-    Ok(Value::Str(out.join(sep)))
+    Ok(out.finish())
 }
 pub(crate) fn contains(v: Value, q: &Value) -> VResult<Value> {
     match v {
@@ -352,13 +438,167 @@ pub(crate) fn contains(v: Value, q: &Value) -> VResult<Value> {
 pub(crate) fn get(v: Value, key: &Value, default: Value) -> VResult<Value> {
     match (v, key) {
         (Value::Record(r), Value::Str(k)) => Ok(r.get(k).cloned().unwrap_or(default)),
-        (Value::List(x), Value::Int(i)) => Ok(if *i >= 0 {
-            x.get(*i as usize)
-        } else {
-            x.get(x.len().wrapping_sub((-i) as usize))
+        (Value::List(x), Value::Int(i)) => Ok(index(*i, x.len())
+            .and_then(|i| x.get(i).cloned())
+            .unwrap_or(default)),
+        (Value::Table(x), Value::Int(i)) => Ok(index(*i, x.len())
+            .and_then(|i| x.get(i).cloned())
+            .map(Value::Record)
+            .unwrap_or(default)),
+        (Value::Range(r), Value::Int(i)) => Ok(r.value_at(*i).map(Value::Int).unwrap_or(default)),
+        _ => Err(ErrorVal::type_error(
+            "get expects record+str or list/table/range+int",
+        )),
+    }
+}
+
+fn index(index: i64, len: usize) -> Option<usize> {
+    if index >= 0 {
+        usize::try_from(index).ok().filter(|index| *index < len)
+    } else {
+        usize::try_from(index.unsigned_abs())
+            .ok()
+            .and_then(|distance| len.checked_sub(distance))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RepeatCtx;
+
+    impl CallCtx for RepeatCtx {
+        fn call_closure(&mut self, _f: &Value, args: Vec<Value>) -> VResult<Value> {
+            Ok(Value::List(vec![args[0].clone(), args[0].clone()]))
         }
-        .cloned()
-        .unwrap_or(default)),
-        _ => Err(ErrorVal::type_error("get expects record+str or list+int")),
+
+        fn buffer_stream(&mut self, _stream: StreamVal, _capacity: usize) -> VResult<StreamVal> {
+            unreachable!("collection tests do not buffer streams")
+        }
+
+        fn cwd(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn fs(&self) -> &dyn Fs {
+            static FS: StdFs = StdFs;
+            &FS
+        }
+    }
+
+    #[test]
+    fn multiplicative_collections_fail_at_incremental_limits() {
+        let input = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(
+            flat_map_with_limits(&mut RepeatCtx, input, &Value::Null, 3, 1024)
+                .unwrap_err()
+                .code,
+            "collection_materialization_limit"
+        );
+
+        let nested = Value::List(vec![
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            Value::List(vec![Value::Int(3), Value::Int(4)]),
+        ]);
+        assert_eq!(
+            flatten_with_limits(nested, 3, 1024).unwrap_err().code,
+            "collection_materialization_limit"
+        );
+
+        let oversized = Value::List(vec![Value::List(vec![Value::Str("x".repeat(128))])]);
+        assert_eq!(
+            flatten_with_limits(oversized, 8, 64).unwrap_err().code,
+            "collection_materialization_limit"
+        );
+    }
+
+    #[test]
+    fn ordinary_eager_collection_methods_share_the_materialization_wall() {
+        let too_many = || Value::List(vec![Value::Int(1); EAGER_COLLECTION_MAX_VALUES + 1]);
+
+        assert_eq!(
+            map(&mut RepeatCtx, too_many(), &Value::Null)
+                .unwrap_err()
+                .code,
+            "collection_materialization_limit"
+        );
+        assert_eq!(
+            enumerate(too_many()).unwrap_err().code,
+            "collection_materialization_limit"
+        );
+        assert_eq!(
+            chunks(too_many(), 32).unwrap_err().code,
+            "collection_materialization_limit"
+        );
+        assert_eq!(
+            tee(too_many(), 2).unwrap_err().code,
+            "collection_materialization_limit"
+        );
+    }
+
+    #[test]
+    fn collection_tee_replays_shared_materialization_exactly() {
+        let forks = match tee(
+            Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            2,
+        )
+        .unwrap()
+        {
+            Value::List(forks) => forks,
+            other => panic!("expected fork list, got {other:?}"),
+        };
+        assert_eq!(forks.len(), 2);
+        for fork in forks {
+            let Value::Stream(stream) = fork else {
+                panic!("expected stream fork")
+            };
+            let mut upstream = stream.take_upstream().unwrap();
+            let mut replay = Vec::new();
+            drive_stream(&mut RepeatCtx, &mut *upstream, |_ctx, value| {
+                replay.push(value);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(replay, vec![Value::Str("a".into()), Value::Str("b".into())]);
+        }
+    }
+
+    #[test]
+    fn get_indexes_tables_and_ranges_without_materializing() {
+        let mut row = Record::new();
+        row.insert("name".into(), Value::Str("shoal".into()));
+        assert_eq!(
+            get(Value::Table(vec![row.clone()]), &Value::Int(0), Value::Null).unwrap(),
+            Value::Record(row)
+        );
+        let range = || {
+            Value::Range(RangeVal {
+                start: 10,
+                end: 13,
+                inclusive: false,
+            })
+        };
+        assert_eq!(
+            get(range(), &Value::Int(1), Value::Null).unwrap(),
+            Value::Int(11)
+        );
+        assert_eq!(
+            get(range(), &Value::Int(-1), Value::Null).unwrap(),
+            Value::Int(12)
+        );
+        assert_eq!(
+            get(range(), &Value::Int(8), Value::Int(99)).unwrap(),
+            Value::Int(99)
+        );
+        assert_eq!(
+            get(
+                Value::List(vec![Value::Int(1)]),
+                &Value::Int(i64::MIN),
+                Value::Int(99),
+            )
+            .unwrap(),
+            Value::Int(99)
+        );
     }
 }

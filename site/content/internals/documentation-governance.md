@@ -51,7 +51,7 @@ enumerations and observable behaviors remain executable:
 | Information | Normative authority | Narrative treatment |
 |---|---|---|
 | builtin names | `shoal_syntax::commands::builtin_names()` | explain categories and lifecycle; do not hand-copy as authority |
-| value methods | metadata in `methods/suggest.rs` plus real dispatch | publish generated tables and call out drift |
+| value methods | metadata in `methods/suggest.rs` plus real dispatch and behavioral fixtures | publish generated tables; treat dispatch as exact arity/value authority |
 | AST/wire/config structs | public serde/Rust types | explain invariants, compatibility, and examples |
 | RPC integer codes | `shoal_proto::error_code` + pinned test | explain meaning and client handling |
 | adapter/manifest grammar | deserializers and fixture corpus | explain precedence and extension process |
@@ -127,7 +127,7 @@ silently preserve two copies.
 | `docs/TDD.md` | language/conformance contract plus focused syntax/value/process/security/storage chapters | stale name lists, state paths, mandatory interactive kernel, aspiration vs behavior | retire and retarget all comments |
 | `docs/STREAMS.md` | streams/channels chapter plus external stream guide | per-source boundedness, evaluator-language EventBus unbounded live subscribers, implemented vs proposed sources | retire |
 | `docs/IO.md` | value/feed/process/script-runner chapters and external I/O guide | exact runner/feed behavior checked against source; aspirations labeled | retire |
-| `docs/REEF.md` | Reef resolution chapter, config and external guide | actual multi-scope discovery, empty-tools manifest gap, provider/lock behavior | retire |
+| `docs/REEF.md` | Reef resolution chapter, config and external guide | actual multi-scope discovery, tool-free policy scopes, provider/lock behavior | retire |
 | `docs/CONFIG.md` | configuration reference + external configuration guide | nearest-only project layer, parallel prompt/Reef parsers, inert fields | retire |
 | `docs/AGENT-SURFACE.md` | kernel/protocol/RPC reference, MCP, security, status/roadmap | unattached approval/journal handlers, colliding plan identity, token reload semantics, raw-base64 bypass, incomplete stream/ref promises | retire and retarget protocol comments |
 | `docs/CONTRACTS.md` | inter-crate/protocol contract + focused crate chapters | exact APIs delegated to source, port bypasses admitted, current DAG/types used | retire and retarget comments |

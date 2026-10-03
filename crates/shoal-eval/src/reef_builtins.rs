@@ -5,11 +5,16 @@
 //! mechanics these commands call into.
 
 use super::*;
+use crate::builtins::admission::{OutputBudget, OutputValues, table_record};
+use std::collections::HashSet;
+use std::io::Read as _;
 
 use shoal_reef::hashcache::HashCache;
 use shoal_reef::{
-    ManifestKind, Policy, ProviderCtx, ReefCode, ReefError, ResolutionReport, ScopeChain,
+    ManifestKind, Policy, ProbeExecution, ProviderCtx, ReefCode, ReefError, ResolutionReport,
+    ScopeChain,
 };
+use shoal_syntax::commands::CommandSource;
 
 impl Evaluator {
     // --- `which` (site/content/internals/reef-resolution.md) -------------------------------------------------
@@ -41,31 +46,57 @@ impl Evaluator {
             return self.which_all(&name);
         }
 
+        let command = self.resolve_head(&name, false, true);
+        if command.source != CommandSource::External {
+            return self.command_source_record(&name, &command);
+        }
+
+        self.executable_resolution_record(&name)
+    }
+
+    fn executable_resolution_record(&mut self, name: &str) -> VResult<Value> {
         let chain = self.reef_chain_snapshot();
+        self.reef_lock_loaded()?;
         let resolver = self.reef_resolver();
-        let mut lock = self.reef_lock.clone();
-        match resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
+        let mut lock = self.exec.reef.lock.clone();
+        let provider_context = self.reef_provider_context(chain.cwd.clone());
+        match resolver.resolve_with_probe_context(
+            name,
+            &chain,
+            &mut lock,
+            Policy::Interactive,
+            &mut |_| {},
+            ProbeExecution {
+                guard: &mut |candidate| self.reef_probe_guard(candidate),
+                context: &provider_context,
+            },
+        ) {
             Ok(res) => {
                 // Only keep a fresh lock when a manifest actually constrained it.
                 if res.constrained {
-                    self.reef_lock = lock;
                     if res.locked_now {
-                        self.persist_reef_lock();
+                        self.persist_reef_lock_value(&lock)?;
                     }
+                    self.exec.reef.lock = lock;
                 }
-                Ok(report_to_record(&res.report))
+                report_to_record(&res.report)
             }
             // A genuine "nothing anywhere provides this" miss falls back to
             // the ambient PATH lookup so `which` never regresses today's
             // behavior for an ordinary, unconstrained command.
             Err(e) if e.code == ReefCode::NotFound => {
                 let path_env = self
+                    .exec
+                    .shell
                     .process_env
                     .iter()
                     .find(|(k, _)| k == "PATH")
                     .map(|(_, v)| v.as_os_str());
-                match shoal_exec::which(OsStr::new(&name), path_env) {
-                    Some(p) => Ok(minimal_which_record(&name, &p)),
+                match shoal_exec::which(OsStr::new(name), path_env) {
+                    Some(p) => {
+                        let hash = self.hash_resolved_bin(p.as_os_str());
+                        Ok(minimal_which_record(name, &p, hash.as_deref()))
+                    }
                     None => Ok(Value::Null),
                 }
             }
@@ -75,8 +106,90 @@ impl Evaluator {
             // (the audit's single most user-misleading finding: `which`
             // actively lied about protection). Mirrors the "unresolved:
             // <code>" idiom `reef_binding_table` already uses below.
-            Err(e) => Ok(unresolved_which_record(&name, &e, &chain)),
+            Err(e) => Ok(unresolved_which_record(name, &e, &chain)),
         }
+    }
+
+    fn command_source_record(
+        &mut self,
+        name: &str,
+        resolution: &crate::resolution::CommandResolution,
+    ) -> VResult<Value> {
+        let source = resolution.source;
+        let mut record = Record::new();
+        record.insert("name".into(), Value::Str(name.to_string()));
+        record.insert("source".into(), Value::Str(source.as_str().into()));
+        record.insert("reason".into(), Value::Str(source.reason().into()));
+        record.insert("scope".into(), Value::Str(source.as_str().into()));
+        record.insert("constraint".into(), Value::Str("*".into()));
+        record.insert("version".into(), Value::Null);
+        record.insert("chain".into(), Value::Table(Vec::new()));
+
+        let mut path = None;
+        let mut hash = None;
+        if source == CommandSource::Script {
+            let candidate = PathBuf::from(name);
+            path = Some(if candidate.is_absolute() {
+                candidate
+            } else {
+                self.exec.shell.cwd.join(candidate)
+            });
+        }
+        if source == CommandSource::Adapter {
+            let adapter = self
+                .host
+                .adapters
+                .lookup(name)
+                .cloned()
+                .expect("adapter resolution carries a catalog entry");
+            let executable = self.executable_resolution_record(&adapter.bin)?;
+            if let Value::Record(executable_record) = &executable {
+                path = executable_record.get("path").and_then(|value| match value {
+                    Value::Path(path) => Some(path.clone()),
+                    _ => None,
+                });
+                hash = executable_record.get("hash").and_then(|value| match value {
+                    Value::Str(hash) => Some(hash.clone()),
+                    _ => None,
+                });
+                if let Some(provider) = executable_record.get("provider") {
+                    record.insert("executable_provider".into(), provider.clone());
+                }
+            }
+            record.insert("executable".into(), executable);
+
+            let mut schema = Record::new();
+            schema.insert("bin".into(), Value::Str(adapter.bin.clone()));
+            schema.insert(
+                "class".into(),
+                Value::Str(format!("{:?}", adapter.class).to_ascii_lowercase()),
+            );
+            let mut params = OutputValues::new();
+            for param in &adapter.top.params {
+                params.push(Value::Str(param.name.clone()))?;
+            }
+            schema.insert("params".into(), params.finish_list());
+            let mut subcommands = OutputValues::new();
+            for subcommand in adapter.subs.keys() {
+                subcommands.push(Value::Str(subcommand.clone()))?;
+            }
+            schema.insert("subcommands".into(), subcommands.finish_list());
+            record.insert("adapter".into(), Value::Record(schema));
+        }
+        if let Some(binding) = &resolution.binding {
+            record.insert("value_type".into(), Value::Str(binding.type_name().into()));
+        }
+
+        record.insert("path".into(), path.map(Value::Path).unwrap_or(Value::Null));
+        record.insert(
+            "hash8".into(),
+            hash.as_ref()
+                .map(|value| Value::Str(short_hash(value)))
+                .unwrap_or(Value::Null),
+        );
+        record.insert("hash".into(), hash.map(Value::Str).unwrap_or(Value::Null));
+        record.insert("provider".into(), Value::Str(source.as_str().into()));
+        Ok(Value::Record(record))
     }
 
     /// `which <tool> --all`: every candidate every provider offers, as a
@@ -87,10 +200,14 @@ impl Evaluator {
     /// ever made or hidden, only a plain listing.
     fn which_all(&mut self, name: &str) -> VResult<Value> {
         let resolver = self.reef_resolver();
-        let ctx = ProviderCtx::new(self.cwd.clone());
-        let mut rows = Vec::new();
+        let ctx = ProviderCtx::new(self.exec.shell.cwd.clone());
+        let mut rows = OutputValues::new();
         for provider in resolver.providers() {
-            for cand in provider.discover(name, &ctx) {
+            let discovery = provider.discover(name, &ctx).map_err(|error| {
+                ErrorVal::new("reef_provider", error.to_string())
+                    .with_hint("narrow or clean the provider's installed candidate set")
+            })?;
+            for cand in discovery.into_candidates() {
                 let mut r = Record::new();
                 r.insert("tool".into(), Value::Str(cand.tool.clone()));
                 r.insert("version".into(), Value::Str(cand.version.to_string()));
@@ -100,10 +217,10 @@ impl Evaluator {
                     "scope".into(),
                     Value::Str(if cand.ambient { "ambient" } else { "system" }.into()),
                 );
-                rows.push(r);
+                rows.push(table_record(r))?;
             }
         }
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 
     // --- `reef` builtins (site/content/internals/reef-resolution.md) -----------------------------------------
@@ -142,22 +259,26 @@ impl Evaluator {
     /// Bare `reef`: the current binding table for every constrained tool.
     fn reef_binding_table(&mut self) -> VResult<Value> {
         let chain = self.reef_chain_snapshot();
-        let mut names: Vec<String> = Vec::new();
-        for scope in &chain.scopes {
-            for tool in scope.manifest.tools.keys() {
-                if !names.contains(tool) {
-                    names.push(tool.clone());
-                }
-            }
-        }
-        names.sort();
+        let names = constrained_tool_names(&chain)?;
         let resolver = self.reef_resolver();
-        let mut lock = self.reef_lock.clone();
-        let mut rows = Vec::new();
+        let original_lock = self.exec.reef.lock.clone();
+        let mut lock = original_lock.clone();
+        let mut rows = OutputValues::new();
+        let provider_context = self.reef_provider_context(chain.cwd.clone());
         for name in names {
             let mut r = Record::new();
             r.insert("name".into(), Value::Str(name.clone()));
-            match resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
+            match resolver.resolve_with_probe_context(
+                &name,
+                &chain,
+                &mut lock,
+                Policy::Interactive,
+                &mut |_| {},
+                ProbeExecution {
+                    guard: &mut |candidate| self.reef_probe_guard(candidate),
+                    context: &provider_context,
+                },
+            ) {
                 Ok(res) => {
                     r.insert(
                         "constraint".into(),
@@ -183,10 +304,13 @@ impl Evaluator {
                     );
                 }
             }
-            rows.push(r);
+            rows.push(table_record(r))?;
         }
-        self.reef_lock = lock;
-        Ok(Value::Table(rows))
+        if lock != original_lock {
+            self.persist_reef_lock_value(&lock)?;
+        }
+        self.exec.reef.lock = lock;
+        Ok(rows.finish_table())
     }
 
     /// `reef add <tool>@<ver>`: write the target `.reef.toml` and lock the tool.
@@ -226,8 +350,8 @@ impl Evaluator {
         // Local manifest first (via the Fs port so a present-but-malformed one is
         // still seen, unlike the chain which skips it); then the nearest ancestor
         // Reef scope; then a fresh manifest in cwd.
-        let local = self.cwd.join(".reef.toml");
-        let manifest_path = if self.fs.is_file(&local) {
+        let local = self.exec.shell.cwd.join(".reef.toml");
+        let manifest_path = if self.host.fs.is_file(&local) {
             local
         } else {
             let chain = self.reef_chain_snapshot();
@@ -238,14 +362,22 @@ impl Evaluator {
                 .map(|s| s.source.clone())
                 .unwrap_or(local)
         };
-        let mut doc = match self.fs.read_to_string(&manifest_path) {
-            Ok(text) => text.parse::<toml::Table>().map_err(|e| {
-                ErrorVal::new(
-                    "reef_provider",
-                    format!("parsing manifest {}: {e}", manifest_path.display()),
-                )
-            })?,
-            Err(_) => toml::Table::new(),
+        let mut doc = match read_optional_reef_manifest(self.host.fs.as_ref(), &manifest_path)? {
+            Some(text) => {
+                shoal_reef::ReefManifest::parse_reef(&text).map_err(|error| {
+                    ErrorVal::new(
+                        "reef_provider",
+                        format!("parsing manifest {}: {error}", manifest_path.display()),
+                    )
+                })?;
+                text.parse::<toml::Table>().map_err(|e| {
+                    ErrorVal::new(
+                        "reef_provider",
+                        format!("parsing manifest {}: {e}", manifest_path.display()),
+                    )
+                })?
+            }
+            None => toml::Table::new(),
         };
         let tools = doc
             .entry("tools".to_string())
@@ -257,26 +389,51 @@ impl Evaluator {
             ));
         };
         tools.insert(tool.clone(), toml::Value::String(ver.clone()));
-        self.fs
-            .write(&manifest_path, doc.to_string().as_bytes())
+        let manifest_text = doc.to_string();
+        if manifest_text.len() > shoal_reef::REEF_MANIFEST_MAX_BYTES {
+            return Err(ErrorVal::new(
+                "reef_provider",
+                format!(
+                    "updated manifest {} exceeds the {}-byte limit",
+                    manifest_path.display(),
+                    shoal_reef::REEF_MANIFEST_MAX_BYTES
+                ),
+            ));
+        }
+        self.host
+            .fs
+            .atomic_replace(&manifest_path, manifest_text.as_bytes())
             .map_err(|e| ErrorVal::new("reef_provider", format!("writing manifest: {e}")))?;
 
         // Re-discover so the fresh constraint is in scope, then lock it.
-        self.reef_chain = None;
+        self.exec.reef.chain = None;
         let chain = self.reef_chain_snapshot();
         let resolver = self.reef_resolver();
-        let mut lock = self.reef_lock.clone();
+        let mut lock = self.exec.reef.lock.clone();
         let mut r = Record::new();
         r.insert("added".into(), Value::Str(format!("{tool}@{ver}")));
         r.insert("manifest".into(), Value::Path(manifest_path.clone()));
-        match resolver.refresh_lock(&tool, &chain, &mut lock, &mut |_| {}) {
-            Ok(res) => {
-                self.reef_lock = lock;
-                self.persist_reef_lock();
-                r.insert("version".into(), Value::Str(res.version.to_string()));
-                r.insert("path".into(), Value::Path(res.path.clone()));
-                r.insert("locked".into(), Value::Bool(true));
-            }
+        let provider_context = self.reef_provider_context(chain.cwd.clone());
+        match resolver.refresh_lock_with_probe_context(
+            &tool,
+            &chain,
+            &mut lock,
+            &mut |_| {},
+            &mut |candidate| self.reef_probe_guard(candidate),
+            &provider_context,
+        ) {
+            Ok(res) => match self.persist_reef_lock_value(&lock) {
+                Ok(()) => {
+                    self.exec.reef.lock = lock;
+                    r.insert("version".into(), Value::Str(res.version.to_string()));
+                    r.insert("path".into(), Value::Path(res.path.clone()));
+                    r.insert("locked".into(), Value::Bool(true));
+                }
+                Err(error) => {
+                    r.insert("locked".into(), Value::Bool(false));
+                    r.insert("note".into(), Value::Str(error.to_string()));
+                }
+            },
             Err(e) => {
                 // The manifest edit stands; the lock could not be written.
                 r.insert("locked".into(), Value::Bool(false));
@@ -295,25 +452,35 @@ impl Evaluator {
                 "reef lock: no manifest in scope",
             ));
         }
-        let mut names: Vec<String> = Vec::new();
-        for scope in &chain.scopes {
-            for tool in scope.manifest.tools.keys() {
-                if !names.contains(tool) {
-                    names.push(tool.clone());
-                }
-            }
-        }
-        names.sort();
+        let names = constrained_tool_names(&chain)?;
         let resolver = self.reef_resolver();
-        let mut lock = self.reef_lock.clone();
-        let mut rows = Vec::new();
+        let mut lock = self.exec.reef.lock.clone();
+        let mut rows = OutputValues::new();
+        let provider_context = self.reef_provider_context(chain.cwd.clone());
         for name in names {
             let mut r = Record::new();
             r.insert("name".into(), Value::Str(name.clone()));
             let res = if refresh {
-                resolver.refresh_lock(&name, &chain, &mut lock, &mut |_| {})
+                resolver.refresh_lock_with_probe_context(
+                    &name,
+                    &chain,
+                    &mut lock,
+                    &mut |_| {},
+                    &mut |candidate| self.reef_probe_guard(candidate),
+                    &provider_context,
+                )
             } else {
-                resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {})
+                resolver.resolve_with_probe_context(
+                    &name,
+                    &chain,
+                    &mut lock,
+                    Policy::Interactive,
+                    &mut |_| {},
+                    ProbeExecution {
+                        guard: &mut |candidate| self.reef_probe_guard(candidate),
+                        context: &provider_context,
+                    },
+                )
             };
             match res {
                 Ok(res) => {
@@ -326,27 +493,34 @@ impl Evaluator {
                     r.insert("error".into(), Value::Str(e.code_str().to_string()));
                 }
             }
-            rows.push(r);
+            rows.push(table_record(r))?;
         }
-        self.reef_lock = lock;
-        self.persist_reef_lock();
-        Ok(Value::Table(rows))
+        self.persist_reef_lock_value(&lock)?;
+        self.exec.reef.lock = lock;
+        Ok(rows.finish_table())
     }
 
     /// `reef fetch <tool>`: delegate to the tool's provider(s); may no-op when
     /// no provider can install.
     fn reef_fetch(&mut self, tool: Option<&str>) -> VResult<Value> {
         let tool = tool.ok_or_else(|| ErrorVal::arg_error("reef fetch expects a tool name"))?;
+        self.reef_fetch_guard()?;
         let chain = self.reef_chain_snapshot();
-        let constraint = chain
+        let requirement = chain
             .nearest_for(tool)
-            .map(|s| s.manifest.tools[tool].constraint.clone())
+            .map(|scope| &scope.manifest.tools[tool]);
+        let constraint = requirement
+            .map(|requirement| requirement.constraint.clone())
             .unwrap_or(shoal_reef::Constraint::Any);
+        let provider_pin = requirement.and_then(|requirement| requirement.provider.as_deref());
         let resolver = self.reef_resolver();
-        let ctx = ProviderCtx::new(self.cwd.clone());
+        let ctx = self.reef_provider_context(self.exec.shell.cwd.clone());
         let mut r = Record::new();
         r.insert("tool".into(), Value::Str(tool.to_string()));
         for provider in resolver.providers() {
+            if provider_pin.is_some_and(|pin| provider.name() != pin) {
+                continue;
+            }
             match provider.fetch(tool, &constraint, &ctx) {
                 Some(Ok(cand)) => {
                     r.insert("fetched".into(), Value::Bool(true));
@@ -366,7 +540,10 @@ impl Evaluator {
         r.insert("fetched".into(), Value::Bool(false));
         r.insert(
             "note".into(),
-            Value::Str("no provider can fetch this tool".into()),
+            Value::Str(match provider_pin {
+                Some(pin) => format!("pinned provider `{pin}` cannot fetch this tool"),
+                None => "no provider can fetch this tool".into(),
+            }),
         );
         Ok(Value::Record(r))
     }
@@ -390,24 +567,26 @@ impl Evaluator {
     ///   forgot the project pin exists.
     fn reef_doctor(&mut self) -> VResult<Value> {
         let chain = self.reef_chain_snapshot();
-        let mut names: Vec<String> = Vec::new();
-        for scope in &chain.scopes {
-            for tool in scope.manifest.tools.keys() {
-                if !names.contains(tool) {
-                    names.push(tool.clone());
-                }
-            }
+        if let Some(error) = self.exec.reef.lock_load_error.clone() {
+            let mut row = Record::new();
+            row.insert("name".into(), Value::Str("reef.lock".into()));
+            row.insert("check".into(), Value::Str("lockfile".into()));
+            row.insert("status".into(), Value::Str("invalid".into()));
+            row.insert("note".into(), Value::Str(error));
+            let mut rows = OutputValues::new();
+            rows.push(table_record(row))?;
+            return Ok(rows.finish_table());
         }
-        names.sort();
+        let names = constrained_tool_names(&chain)?;
 
         let hashes = HashCache::new();
-        let mut rows = Vec::new();
+        let mut rows = OutputValues::new();
 
         for name in &names {
             let mut r = Record::new();
             r.insert("name".into(), Value::Str(name.clone()));
             r.insert("check".into(), Value::Str("drift".into()));
-            match self.reef_lock.get(name) {
+            match self.exec.reef.lock.get(name) {
                 Some(entry) => {
                     let current = hashes.hash_file(&entry.path).ok();
                     let drifted = current.as_deref() != Some(entry.blake3.as_str());
@@ -432,9 +611,9 @@ impl Evaluator {
                     r.insert("current_hash8".into(), Value::Null);
                 }
             }
-            rows.push(r);
+            rows.push(table_record(r))?;
 
-            if let Some(entry) = self.reef_lock.get(name)
+            if let Some(entry) = self.exec.reef.lock.get(name)
                 && let Some(ambient) = self.ambient_which(name)
                 && ambient != entry.path
             {
@@ -444,11 +623,11 @@ impl Evaluator {
                 s.insert("status".into(), Value::Str("shadowed".into()));
                 s.insert("path".into(), Value::Path(entry.path.clone()));
                 s.insert("ambient_path".into(), Value::Path(ambient));
-                rows.push(s);
+                rows.push(table_record(s))?;
             }
         }
 
-        for (name, entry) in &self.reef_lock.tools {
+        for (name, entry) in &self.exec.reef.lock.tools {
             if names.contains(name) {
                 continue;
             }
@@ -457,40 +636,103 @@ impl Evaluator {
             r.insert("check".into(), Value::Str("orphan".into()));
             r.insert("status".into(), Value::Str("orphan".into()));
             r.insert("path".into(), Value::Path(entry.path.clone()));
-            rows.push(r);
+            rows.push(table_record(r))?;
         }
 
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 }
 
+fn read_optional_reef_manifest(fs: &dyn Fs, path: &Path) -> VResult<Option<String>> {
+    let reader = match fs.open_read(path) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ErrorVal::new(
+                "reef_provider",
+                format!("reading manifest {}: {error}", path.display()),
+            ));
+        }
+    };
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    reader
+        .take((shoal_reef::REEF_MANIFEST_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ErrorVal::new(
+                "reef_provider",
+                format!("reading manifest {}: {error}", path.display()),
+            )
+        })?;
+    if bytes.len() > shoal_reef::REEF_MANIFEST_MAX_BYTES {
+        return Err(ErrorVal::new(
+            "reef_provider",
+            format!(
+                "manifest {} exceeds the {}-byte limit",
+                path.display(),
+                shoal_reef::REEF_MANIFEST_MAX_BYTES
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| {
+        ErrorVal::new(
+            "reef_provider",
+            format!("manifest {} is not valid UTF-8", path.display()),
+        )
+    })
+}
+
 /// Map a resolved [`ResolutionReport`] to the record `which` renders (site/content/internals/reef-resolution.md).
-fn report_to_record(report: &ResolutionReport) -> Value {
+fn report_to_record(report: &ResolutionReport) -> VResult<Value> {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(report.name.clone()));
+    r.insert("source".into(), Value::Str("external".into()));
+    r.insert(
+        "reason".into(),
+        Value::Str(CommandSource::External.reason().into()),
+    );
     r.insert("scope".into(), Value::Str(report.scope.clone()));
     r.insert("constraint".into(), Value::Str(report.constraint.clone()));
     r.insert("version".into(), Value::Str(report.version.clone()));
     r.insert("path".into(), Value::Path(report.path.clone()));
     r.insert("hash8".into(), Value::Str(short_hash(&report.hash)));
+    r.insert("hash".into(), Value::Str(report.hash.clone()));
     r.insert("provider".into(), Value::Str(report.provider.clone()));
-    let chain = report
-        .chain
-        .iter()
-        .map(|d| {
-            let mut row = Record::new();
-            row.insert("scope".into(), Value::Str(d.scope.clone()));
-            row.insert("source".into(), Value::Path(d.source.clone()));
-            row.insert(
-                "constraint".into(),
-                d.constraint.clone().map(Value::Str).unwrap_or(Value::Null),
-            );
-            row.insert("outcome".into(), Value::Str(d.outcome.clone()));
-            row
-        })
-        .collect();
-    r.insert("chain".into(), Value::Table(chain));
-    Value::Record(r)
+    let mut chain = OutputValues::new();
+    for decision in &report.chain {
+        let mut row = Record::new();
+        row.insert("scope".into(), Value::Str(decision.scope.clone()));
+        row.insert("source".into(), Value::Path(decision.source.clone()));
+        row.insert(
+            "constraint".into(),
+            decision
+                .constraint
+                .clone()
+                .map(Value::Str)
+                .unwrap_or(Value::Null),
+        );
+        row.insert("outcome".into(), Value::Str(decision.outcome.clone()));
+        chain.push(table_record(row))?;
+    }
+    r.insert("chain".into(), chain.finish_table());
+    Ok(Value::Record(r))
+}
+
+fn constrained_tool_names(chain: &ScopeChain) -> VResult<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    let mut budget = OutputBudget::new();
+    for scope in &chain.scopes {
+        for tool in scope.manifest.tools.keys() {
+            if seen.insert(tool.as_str()) {
+                let value = Value::Str(tool.clone());
+                budget.admit_value(&value)?;
+                names.push(tool.clone());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// The `which` record for a resolver error that is NOT a plain "not found"
@@ -501,6 +743,11 @@ fn report_to_record(report: &ResolutionReport) -> Value {
 fn unresolved_which_record(name: &str, e: &ReefError, chain: &ScopeChain) -> Value {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(name.to_string()));
+    r.insert("source".into(), Value::Str("external".into()));
+    r.insert(
+        "reason".into(),
+        Value::Str(CommandSource::External.reason().into()),
+    );
     let constraint = chain
         .nearest_for(name)
         .map(|s| s.manifest.tools[name].constraint.to_string())
@@ -513,6 +760,7 @@ fn unresolved_which_record(name: &str, e: &ReefError, chain: &ScopeChain) -> Val
     r.insert("version".into(), Value::Null);
     r.insert("path".into(), Value::Null);
     r.insert("hash8".into(), Value::Null);
+    r.insert("hash".into(), Value::Null);
     r.insert("provider".into(), Value::Null);
     r.insert("chain".into(), Value::Table(Vec::new()));
     // The real error message (e.g. reef_drift's old/new hashes, reef_conflict's
@@ -526,14 +774,28 @@ fn unresolved_which_record(name: &str, e: &ReefError, chain: &ScopeChain) -> Val
 }
 
 /// The minimal `which` record for an ambient PATH hit (no manifest in scope).
-fn minimal_which_record(name: &str, path: &Path) -> Value {
+fn minimal_which_record(name: &str, path: &Path, hash: Option<&str>) -> Value {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(name.to_string()));
+    r.insert("source".into(), Value::Str("external".into()));
+    r.insert(
+        "reason".into(),
+        Value::Str(CommandSource::External.reason().into()),
+    );
     r.insert("scope".into(), Value::Str("ambient".into()));
     r.insert("constraint".into(), Value::Str("*".into()));
     r.insert("version".into(), Value::Str("unknown".into()));
     r.insert("path".into(), Value::Path(path.to_path_buf()));
-    r.insert("hash8".into(), Value::Null);
+    r.insert(
+        "hash8".into(),
+        hash.map(|value| Value::Str(short_hash(value)))
+            .unwrap_or(Value::Null),
+    );
+    r.insert(
+        "hash".into(),
+        hash.map(|value| Value::Str(value.to_string()))
+            .unwrap_or(Value::Null),
+    );
     r.insert("provider".into(), Value::Str("ambient".into()));
     r.insert("chain".into(), Value::Table(Vec::new()));
     Value::Record(r)
@@ -557,321 +819,5 @@ fn reef_value_word(v: &Value) -> VResult<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Run `src` in a fresh `Evaluator` rooted at `cwd`, returning the
-    /// resolution/health record `which`/`reef` carry as an outcome's
-    /// `.parsed` value (mirrors `crates/shoal-eval/tests/reef_integration.rs`'s
-    /// own unwrap pattern).
-    fn parsed(cwd: &Path, src: &str) -> Value {
-        let mut ev = Evaluator::new(cwd.to_path_buf());
-        let out = ev
-            .eval_program(&shoal_syntax::parse(src).unwrap())
-            .unwrap_or_else(|e| panic!("{src}: {e}"));
-        let Value::Outcome(o) = out else {
-            panic!("{src}: expected an outcome, got {out:?}")
-        };
-        o.parsed
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| panic!("{src}: outcome carried no parsed value"))
-    }
-
-    /// Fix 2: two scopes constraining `faketool` incompatibly is a pure
-    /// manifest-chain decision (site/content/internals/reef-resolution.md) — no real tool install needed, so
-    /// this doesn't need a fixture resolver at all. Before the fix, `which`'s
-    /// `Err(_)` arm swallowed this and reported a bare ambient/null guess.
-    #[test]
-    fn which_surfaces_conflict_instead_of_ambient_fallback() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join(".reef.toml"),
-            "[tools]\nfaketool = \"18\"\n",
-        )
-        .unwrap();
-        let sub = root.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join(".reef.toml"), "[tools]\nfaketool = \"22\"\n").unwrap();
-
-        let Value::Record(r) = parsed(&sub, "which faketool") else {
-            panic!("expected a record")
-        };
-        assert_eq!(
-            r.get("scope"),
-            Some(&Value::Str("unresolved: reef_conflict".into()))
-        );
-        assert!(
-            matches!(r.get("note"), Some(Value::Str(s)) if s.contains("18") && s.contains("22")),
-            "note should cite both conflicting constraints, got {:?}",
-            r.get("note")
-        );
-    }
-
-    /// Fix 2: a valid-but-drifted lock entry (hand-written, pointing at a
-    /// fixture file whose content doesn't match the recorded hash) is a pure
-    /// function of the lock + on-disk bytes — no real provider/tool needed,
-    /// since a valid lock entry short-circuits `resolve()` before any
-    /// provider is ever consulted.
-    #[test]
-    fn which_surfaces_drift_instead_of_ambient_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".reef.toml"), "[tools]\nfaketool = \"*\"\n").unwrap();
-        let bin = dir.path().join("fakebin");
-        std::fs::write(&bin, b"original-bytes").unwrap();
-        std::fs::write(
-            dir.path().join("reef.lock"),
-            format!(
-                "[tool.faketool]\nname = \"faketool\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"{}\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n",
-                bin.display()
-            ),
-        )
-        .unwrap();
-
-        let Value::Record(r) = parsed(dir.path(), "which faketool") else {
-            panic!("expected a record")
-        };
-        assert_eq!(
-            r.get("scope"),
-            Some(&Value::Str("unresolved: reef_drift".into()))
-        );
-    }
-
-    /// Fix 4: `reef doctor`'s drift check, same fixture shape as the `which`
-    /// drift test above.
-    #[test]
-    fn reef_doctor_flags_drift() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".reef.toml"), "[tools]\nfaketool = \"*\"\n").unwrap();
-        let bin = dir.path().join("fakebin");
-        std::fs::write(&bin, b"original-bytes").unwrap();
-        std::fs::write(
-            dir.path().join("reef.lock"),
-            format!(
-                "[tool.faketool]\nname = \"faketool\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"{}\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n",
-                bin.display()
-            ),
-        )
-        .unwrap();
-
-        let Value::Table(rows) = parsed(dir.path(), "reef doctor") else {
-            panic!("expected a table")
-        };
-        let drift = rows
-            .iter()
-            .find(|r| r.get("check") == Some(&Value::Str("drift".into())))
-            .expect("a drift row is present");
-        assert_eq!(drift.get("name"), Some(&Value::Str("faketool".into())));
-        assert_eq!(drift.get("status"), Some(&Value::Str("drift".into())));
-    }
-
-    /// Fix 4: an orphan lock entry — `reef.lock` remembers `ghosttool`, but no
-    /// manifest in scope mentions it anymore.
-    #[test]
-    fn reef_doctor_flags_orphan_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".reef.toml"), "[tools]\nsh = \"*\"\n").unwrap();
-        std::fs::write(
-            dir.path().join("reef.lock"),
-            "[tool.ghosttool]\nname = \"ghosttool\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"/nonexistent/ghosttool\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n",
-        )
-        .unwrap();
-
-        let Value::Table(rows) = parsed(dir.path(), "reef doctor") else {
-            panic!("expected a table")
-        };
-        let orphan = rows
-            .iter()
-            .find(|r| r.get("check") == Some(&Value::Str("orphan".into())))
-            .expect("an orphan row is present");
-        assert_eq!(orphan.get("name"), Some(&Value::Str("ghosttool".into())));
-    }
-
-    /// Fix 4: shadowed-ambient — `sh` is locked to a fixture path, but the
-    /// REAL ambient `sh` (guaranteed present on any POSIX host, same
-    /// assumption the rest of this corpus/test suite already makes) resolves
-    /// to a different binary.
-    #[test]
-    fn reef_doctor_flags_shadowed_ambient() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".reef.toml"), "[tools]\nsh = \"*\"\n").unwrap();
-        let fake = dir.path().join("fake-sh");
-        std::fs::write(&fake, b"not a real shell").unwrap();
-        std::fs::write(
-            dir.path().join("reef.lock"),
-            format!(
-                "[tool.sh]\nname = \"sh\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"{}\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n",
-                fake.display()
-            ),
-        )
-        .unwrap();
-
-        let Value::Table(rows) = parsed(dir.path(), "reef doctor") else {
-            panic!("expected a table")
-        };
-        let shadowed = rows
-            .iter()
-            .find(|r| r.get("check") == Some(&Value::Str("shadowed_ambient".into())))
-            .expect("a shadowed_ambient row is present");
-        assert_eq!(shadowed.get("name"), Some(&Value::Str("sh".into())));
-    }
-
-    /// The manifest filenames `ScopeChain::discover` (site/content/internals/reef-resolution.md) looks
-    /// for at every directory on its walk from `cwd` up to the filesystem
-    /// root.
-    const REEF_MANIFEST_NAMES: &[&str] =
-        &[".reef.toml", "mise.toml", ".mise.toml", ".tool-versions"];
-
-    /// `reef_doctor_empty_scope_is_empty_table_not_error` asserts the
-    /// "genuinely nothing constrains anything anywhere" invariant — but
-    /// `ScopeChain::discover` walks from `dir` all the way to the real
-    /// filesystem root, including the shared OS temp dir every
-    /// `tempfile::tempdir()` nests under. That walk is only actually empty
-    /// when no ancestor directory happens to contain a
-    /// `.reef.toml`/`mise.toml`/`.mise.toml`/`.tool-versions` — true on a
-    /// clean host, but not something this test can force from Rust alone
-    /// (fully bounding the walk needs a root/boundary knob on
-    /// `ScopeChain::discover` itself, a `shoal-reef` source change). Rather
-    /// than let ambient contamination surface as a confusing generic
-    /// `assertion failed` a few lines down, fail loudly here with a precise
-    /// pointer at the offending file, so it reads as "environmental
-    /// contamination" (fix your host / clean the shared tempdir) rather
-    /// than "reef regressed".
-    fn panic_if_ancestor_reef_pollution(dir: &Path) {
-        let mut cur = Some(dir);
-        while let Some(d) = cur {
-            for name in REEF_MANIFEST_NAMES {
-                let candidate = d.join(name);
-                if candidate.exists() {
-                    panic!(
-                        "ambient reef-manifest pollution detected above this test's own \
-                         tempdir: {candidate:?} exists and was NOT created by this test. \
-                         ScopeChain::discover (site/content/internals/reef-resolution.md) walks from cwd to the \
-                         filesystem root, so this file makes the scope chain non-empty and \
-                         breaks this test's \"nothing constrains anything\" premise. This is \
-                         environmental contamination (e.g. a stray manifest left in a shared \
-                         /tmp by an unrelated manual `reef`/`mise` repro), not a product \
-                         regression — remove the file and re-run."
-                    );
-                }
-            }
-            cur = d.parent();
-        }
-    }
-
-    /// `reef doctor` with no manifest in scope is a clean, empty table — not
-    /// an error (unlike `reef lock`, a health check has nothing to say about
-    /// nothing).
-    #[test]
-    fn reef_doctor_empty_scope_is_empty_table_not_error() {
-        let dir = tempfile::tempdir().unwrap();
-        panic_if_ancestor_reef_pollution(dir.path());
-        let Value::Table(rows) = parsed(dir.path(), "reef doctor") else {
-            panic!("expected a table")
-        };
-        assert!(rows.is_empty());
-    }
-
-    /// Item 1 — the footgun scenario: a MALFORMED `cwd/.reef.toml` under a VALID
-    /// ancestor `.reef.toml`. `reef add` must surface the LOCAL parse error and
-    /// leave the ancestor's manifest byte-for-byte untouched. Before the fix,
-    /// `ScopeChain::discover` silently skipped the broken local file, so the
-    /// chain's nearest parsed `Reef` scope was the ANCESTOR and `reef add`
-    /// silently mutated it — hiding the local parse error entirely.
-    #[test]
-    fn reef_add_surfaces_local_parse_error_not_ancestor_write() {
-        let root = tempfile::tempdir().unwrap();
-        let ancestor = root.path().join(".reef.toml");
-        let ancestor_text = "[tools]\nnode = \"18\"\n";
-        std::fs::write(&ancestor, ancestor_text).unwrap();
-        let sub = root.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let local = sub.join(".reef.toml");
-        let local_text = "[tools\nfaketool = "; // malformed TOML
-        std::fs::write(&local, local_text).unwrap();
-
-        let mut ev = Evaluator::new(sub.clone());
-        let err = ev
-            .eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
-            .expect_err("a malformed local manifest must surface a parse error");
-        assert_eq!(err.code, "reef_provider");
-        assert!(
-            err.msg.contains(&local.display().to_string()),
-            "the parse error must name the LOCAL manifest, got: {}",
-            err.msg
-        );
-        // The ancestor manifest is untouched — no silent write one dir up.
-        assert_eq!(std::fs::read_to_string(&ancestor).unwrap(), ancestor_text);
-        // The malformed local file is left exactly as-is (we never wrote it).
-        assert_eq!(std::fs::read_to_string(&local).unwrap(), local_text);
-    }
-
-    /// Item 1 — the ordinary local case: a VALID `cwd/.reef.toml` under a valid
-    /// ancestor. `reef add` edits the LOCAL manifest; the ancestor is untouched.
-    #[test]
-    fn reef_add_edits_local_manifest_not_ancestor() {
-        let root = tempfile::tempdir().unwrap();
-        let ancestor = root.path().join(".reef.toml");
-        let ancestor_text = "[tools]\nnode = \"18\"\n";
-        std::fs::write(&ancestor, ancestor_text).unwrap();
-        let sub = root.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let local = sub.join(".reef.toml");
-        std::fs::write(&local, "[tools]\nrg = \"*\"\n").unwrap();
-
-        let mut ev = Evaluator::new(sub.clone());
-        // faketool never resolves, so the lock step no-ops — but the manifest
-        // EDIT still lands (the tool constraint is written before the lock).
-        ev.eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
-            .expect("reef add on a valid local manifest succeeds");
-
-        let written = std::fs::read_to_string(&local).unwrap();
-        let tbl: toml::Table = written.parse().unwrap();
-        assert_eq!(tbl["tools"]["faketool"].as_str(), Some("1"));
-        assert_eq!(tbl["tools"]["rg"].as_str(), Some("*"), "existing pin kept");
-        // The ancestor never sees the new pin.
-        assert_eq!(std::fs::read_to_string(&ancestor).unwrap(), ancestor_text);
-    }
-
-    /// Item 1 — no local manifest: `reef add` falls back to the chain's nearest
-    /// ancestor `.reef.toml` ("writes nearest manifest", site/content/internals/reef-resolution.md), since the
-    /// subdir has none of its own.
-    #[test]
-    fn reef_add_falls_back_to_nearest_ancestor_when_no_local() {
-        let root = tempfile::tempdir().unwrap();
-        let ancestor = root.path().join(".reef.toml");
-        std::fs::write(&ancestor, "[tools]\nnode = \"18\"\n").unwrap();
-        let sub = root.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-
-        let mut ev = Evaluator::new(sub.clone());
-        ev.eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
-            .expect("reef add falls back to the ancestor manifest");
-
-        // The ancestor gained the pin; no local manifest was created.
-        let tbl: toml::Table = std::fs::read_to_string(&ancestor).unwrap().parse().unwrap();
-        assert_eq!(tbl["tools"]["faketool"].as_str(), Some("1"));
-        assert_eq!(tbl["tools"]["node"].as_str(), Some("18"));
-        assert!(
-            !sub.join(".reef.toml").exists(),
-            "no local manifest should be created when an ancestor exists"
-        );
-    }
-
-    /// Item 1 — greenfield: no manifest anywhere in the chain → create a fresh
-    /// `cwd/.reef.toml`. (Guarded against ambient ancestor pollution above the
-    /// shared tempdir, which would otherwise steal the write as a "nearest
-    /// ancestor".)
-    #[test]
-    fn reef_add_creates_local_manifest_when_none_in_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        panic_if_ancestor_reef_pollution(dir.path());
-        let mut ev = Evaluator::new(dir.path().to_path_buf());
-        ev.eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
-            .expect("reef add creates a manifest when none exists");
-        let local = dir.path().join(".reef.toml");
-        assert!(local.exists(), "a fresh cwd/.reef.toml must be created");
-        let tbl: toml::Table = std::fs::read_to_string(&local).unwrap().parse().unwrap();
-        assert_eq!(tbl["tools"]["faketool"].as_str(), Some("1"));
-    }
-}
+#[path = "reef_builtins/tests.rs"]
+mod tests;

@@ -21,7 +21,7 @@ fn parse(src: &str) -> shoal_ast::Program {
 fn builtin_outcome_is_not_streamed() {
     let dir = tempfile::tempdir().unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     let out = ev.eval_program(&parse("echo hello")).expect("echo runs");
     let Value::Outcome(o) = out else {
         panic!("echo should yield an outcome, got {out:?}");
@@ -39,7 +39,7 @@ fn builtin_outcome_is_not_streamed() {
 fn captured_external_is_not_streamed() {
     let dir = tempfile::tempdir().unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     // Value position (bound with `let`) forces Capture mode even interactively.
     let out = ev
         .eval_program(&parse("let r = (/usr/bin/printf hi); r"))
@@ -58,7 +58,7 @@ fn captured_external_is_not_streamed() {
 fn ptytee_external_is_streamed() {
     let dir = tempfile::tempdir().unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     let out = ev
         .eval_program(&parse("/usr/bin/true"))
         .expect("external runs");
@@ -69,6 +69,24 @@ fn ptytee_external_is_streamed() {
         o.streamed,
         "a PtyTee external's bytes hit the tty, so it must be marked streamed"
     );
+}
+
+/// Finite input needs a real pipe so its end is an actual EOF. Even in an
+/// interactive statement, stream `.feed` must therefore use Capture rather
+/// than a PTY (whose master has no portable write-half-close).
+#[test]
+fn interactive_stream_feed_uses_capture_and_delivers_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    let out = ev
+        .eval_program(&parse(r#"["alpha", "beta"].stream().feed(/bin/cat)"#))
+        .expect("finite stream feed terminates");
+    let Value::Outcome(o) = out else {
+        panic!("expected a captured outcome, got {out:?}");
+    };
+    assert!(!o.streamed, "finite stdin forces pipe-based Capture mode");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "alpha\nbeta\n");
 }
 
 /// `exit <code>` surfaces the code via `take_exit`; eval never exits the
@@ -103,9 +121,9 @@ fn exit_halts_remaining_statements() {
     ev.eval_program(&parse("let a = 1; exit 4; let b = 2"))
         .unwrap();
     assert_eq!(ev.take_exit(), Some(4));
-    assert!(ev.env.get("a").is_some(), "statement before exit ran");
+    assert!(ev.env().get("a").is_some(), "statement before exit ran");
     assert!(
-        ev.env.get("b").is_none(),
+        ev.env().get("b").is_none(),
         "statement after exit must not run"
     );
 }

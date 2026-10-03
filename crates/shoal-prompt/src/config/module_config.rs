@@ -118,7 +118,6 @@ pub struct GitStatusModule {
     pub conflicted: String,
     pub stashed: String,
     pub stale_symbol: String,
-    pub engine: String,
 }
 impl Default for GitStatusModule {
     fn default() -> Self {
@@ -134,7 +133,6 @@ impl Default for GitStatusModule {
             conflicted: "=${count}".into(),
             stashed: "*${count}".into(),
             stale_symbol: "…".into(),
-            engine: "gix".into(),
         }
     }
 }
@@ -384,7 +382,6 @@ pub struct LanguageModule {
     pub ascii_symbol: String,
     pub style: String,
     pub when: String,
-    pub probe_ttl_s: u64,
     pub format: String,
 }
 impl Default for LanguageModule {
@@ -396,7 +393,6 @@ impl Default for LanguageModule {
             ascii_symbol: String::new(),
             style: "green".into(),
             when: "constrained".into(),
-            probe_ttl_s: 30,
             format: "${symbol}${version}".into(),
         }
     }

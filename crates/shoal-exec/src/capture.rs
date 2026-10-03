@@ -1,7 +1,6 @@
 //! Capture mode: piped stdout/stderr, no controlling tty, child in its own
 //! process group, both pipes drained concurrently (deadlock-free).
 
-use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::mem;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -9,10 +8,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelToken, ProcessGroupLease};
+use crate::capture_budget::{MemoryLease, SpillLease};
 use crate::status::decode_wait_status;
 use crate::watcher::spawn_cancel_watcher;
 use crate::which::resolve_program;
@@ -49,6 +50,14 @@ impl StreamingChild {
     /// Propagates OS errors from `waitpid`; these do not occur in normal
     /// operation. The child is reaped either way.
     pub fn wait(self, cancel: &CancelToken) -> io::Result<ExecResult> {
+        let (result, _process_group) = self.wait_retain_process_group(cancel);
+        result
+    }
+
+    fn wait_retain_process_group(
+        self,
+        cancel: &CancelToken,
+    ) -> (io::Result<ExecResult>, Option<ProcessGroupLease>) {
         let StreamingChild {
             stdout,
             stderr,
@@ -57,7 +66,9 @@ impl StreamingChild {
         } = self;
         drop(stdout);
         drop(stderr);
-        inner.wait_reap(cancel)
+        let result = inner.wait_reap(cancel);
+        let process_group = inner.process_group.take();
+        (result, process_group)
     }
 }
 
@@ -74,6 +85,7 @@ struct StreamInner {
     /// What [`crate::sandbox::apply`] actually did before this child's exec,
     /// if `ExecSpec::sandbox` was set. Carried through to [`ExecResult`].
     enforcement: Option<shoal_leash::EnforcementStatus>,
+    process_group: Option<ProcessGroupLease>,
 }
 
 impl StreamInner {
@@ -149,7 +161,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
         ));
     }
     let enforcement = crate::sandbox::apply(&mut spec)?;
-    let program = resolve_program(&spec.argv, &spec.env)?;
+    let program = resolve_program(&spec.argv, &spec.env, &spec.cwd)?;
     let mut cmd = Command::new(&program);
     cmd.args(&spec.argv[1..]);
     cmd.current_dir(&spec.cwd);
@@ -159,6 +171,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
     cmd.stderr(Stdio::piped());
 
     let mut stdin_bytes = None;
+    let mut stdin_stream = None;
     match spec.stdin {
         StdinSpec::Null => {
             cmd.stdin(Stdio::null());
@@ -172,6 +185,10 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
         }
         StdinSpec::File(p) => {
             cmd.stdin(Stdio::from(std::fs::File::open(&p)?));
+        }
+        StdinSpec::Stream(stream) => {
+            cmd.stdin(Stdio::piped());
+            stdin_stream = Some(stream.take()?);
         }
     }
 
@@ -192,7 +209,9 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
     let mut child = cmd.spawn()?;
     let pid = child.id();
     let pgid = pid as libc::pid_t;
+    let process_group = cancel.register_process_group(pgid);
 
+    let done = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     if let Some(bytes) = stdin_bytes {
         let mut sink = child.stdin.take().expect("stdin was configured as piped");
@@ -202,7 +221,24 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
         }));
     }
 
-    let done = Arc::new(AtomicBool::new(false));
+    if let Some(rx) = stdin_stream {
+        let mut sink = child.stdin.take().expect("stdin was configured as piped");
+        let child_done = done.clone();
+        threads.push(thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(chunk) => {
+                        if sink.write_all(&chunk).is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) if !child_done.load(Ordering::SeqCst) => {}
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }));
+    }
+
     let claimed = Arc::new(AtomicBool::new(false));
     threads.push(spawn_cancel_watcher(
         pgid,
@@ -227,6 +263,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
             threads,
             reaped: false,
             enforcement,
+            process_group: Some(process_group),
         },
     })
 }
@@ -251,15 +288,40 @@ pub(crate) fn run_capture(spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
     let mut child = spawn_capture(spec, cancel)?;
     let out = mem::replace(&mut child.stdout, Box::new(io::empty()));
     let err = mem::replace(&mut child.stderr, Box::new(io::empty()));
-    let t_out = thread::spawn(move || drain_stdout(out, cap, spill, spill_cap));
-    let t_err = thread::spawn(move || drain_capped(err, cap));
-    let mut res = child.wait(cancel)?;
+    let t_out = match thread::Builder::new()
+        .name("shoal-capture-stdout".into())
+        .spawn(move || drain_stdout(out, cap, spill, spill_cap))
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(child);
+            return Err(error);
+        }
+    };
+    let t_err = match thread::Builder::new()
+        .name("shoal-capture-stderr".into())
+        .spawn(move || drain_capped(err, cap))
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(child);
+            let _ = t_out.join();
+            return Err(error);
+        }
+    };
+    // Join both readers even if waiting fails; otherwise their reservations,
+    // descriptors, or an in-progress spill could outlive this operation.
+    // Keep the process-group lease until stdout/stderr descendants have also
+    // closed and every helper has joined. The group remains task-controllable
+    // during this post-leader drain window.
+    let (wait_result, _process_group) = child.wait_retain_process_group(cancel);
     let out = t_out.join().unwrap_or_else(|_| DrainOut {
         buf: Vec::new(),
         spill: None,
-        truncated: false,
+        truncated: true,
     });
-    let (stderr, err_trunc) = t_err.join().unwrap_or_default();
+    let (stderr, err_trunc) = t_err.join().unwrap_or_else(|_| (Vec::new(), true));
+    let mut res = wait_result?;
     res.stdout = out.buf;
     res.stderr = stderr;
     res.truncated = out.truncated || err_trunc;
@@ -271,28 +333,58 @@ pub(crate) fn run_capture(spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
 /// cap (draining and discarding the overflow) so the child never blocks on a
 /// full pipe; the returned flag is `true` when any byte was dropped.
 fn drain_capped(mut r: Box<dyn Read + Send>, cap: usize) -> (Vec<u8>, bool) {
+    let mut lease = MemoryLease::empty();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 65536];
     let mut truncated = false;
+    let mut retaining = true;
     loop {
         match r.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                if buf.len() < cap {
-                    let take = (cap - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
+                if retaining && buf.len() < cap {
+                    let take = append_admitted_prefix(&mut buf, &mut lease, &chunk[..n], cap);
                     if take < n {
                         truncated = true;
+                        // Never append later bytes after a denied byte: the
+                        // resident result must remain an honest prefix even if
+                        // aggregate capacity becomes available later.
+                        retaining = false;
                     }
                 } else {
                     truncated = true;
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => {
+                truncated = true;
+                break;
+            }
         }
     }
     (buf, truncated)
+}
+
+/// Append as much of `data` as both the per-stream and process-wide resident
+/// budgets admit. Admission precedes allocation; an allocation failure rolls
+/// the reservation back and is reported as a zero-byte append.
+fn append_admitted_prefix(
+    buf: &mut Vec<u8>,
+    lease: &mut MemoryLease,
+    data: &[u8],
+    cap: usize,
+) -> usize {
+    let requested = cap.saturating_sub(buf.len()).min(data.len());
+    let admitted = lease.reserve_up_to(requested);
+    if admitted == 0 {
+        return 0;
+    }
+    if buf.try_reserve_exact(admitted).is_err() {
+        lease.rollback(admitted);
+        return 0;
+    }
+    buf.extend_from_slice(&data[..admitted]);
+    admitted
 }
 
 /// Outcome of draining a value-position stdout stream.
@@ -314,10 +406,20 @@ struct DrainOut {
 ///
 /// Reading always continues to EOF so the child never blocks on a full pipe.
 fn drain_stdout(
+    r: Box<dyn Read + Send>,
+    cap: usize,
+    spill: Option<SpillConfig>,
+    spill_cap: u64,
+) -> DrainOut {
+    drain_stdout_with(r, cap, spill, spill_cap, SpillSink::create)
+}
+
+fn drain_stdout_with(
     mut r: Box<dyn Read + Send>,
     cap: usize,
     spill: Option<SpillConfig>,
     spill_cap: u64,
+    mut create_sink: impl FnMut(&std::path::Path) -> io::Result<SpillSink>,
 ) -> DrainOut {
     // No spill requested → exact pre-spill behavior.
     let Some(spill) = spill else {
@@ -329,6 +431,7 @@ fn drain_stdout(
         };
     };
 
+    let mut memory_lease = MemoryLease::empty();
     let mut preview = Vec::new();
     let mut chunk = [0u8; 65536];
     let mut hasher = blake3::Hasher::new();
@@ -337,39 +440,63 @@ fn drain_stdout(
     let mut total: u64 = 0; // bytes read from the child
     let mut stored: u64 = 0; // bytes written to the spill file (≤ spill_cap)
     let mut spill_truncated = false;
+    let mut read_failed = false;
+    let mut write_failed = false;
 
     loop {
         let n = match r.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
         };
         let data = &chunk[..n];
         // Grow the resident preview up to the RAM cap; remember how many of this
         // chunk's front bytes it absorbed so the spill doesn't double-write them.
-        let into_preview = if preview.len() < cap {
-            (cap - preview.len()).min(n)
+        let into_preview = if sink.is_none() && preview.len() < cap {
+            append_admitted_prefix(&mut preview, &mut memory_lease, data, cap)
         } else {
             0
         };
-        if into_preview > 0 {
-            preview.extend_from_slice(&data[..into_preview]);
-        }
-        total += n as u64;
+        total = match total.checked_add(n as u64) {
+            Some(total) => total,
+            None => {
+                spill_truncated = true;
+                u64::MAX
+            }
+        };
 
-        if sink.is_none() && total > cap as u64 {
+        if sink.is_none() && (total > cap as u64 || into_preview < n) {
             // First overflow: open the spill file and write the whole stream so
             // far. Everything before this chunk fit under the cap, so `preview`
             // holds it verbatim (the first `cap` bytes); the overflow tail is
             // this chunk's bytes past what the preview just absorbed. Together
             // they cover the stream from byte zero, so the hash is exact.
-            match SpillSink::create(&spill.dir) {
+            match create_sink(&spill.dir) {
                 Ok(mut s) => {
-                    let w1 = write_bounded(&mut s, &preview, spill_cap, &mut stored);
+                    let w1 = match write_bounded(&mut s, &preview, spill_cap, &mut stored) {
+                        Ok(written) => written,
+                        Err(_) => {
+                            write_failed = true;
+                            0
+                        }
+                    };
                     hasher.update(&preview[..w1]);
                     let tail = &data[into_preview..];
-                    let w2 = write_bounded(&mut s, tail, spill_cap, &mut stored);
+                    let w2 = if write_failed {
+                        0
+                    } else {
+                        match write_bounded(&mut s, tail, spill_cap, &mut stored) {
+                            Ok(written) => written,
+                            Err(_) => {
+                                write_failed = true;
+                                0
+                            }
+                        }
+                    };
                     hasher.update(&tail[..w2]);
                     if w1 < preview.len() || w2 < tail.len() {
                         spill_truncated = true;
@@ -385,12 +512,45 @@ fn drain_stdout(
         } else if let Some(s) = sink.as_mut() {
             // Sink already open before this chunk: the preview is full, so the
             // whole chunk is overflow.
-            let written = write_bounded(s, data, spill_cap, &mut stored);
+            let written = if write_failed {
+                0
+            } else {
+                match write_bounded(s, data, spill_cap, &mut stored) {
+                    Ok(written) => written,
+                    Err(_) => {
+                        write_failed = true;
+                        0
+                    }
+                }
+            };
             hasher.update(&data[..written]);
             if written < n {
                 spill_truncated = true;
             }
         }
+    }
+
+    if read_failed || write_failed {
+        // Dropping the sink removes its private temp file and returns all
+        // process-wide reservations. A read/write failure is never presented
+        // as a complete durable capture.
+        drop(sink);
+        return DrainOut {
+            buf: preview,
+            spill: None,
+            truncated: true,
+        };
+    }
+    if sink.is_some() && stored < preview.len() as u64 {
+        // A ref-backed value cannot honestly advertise a retained preview that
+        // is longer than its stored content. Aggregate/per-stream exhaustion
+        // before the preview is durable degrades to the RAM prefix instead.
+        drop(sink);
+        return DrainOut {
+            buf: preview,
+            spill: None,
+            truncated: true,
+        };
     }
 
     match sink {
@@ -402,12 +562,10 @@ fn drain_stdout(
                 truncated: false,
             }
         }
-        Some(mut s) => {
-            let ok = s.finish().is_ok();
-            if !ok {
+        Some(mut sink) => {
+            if sink.finish().is_err() {
                 // Flushing/closing the spill failed: don't hand back a partial
                 // file as durable. Fall back to the preview + truncated flag.
-                let _ = std::fs::remove_file(&s.path);
                 return DrainOut {
                     buf: preview,
                     spill: None,
@@ -415,15 +573,20 @@ fn drain_stdout(
                 };
             }
             let hash = hasher.finalize().to_hex().to_string();
+            let spill = match sink.into_spill(hash, stored, spill_truncated) {
+                Ok(spill) => spill,
+                Err(_) => {
+                    return DrainOut {
+                        buf: preview,
+                        spill: None,
+                        truncated: true,
+                    };
+                }
+            };
             DrainOut {
                 buf: preview,
-                spill: Some(CaptureSpill {
-                    path: s.path,
-                    hash,
-                    len: stored,
-                    truncated: spill_truncated,
-                }),
-                truncated: false,
+                spill: Some(spill),
+                truncated: spill_truncated,
             }
         }
     }
@@ -451,40 +614,61 @@ fn drain_rest_no_spill(mut r: Box<dyn Read + Send>, preview: Vec<u8>) -> DrainOu
 /// Write `data` to the spill sink, but never let `*stored` exceed `spill_cap`.
 /// Returns the number of bytes actually written (== the number that must be fed
 /// to the content hasher, so the hash addresses exactly the stored bytes).
-fn write_bounded(sink: &mut SpillSink, data: &[u8], spill_cap: u64, stored: &mut u64) -> usize {
+fn write_bounded(
+    sink: &mut SpillSink,
+    data: &[u8],
+    spill_cap: u64,
+    stored: &mut u64,
+) -> io::Result<usize> {
     let room = spill_cap.saturating_sub(*stored);
     if room == 0 {
-        return 0;
+        return Ok(0);
     }
-    let take = (room as usize).min(data.len());
-    // A write error stops storage (treated as cap reached) rather than aborting
-    // the drain — the child must still be drained to EOF.
-    if sink.write_all(&data[..take]).is_err() {
-        return 0;
+    let requested = room.min(data.len() as u64);
+    let reserved = sink
+        .lease
+        .as_mut()
+        .ok_or_else(|| io::Error::other("spill reservation already transferred"))?
+        .reserve_up_to(requested);
+    if reserved == 0 {
+        return Ok(0);
     }
-    *stored += take as u64;
-    take
+    let take = usize::try_from(reserved)
+        .map_err(|_| io::Error::other("spill reservation does not fit usize"))?
+        .min(data.len());
+    if let Err(error) = sink.write_all(&data[..take]) {
+        if let Some(lease) = sink.lease.as_mut() {
+            lease.rollback(reserved);
+        }
+        return Err(error);
+    }
+    *stored = stored.saturating_add(reserved);
+    Ok(take)
 }
 
 /// A blake3-addressed spill file being written. Buffered so the many small
 /// pipe-sized writes coalesce into large disk writes.
 struct SpillSink {
-    writer: BufWriter<File>,
-    path: PathBuf,
+    writer: BufWriter<Box<dyn Write + Send>>,
+    path: Option<PathBuf>,
+    lease: Option<SpillLease>,
 }
 
 impl SpillSink {
     fn create(dir: &std::path::Path) -> io::Result<SpillSink> {
+        let lease = SpillLease::acquire_file()
+            .ok_or_else(|| io::Error::other("active command spill file limit reached"))?;
         // A unique name in the caller's spill dir; the caller adopts/deletes it.
         let named = tempfile::Builder::new()
             .prefix("capture-spill-")
             .tempfile_in(dir)?;
-        let path = named.path().to_path_buf();
-        // Detach from tempfile's auto-delete: ownership passes to the caller.
-        let file = named.persist(&path).map_err(|e| e.error)?;
+        // `keep` transfers cleanup to this guard. The file is created with
+        // mode 0600 by tempfile and never preallocated or made sparse.
+        let (file, path) = named.keep().map_err(|error| error.error)?;
         Ok(SpillSink {
-            writer: BufWriter::new(file),
-            path,
+            writer: BufWriter::new(Box::new(file)),
+            path: Some(path),
+            lease: Some(lease),
         })
     }
 
@@ -495,151 +679,27 @@ impl SpillSink {
     fn finish(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
+
+    fn into_spill(mut self, hash: String, len: u64, truncated: bool) -> io::Result<CaptureSpill> {
+        let lease = self
+            .lease
+            .take()
+            .ok_or_else(|| io::Error::other("spill reservation already transferred"))?;
+        let path = self
+            .path
+            .take()
+            .ok_or_else(|| io::Error::other("spill sink path already transferred"))?;
+        Ok(CaptureSpill::new(path, hash, len, truncated, lease))
+    }
+}
+
+impl Drop for SpillSink {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A bounded producer emitting more than `cap` bytes fills the buffer
-    /// to exactly the cap and reports truncation — the buffer never grows past
-    /// the bound, so an unbounded child can't OOM the shell.
-    #[test]
-    fn drain_capped_stops_at_cap_and_flags_truncation() {
-        let cap = 4096;
-        let producer = vec![b'x'; cap + 5000];
-        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(producer));
-        let (buf, truncated) = drain_capped(r, cap);
-        assert_eq!(buf.len(), cap, "buffer must stop growing at the cap");
-        assert!(buf.iter().all(|&b| b == b'x'));
-        assert!(truncated, "dropping overflow must set the truncated flag");
-    }
-
-    /// Output at or under the cap is captured whole with no truncation flag.
-    #[test]
-    fn drain_capped_keeps_output_within_cap() {
-        let cap = 4096;
-        let producer = vec![b'y'; 1000];
-        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(producer));
-        let (buf, truncated) = drain_capped(r, cap);
-        assert_eq!(buf.len(), 1000);
-        assert!(!truncated);
-    }
-
-    /// Exactly-cap-sized output is not falsely flagged as truncated.
-    #[test]
-    fn drain_capped_exact_cap_is_not_truncated() {
-        let cap = 4096;
-        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(vec![b'z'; cap]));
-        let (buf, truncated) = drain_capped(r, cap);
-        assert_eq!(buf.len(), cap);
-        assert!(!truncated, "an exact fit is complete, not truncated");
-    }
-
-    /// site/content/internals/process-execution.md disk-spill: a stream past the RAM cap streams the FULL content to a
-    /// blake3-addressed file, keeps a bounded preview, and reports the true len
-    /// and hash — nothing is lost (contrast `drain_capped`, which drops it).
-    #[test]
-    fn drain_stdout_spills_full_stream_to_disk() {
-        let cap = 4096;
-        let dir = tempfile::tempdir().unwrap();
-        let payload = vec![b'x'; cap + 5000];
-        let expect_hash = blake3::hash(&payload).to_hex().to_string();
-        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(payload.clone()));
-        let out = drain_stdout(
-            r,
-            cap,
-            Some(SpillConfig {
-                dir: dir.path().to_path_buf(),
-            }),
-            1 << 30,
-        );
-        assert!(!out.truncated, "spilled output is preserved, not truncated");
-        assert_eq!(out.buf.len(), cap, "resident buffer is a bounded preview");
-        let spill = out.spill.expect("overflow must produce a spill");
-        assert_eq!(spill.len, payload.len() as u64, "spill len is the TRUE len");
-        assert!(!spill.truncated);
-        assert_eq!(spill.hash, expect_hash, "hash addresses the full content");
-        // The on-disk file is exactly the full stream.
-        let on_disk = std::fs::read(&spill.path).unwrap();
-        assert_eq!(on_disk, payload);
-        assert_eq!(blake3::hash(&on_disk).to_hex().to_string(), expect_hash);
-    }
-
-    /// Sub-cap output with a spill configured stays fully resident and never
-    /// touches disk — zero regression for the common case.
-    #[test]
-    fn drain_stdout_under_cap_stays_resident_no_spill() {
-        let cap = 4096;
-        let dir = tempfile::tempdir().unwrap();
-        let payload = vec![b'y'; 1000];
-        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(payload.clone()));
-        let out = drain_stdout(
-            r,
-            cap,
-            Some(SpillConfig {
-                dir: dir.path().to_path_buf(),
-            }),
-            1 << 30,
-        );
-        assert_eq!(out.buf, payload);
-        assert!(out.spill.is_none(), "sub-cap output must not spill");
-        assert!(!out.truncated);
-        // The spill dir stays empty (no file created).
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    /// A spill that itself exceeds `spill_cap` is bounded on disk too, and flags
-    /// its own truncation — `let x = (yes)` fills neither RAM nor disk.
-    #[test]
-    fn drain_stdout_spill_is_bounded_by_spill_cap() {
-        let cap = 1024;
-        let spill_cap = 8192u64;
-        let dir = tempfile::tempdir().unwrap();
-        let payload = vec![b'z'; 100_000];
-        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(payload));
-        let out = drain_stdout(
-            r,
-            cap,
-            Some(SpillConfig {
-                dir: dir.path().to_path_buf(),
-            }),
-            spill_cap,
-        );
-        let spill = out.spill.expect("overflow must produce a spill");
-        assert_eq!(spill.len, spill_cap, "disk is bounded by the spill cap");
-        assert!(spill.truncated, "hitting the spill cap flags truncation");
-        let on_disk = std::fs::read(&spill.path).unwrap();
-        assert_eq!(on_disk.len(), spill_cap as usize);
-        assert_eq!(spill.hash, blake3::hash(&on_disk).to_hex().to_string());
-    }
-
-    /// With no spill configured, stdout draining is byte-identical to the
-    /// pre-spill `drain_capped` behavior: bounded + flagged.
-    #[test]
-    fn drain_stdout_without_spill_matches_capped() {
-        let cap = 4096;
-        let payload = vec![b'x'; cap + 100];
-        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(payload));
-        let out = drain_stdout(r, cap, None, 1 << 30);
-        assert_eq!(out.buf.len(), cap);
-        assert!(out.truncated);
-        assert!(out.spill.is_none());
-    }
-
-    /// The configurable cap resolves (default or override) to a positive bound.
-    #[test]
-    fn capture_hard_cap_is_positive_and_overridable() {
-        assert!(crate::capture_hard_cap() > 0);
-        crate::set_capture_hard_cap(1234);
-        assert_eq!(crate::capture_hard_cap(), 1234);
-        crate::set_capture_hard_cap(0);
-        assert_eq!(
-            crate::capture_hard_cap(),
-            1,
-            "zero is clamped to a positive cap"
-        );
-        // Restore the resolved default so other tests in this binary are unaffected.
-        crate::set_capture_hard_cap(crate::DEFAULT_CAPTURE_HARD_CAP);
-    }
-}
+mod tests;

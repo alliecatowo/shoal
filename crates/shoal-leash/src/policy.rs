@@ -3,12 +3,20 @@
 //! [`crate::SandboxPolicy`] for one child spawn.
 
 use crate::effects::{Effect, Plan, Reversibility};
-use crate::enforce::{FsSandbox, NetPolicy, SandboxPolicy};
+use crate::enforce::{FsSandbox, NetPolicy, ProcessLimits, SandboxPolicy};
 use glob::Pattern;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+
+pub const POLICY_MAX_BYTES: usize = 1024 * 1024;
+pub const POLICY_MAX_NESTING: usize = 64;
+pub const POLICY_MAX_ASSIGNMENTS: usize = 8 * 1024;
+pub const POLICY_MAX_PRINCIPALS: usize = 256;
+pub const POLICY_MAX_GRANTS_PER_KIND: usize = 1024;
+pub const POLICY_MAX_GRANT_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -36,6 +44,7 @@ pub enum OpaqueMode {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalPolicy {
     #[serde(default, rename = "fs.read")]
     pub fs_read: Vec<String>,
@@ -61,6 +70,14 @@ pub struct PrincipalPolicy {
     pub journal_read: bool,
     #[serde(default)]
     pub time: bool,
+    /// Hard CPU-time ceiling inherited by each spawned process. Accounting is
+    /// per process, not aggregate across a descendant tree.
+    #[serde(default)]
+    pub process_cpu_seconds: Option<u64>,
+    /// Hard virtual-address-space ceiling inherited by each spawned process.
+    /// Accounting is per process, not an aggregate principal memory budget.
+    #[serde(default)]
+    pub process_memory_bytes: Option<u64>,
     #[serde(default)]
     pub auto_apply: AutoApply,
     #[serde(default)]
@@ -78,17 +95,20 @@ pub struct PrincipalPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
     principals: HashMap<String, PrincipalPolicy>,
+    fail_closed: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicyDoc {
     #[serde(default)]
     principal: HashMap<String, PrincipalPolicy>,
 }
 
 impl Policy {
-    pub fn from_toml(src: &str) -> Result<Self, toml::de::Error> {
-        let mut value: toml::Value = toml::from_str(src)?;
+    pub fn from_toml(src: &str) -> Result<Self, PolicyParseError> {
+        validate_policy_text(src)?;
+        let mut value: toml::Value = toml::from_str(src).map_err(PolicyParseError::toml)?;
         // TOML dotted keys such as `fs.read = [...]` deserialize as nested
         // tables. Flatten the policy namespaces into the wire field names.
         if let Some(principals) = value
@@ -104,14 +124,32 @@ impl Policy {
                 }
             }
         }
-        let doc: PolicyDoc = value.try_into()?;
+        let doc: PolicyDoc = value.try_into().map_err(PolicyParseError::toml)?;
+        validate_policy_doc(&doc)?;
         Ok(Self {
             principals: doc.principal,
+            fail_closed: false,
         })
     }
     pub fn load(path: &Path) -> Result<Self, PolicyLoadError> {
-        let src = fs::read_to_string(path).map_err(PolicyLoadError::Io)?;
-        Self::from_toml(&src).map_err(PolicyLoadError::Toml)
+        let metadata = fs::metadata(path).map_err(|source| PolicyLoadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(PolicyLoadError::NotFile {
+                path: path.to_path_buf(),
+            });
+        }
+        let file = fs::File::open(path).map_err(|source| PolicyLoadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let src = read_policy_utf8(path, file)?;
+        Self::from_toml(&src).map_err(|source| PolicyLoadError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
     pub fn principal(&self, name: &str) -> Option<&PrincipalPolicy> {
         self.principals.get(name)
@@ -130,11 +168,49 @@ impl Policy {
     /// gates on this predicate first and only hashes/evaluates a binary once a
     /// principal has actually opted into spawn pinning.
     pub fn spawn_pinning_active(&self, principal: &str) -> bool {
+        self.fail_closed
+            || self
+                .principal(principal)
+                .is_some_and(|p| !p.proc_spawn.is_empty())
+    }
+
+    /// Whether this principal asks Leash to restrict filesystem access.
+    /// This intentionally remains true when every configured root is missing:
+    /// a hermetic typo must be distinguishable from an unrestricted policy so
+    /// the spawn boundary can refuse instead of silently dropping the scope.
+    pub fn filesystem_scoping_active(&self, principal: &str) -> bool {
+        self.fail_closed
+            || self
+                .principal(principal)
+                .is_some_and(PrincipalPolicy::has_fs_scope)
+    }
+
+    /// Whether a network destination/listener allowlist is configured. Leash
+    /// can authorize declared network effects, but the OS backends can only
+    /// enforce coarse all-or-nothing denial, not hostname/port allowlists.
+    pub fn network_scoping_active(&self, principal: &str) -> bool {
+        self.fail_closed
+            || self
+                .principal(principal)
+                .is_some_and(|p| !p.net_connect.is_empty() || !p.net_listen.is_empty())
+    }
+
+    /// Whether this principal requires requested OS dimensions to be hard
+    /// guarantees rather than best-effort constraints.
+    pub fn hermetic_active(&self, principal: &str) -> bool {
+        self.fail_closed || self.principal(principal).is_some_and(|p| p.hermetic)
+    }
+
+    /// Whether this principal requests any inherited per-process ceiling.
+    pub fn process_limits_active(&self, principal: &str) -> bool {
         self.principal(principal)
-            .is_some_and(|p| !p.proc_spawn.is_empty())
+            .is_some_and(|p| p.process_cpu_seconds.is_some() || p.process_memory_bytes.is_some())
     }
 
     pub fn evaluate_effect(&self, principal: &str, effect: &Effect) -> Verdict {
+        if self.fail_closed {
+            return Verdict::Deny;
+        }
         let Some(p) = self.principal(principal) else {
             return Verdict::Deny;
         };
@@ -170,11 +246,22 @@ impl Policy {
     /// Denial dominates approval, which dominates allow. `auto_apply` controls
     /// whether an otherwise granted plan may proceed unattended.
     pub fn evaluate_plan(&self, principal: &str, plan: &Plan) -> Verdict {
+        if self.fail_closed {
+            return Verdict::Deny;
+        }
         let Some(policy) = self.principal(principal) else {
             return Verdict::Deny;
         };
         let mut verdict = Verdict::Allow;
         for effect in &plan.effects {
+            // An empty process allowlist means spawn pinning is disabled, not
+            // "deny every executable". The evaluator's concrete spawn gate
+            // already follows this contract; plan evaluation must apply the
+            // same semantics or a kernel rejects an ordinary command before
+            // execution reaches that gate.
+            if matches!(effect, Effect::ProcSpawn { .. }) && !self.spawn_pinning_active(principal) {
+                continue;
+            }
             match self.evaluate_effect(principal, effect) {
                 Verdict::Deny => return Verdict::Deny,
                 Verdict::ApprovalRequired => verdict = Verdict::ApprovalRequired,
@@ -208,6 +295,22 @@ impl Policy {
         .expect("built-in permissive policy")
     }
 
+    /// A quarantined policy used when an authority-bearing policy exists but
+    /// cannot be trusted. It denies every effect and reports spawn pinning as
+    /// active so callers cannot take the empty-allowlist bypass.
+    pub fn deny_all(principal: &str) -> Policy {
+        let mut principals = HashMap::new();
+        principals.insert(principal.to_string(), PrincipalPolicy::default());
+        Policy {
+            principals,
+            fail_closed: true,
+        }
+    }
+
+    pub fn is_fail_closed(&self) -> bool {
+        self.fail_closed
+    }
+
     /// Path of the per-user leash policy (site/content/internals/language-conformance-contract.md): `$XDG_CONFIG_HOME/shoal/leash.toml`
     /// or, absent that, `~/.config/shoal/leash.toml`. `None` when neither
     /// `XDG_CONFIG_HOME` nor `HOME` is set (no home to anchor config to).
@@ -223,24 +326,25 @@ impl Policy {
         })
     }
 
-    /// Load the per-user leash policy from [`Policy::user_leash_path`] if it
-    /// exists and parses, otherwise fall back to [`Policy::permissive`] for
-    /// `principal`. A missing or malformed file never bricks the shell — it
-    /// degrades to permissive so normal use keeps working (site/content/internals/language-conformance-contract.md: honesty is
-    /// surfaced at attach, not by refusing to run).
+    /// Load the per-user leash policy from [`Policy::user_leash_path`]. A
+    /// genuinely missing file keeps the documented permissive default; any
+    /// present-but-unreadable, malformed, oversized, or non-regular policy is
+    /// authority corruption and quarantines to [`Policy::deny_all`].
     pub fn load_user_or_permissive(principal: &str) -> Policy {
-        match Self::user_leash_path() {
-            Some(path) if path.is_file() => {
-                Self::load(&path).unwrap_or_else(|_| Self::permissive(principal))
-            }
-            _ => Self::permissive(principal),
+        let Some(path) = Self::user_leash_path() else {
+            return Self::permissive(principal);
+        };
+        match fs::metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::permissive(principal),
+            Ok(_) => Self::load(&path).unwrap_or_else(|_| Self::deny_all(principal)),
+            Err(_) => Self::deny_all(principal),
         }
     }
 
     /// Resolve the concrete OS [`SandboxPolicy`] for `principal`'s next child
-    /// spawn, or `None` when the principal is unknown, its filesystem grants
-    /// are unrestricted, or it declares no filesystem scope at all. `None`
-    /// means "run the child without OS confinement" — the plan-layer verdict
+    /// spawn, or `None` when the principal is unknown and requests neither a
+    /// usable filesystem scope nor process ceilings. `None` means "run the
+    /// child without an enforcement launcher" — the plan-layer verdict
     /// ([`Policy::evaluate_plan`]) remains the authority in that case, and the
     /// default-permissive policy therefore never wraps a spawn (zero
     /// regression). See [`PrincipalPolicy::to_sandbox_policy`].
@@ -251,6 +355,14 @@ impl Policy {
 }
 
 impl PrincipalPolicy {
+    /// Whether the principal declares a non-no-op filesystem scope. Empty
+    /// grant lists mean no OS filesystem request (semantic effect evaluation
+    /// may still deny filesystem effects); all-root grants are unrestricted.
+    pub fn has_fs_scope(&self) -> bool {
+        (!self.fs_read.is_empty() || !self.fs_write.is_empty() || !self.fs_delete.is_empty())
+            && !self.is_fs_unrestricted()
+    }
+
     /// True when every filesystem dimension grants the root subtree (`/**`),
     /// i.e. an OS sandbox built from this principal would confine nothing.
     pub fn is_fs_unrestricted(&self) -> bool {
@@ -259,30 +371,48 @@ impl PrincipalPolicy {
             && grants_include_root(&self.fs_delete)
     }
 
-    /// Lower this principal's filesystem scopes into a concrete
-    /// [`SandboxPolicy`] for one child spawn, or `None` when there is nothing
-    /// to confine to.
+    /// Lower this principal's filesystem scopes and inherited process ceilings
+    /// into a concrete [`SandboxPolicy`] for one child spawn, or `None` when
+    /// there is nothing to enforce.
     ///
     /// `None` is returned when the grants are unrestricted (root subtree — a
-    /// no-op sandbox) or when no filesystem scope resolves to an existing path
-    /// (an empty Landlock/Seatbelt ruleset would only stop the child from
-    /// loading its own binary, not usefully confine it — the plan layer, not
-    /// the OS sandbox, denies those). Otherwise each glob is reduced to its
+    /// no-op sandbox), or when a non-hermetic scope has no existing root. A
+    /// hermetic unresolved scope is retained as an empty request so the exec
+    /// boundary can refuse it explicitly instead of losing the hard
+    /// requirement. Otherwise each glob is reduced to its
     /// longest concrete leading path (`/work/**` → `/work`) and non-existent
     /// roots are dropped so the backend never fails closed on a typo'd path.
     ///
-    /// Net policy is left [`NetPolicy::Unrestricted`] because no seccomp/netns
-    /// backend exists in this build — the plan-layer `NetConnect` verdict is
-    /// the honest gate; [`crate::EnforcementStatus::network_enforced`] already
-    /// reports `false`. `hermetic` is carried through from the principal.
+    /// A hermetic principal with no network grants lowers to coarse
+    /// [`NetPolicy::Deny`], which Landlock ABI 4+ or Seatbelt can enforce. Any
+    /// declared hostname/port/listener allowlist remains unrestricted here:
+    /// the evaluator refuses that hermetic request before spawn because the OS
+    /// backends cannot express it. `hermetic` is carried through unchanged.
     pub fn to_sandbox_policy(&self) -> Option<SandboxPolicy> {
-        if self.is_fs_unrestricted() {
+        let filesystem_requested = self.has_fs_scope();
+        let process_limits = ProcessLimits {
+            cpu_seconds: self.process_cpu_seconds,
+            memory_bytes: self.process_memory_bytes,
+        };
+        if !filesystem_requested && process_limits.is_empty() {
             return None;
         }
-        let read = grant_roots(&self.fs_read);
-        let write = grant_roots(&self.fs_write);
-        let delete = grant_roots(&self.fs_delete);
-        if read.is_empty() && write.is_empty() && delete.is_empty() {
+        let (read, write, delete) = if filesystem_requested {
+            (
+                grant_roots(&self.fs_read),
+                grant_roots(&self.fs_write),
+                grant_roots(&self.fs_delete),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        if filesystem_requested
+            && read.is_empty()
+            && write.is_empty()
+            && delete.is_empty()
+            && !self.hermetic
+            && process_limits.is_empty()
+        {
             return None;
         }
         Some(SandboxPolicy {
@@ -291,8 +421,18 @@ impl PrincipalPolicy {
                 write,
                 delete,
             },
-            net: NetPolicy::Unrestricted,
+            filesystem_requested,
+            net: if filesystem_requested
+                && self.hermetic
+                && self.net_connect.is_empty()
+                && self.net_listen.is_empty()
+            {
+                NetPolicy::Deny
+            } else {
+                NetPolicy::Unrestricted
+            },
             spawn_hash: None,
+            process_limits,
             hermetic: self.hermetic,
         })
     }
@@ -370,20 +510,202 @@ fn flatten_namespace(table: &mut toml::Table, namespace: &str, fields: &[&str]) 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyParseError {
+    pub msg: String,
+}
+
+impl PolicyParseError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            msg: message.into(),
+        }
+    }
+
+    fn toml(error: toml::de::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl std::fmt::Display for PolicyParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+impl std::error::Error for PolicyParseError {}
+
 #[derive(Debug)]
 pub enum PolicyLoadError {
-    Io(std::io::Error),
-    Toml(toml::de::Error),
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    NotFile {
+        path: PathBuf,
+    },
+    TooLarge {
+        path: PathBuf,
+        max_bytes: usize,
+    },
+    Utf8 {
+        path: PathBuf,
+    },
+    Parse {
+        path: PathBuf,
+        source: PolicyParseError,
+    },
 }
 impl std::fmt::Display for PolicyLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "{e}"),
-            Self::Toml(e) => write!(f, "{e}"),
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::NotFile { path } => {
+                write!(f, "{}: policy is not a regular file", path.display())
+            }
+            Self::TooLarge { path, max_bytes } => write!(
+                f,
+                "{}: policy exceeds the {max_bytes}-byte limit",
+                path.display()
+            ),
+            Self::Utf8 { path } => write!(f, "{}: policy is not valid UTF-8", path.display()),
+            Self::Parse { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }
 }
 impl std::error::Error for PolicyLoadError {}
+
+fn read_policy_utf8(path: &Path, reader: impl Read) -> Result<String, PolicyLoadError> {
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    reader
+        .take((POLICY_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| PolicyLoadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > POLICY_MAX_BYTES {
+        return Err(PolicyLoadError::TooLarge {
+            path: path.to_path_buf(),
+            max_bytes: POLICY_MAX_BYTES,
+        });
+    }
+    String::from_utf8(bytes).map_err(|_| PolicyLoadError::Utf8 {
+        path: path.to_path_buf(),
+    })
+}
+
+fn validate_policy_text(source: &str) -> Result<(), PolicyParseError> {
+    if source.len() > POLICY_MAX_BYTES {
+        return Err(PolicyParseError::new(format!(
+            "policy exceeds the {POLICY_MAX_BYTES}-byte limit"
+        )));
+    }
+    let mut depth = 0usize;
+    let mut assignments = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+    for byte in source.bytes() {
+        if comment {
+            if byte == b'\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if delimiter == b'"' && escaped {
+                escaped = false;
+            } else if delimiter == b'"' && byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'#' => comment = true,
+            b'"' | b'\'' => quote = Some(byte),
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > POLICY_MAX_NESTING {
+                    return Err(PolicyParseError::new(format!(
+                        "policy exceeds the {POLICY_MAX_NESTING}-level TOML nesting limit"
+                    )));
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b'=' => {
+                assignments += 1;
+                if assignments > POLICY_MAX_ASSIGNMENTS {
+                    return Err(PolicyParseError::new(format!(
+                        "policy exceeds the {POLICY_MAX_ASSIGNMENTS}-assignment limit"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_doc(doc: &PolicyDoc) -> Result<(), PolicyParseError> {
+    if doc.principal.len() > POLICY_MAX_PRINCIPALS {
+        return Err(PolicyParseError::new(format!(
+            "policy has {} principals; maximum is {POLICY_MAX_PRINCIPALS}",
+            doc.principal.len()
+        )));
+    }
+    for (name, policy) in &doc.principal {
+        validate_policy_string("principal name", name)?;
+        for (kind, grants) in [
+            ("fs.read", &policy.fs_read),
+            ("fs.write", &policy.fs_write),
+            ("fs.delete", &policy.fs_delete),
+            ("net_connect", &policy.net_connect),
+            ("proc_spawn", &policy.proc_spawn),
+            ("env_read", &policy.env_read),
+            ("env_write", &policy.env_write),
+            ("secret_use", &policy.secret_use),
+        ] {
+            if grants.len() > POLICY_MAX_GRANTS_PER_KIND {
+                return Err(PolicyParseError::new(format!(
+                    "principal {name:?} has {} {kind} grants; maximum is {POLICY_MAX_GRANTS_PER_KIND}",
+                    grants.len()
+                )));
+            }
+            for grant in grants {
+                validate_policy_string(kind, grant)?;
+            }
+        }
+        if policy.net_listen.len() > POLICY_MAX_GRANTS_PER_KIND {
+            return Err(PolicyParseError::new(format!(
+                "principal {name:?} has {} net_listen grants; maximum is {POLICY_MAX_GRANTS_PER_KIND}",
+                policy.net_listen.len()
+            )));
+        }
+        if policy.process_cpu_seconds == Some(0) {
+            return Err(PolicyParseError::new(format!(
+                "principal {name:?} process_cpu_seconds must be greater than zero"
+            )));
+        }
+        if policy.process_memory_bytes == Some(0) {
+            return Err(PolicyParseError::new(format!(
+                "principal {name:?} process_memory_bytes must be greater than zero"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_string(kind: &str, value: &str) -> Result<(), PolicyParseError> {
+    if value.len() > POLICY_MAX_GRANT_BYTES {
+        return Err(PolicyParseError::new(format!(
+            "{kind} value is {} UTF-8 bytes; maximum is {POLICY_MAX_GRANT_BYTES}",
+            value.len()
+        )));
+    }
+    Ok(())
+}
 
 fn bool_verdict(ok: bool) -> Verdict {
     if ok { Verdict::Allow } else { Verdict::Deny }
@@ -440,4 +762,74 @@ fn host_grant(grant: &str, host: &str, port: u16) -> bool {
         return false;
     }
     Pattern::new(host_pat).is_ok_and(|p| p.matches(host))
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_oversized_and_non_utf8_policy_files_fail_typed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("leash.toml");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((POLICY_MAX_BYTES + 1) as u64).unwrap();
+        assert!(matches!(
+            Policy::load(&path),
+            Err(PolicyLoadError::TooLarge { path: ref found, .. }) if found == &path
+        ));
+
+        fs::write(&path, [0xff]).unwrap();
+        assert!(matches!(
+            Policy::load(&path),
+            Err(PolicyLoadError::Utf8 { path: ref found }) if found == &path
+        ));
+        assert!(matches!(
+            Policy::load(directory.path()),
+            Err(PolicyLoadError::NotFile { .. })
+        ));
+    }
+
+    #[test]
+    fn deep_wide_duplicate_and_unknown_policy_shapes_fail_closed() {
+        let deep = format!(
+            "[principal.agent]\nnet_connect = {}\"x:1\"{}\n",
+            "[".repeat(POLICY_MAX_NESTING + 1),
+            "]".repeat(POLICY_MAX_NESTING + 1)
+        );
+        assert!(Policy::from_toml(&deep).is_err());
+
+        let wide = (0..=POLICY_MAX_PRINCIPALS)
+            .map(|index| format!("[principal.p{index}]\ntime=true\n"))
+            .collect::<String>();
+        assert!(Policy::from_toml(&wide).is_err());
+
+        let grants = std::iter::repeat_n("\"x\"", POLICY_MAX_GRANTS_PER_KIND + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(Policy::from_toml(&format!("[principal.agent]\nenv_read=[{grants}]\n")).is_err());
+
+        assert!(Policy::from_toml("[principal.agent]\ntime=true\ntime=false\n").is_err());
+        assert!(Policy::from_toml("[principal.agent]\ntiem=true\n").is_err());
+        assert!(Policy::from_toml("[mystery]\nallow=true\n").is_err());
+    }
+
+    #[test]
+    fn oversized_grant_string_is_rejected() {
+        let source = format!(
+            "[principal.agent]\nenv_read=[\"{}\"]\n",
+            "x".repeat(POLICY_MAX_GRANT_BYTES + 1)
+        );
+        assert!(Policy::from_toml(&source).is_err());
+    }
+
+    #[test]
+    fn production_policy_loader_has_no_whole_file_read() {
+        let production = include_str!("policy.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!production.contains("fs::read_to_string"));
+        assert!(production.contains("POLICY_MAX_BYTES + 1"));
+    }
 }

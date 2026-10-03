@@ -12,7 +12,7 @@ impl Evaluator {
                 arg,
                 CmdArg::FlagLong { .. } | CmdArg::FlagShort { .. } | CmdArg::DashDash { .. }
             ) {
-                ps.extend(plan_paths(arg, &self.cwd)?);
+                ps.extend(self.plan_paths(arg)?);
             }
         }
         let e = match call.head.as_str() {
@@ -25,7 +25,7 @@ impl Evaluator {
             }],
             "ls" | "cat" | "stat" | "head" => vec![Effect::FsRead {
                 paths: if ps.is_empty() {
-                    vec![self.cwd.clone()]
+                    vec![self.exec.shell.cwd.clone()]
                 } else {
                     ps
                 },
@@ -100,6 +100,16 @@ impl Evaluator {
         }
         Ok(bindings)
     }
+
+    fn plan_paths(&self, arg: &CmdArg) -> VResult<Vec<PathBuf>> {
+        match arg {
+            CmdArg::Glob { pattern, .. } => {
+                crate::args::expand_glob_paths(&self.exec.shell.cwd, pattern, false)
+            }
+            CmdArg::Path { text, .. } => Ok(vec![self.resolved_abs_path(text)]),
+            _ => Ok(vec![self.plan_abs(&plan_text(arg)?)]),
+        }
+    }
 }
 
 fn plan_text(arg: &CmdArg) -> VResult<String> {
@@ -115,69 +125,63 @@ fn plan_text(arg: &CmdArg) -> VResult<String> {
         _ => Err(ErrorVal::arg_error("planning requires a value argument")),
     }
 }
-fn plan_paths(arg: &CmdArg, cwd: &Path) -> VResult<Vec<PathBuf>> {
-    match arg {
-        CmdArg::Glob { pattern, .. } => {
-            let pat = cwd.join(pattern).to_string_lossy().into_owned();
-            let mut ps = glob::glob(&pat)
-                .map_err(|e| ErrorVal::arg_error(e.to_string()))?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>();
-            ps.sort();
-            Ok(ps)
-        }
-        _ => {
-            let p = PathBuf::from(plan_text(arg)?);
-            Ok(vec![if p.is_absolute() { p } else { cwd.join(p) }])
-        }
-    }
-}
+/// Parse one declared adapter effect against the **full** effect vocabulary
+/// (site/content/internals/effects-plans-security.md). Recognized kinds map to
+/// concrete [`Effect`]s; a declaration whose kind is not in the vocabulary
+/// (a typo, or a future kind this build predates) becomes a conservative
+/// [`Effect::Opaque`] rather than being silently dropped — fail-closed (A7).
+///
+/// Accepts both parenthesized (`fs.read($paths)`, `proc.spawn(docker)`) and
+/// bare (`session.write`, `time`) forms.
 pub(crate) fn parse_declared_effect(
     raw: &str,
     bindings: &std::collections::HashMap<String, Vec<String>>,
     cwd: &Path,
 ) -> Vec<Effect> {
-    let Some((kind, arg)) = raw
+    let (kind, values) = match raw
         .split_once('(')
         .and_then(|(k, a)| a.strip_suffix(')').map(|a| (k, a)))
-    else {
-        return vec![];
+    {
+        Some((kind, arg)) => {
+            let values = if arg == "cwd" {
+                vec![cwd.to_string_lossy().into_owned()]
+            } else if let Some(key) = arg.strip_prefix('$') {
+                bindings.get(key).cloned().unwrap_or_default()
+            } else if arg.is_empty() {
+                vec![]
+            } else {
+                vec![arg.to_owned()]
+            };
+            (kind, values)
+        }
+        // A bare kind with no `(…)` — e.g. `session.write`, `journal.read`,
+        // `time`. Any other bare token stays conservative (Opaque) below.
+        None => (raw, Vec::new()),
     };
-    let values = if arg == "cwd" {
-        vec![cwd.to_string_lossy().into_owned()]
-    } else if let Some(key) = arg.strip_prefix('$') {
-        bindings.get(key).cloned().unwrap_or_default()
-    } else {
-        vec![arg.to_owned()]
+    let abs = |values: Vec<String>| -> Vec<PathBuf> {
+        values
+            .into_iter()
+            .map(|p| {
+                let p = PathBuf::from(p);
+                if p.is_absolute() { p } else { cwd.join(p) }
+            })
+            .collect()
     };
     match kind {
-        "fs.read" => vec![Effect::FsRead {
-            paths: values
-                .into_iter()
-                .map(|p| {
-                    let p = PathBuf::from(p);
-                    if p.is_absolute() { p } else { cwd.join(p) }
-                })
-                .collect(),
-        }],
-        "fs.write" => vec![Effect::FsWrite {
-            paths: values
-                .into_iter()
-                .map(|p| {
-                    let p = PathBuf::from(p);
-                    if p.is_absolute() { p } else { cwd.join(p) }
-                })
-                .collect(),
-        }],
-        "fs.delete" => vec![Effect::FsDelete {
-            paths: values
-                .into_iter()
-                .map(|p| {
-                    let p = PathBuf::from(p);
-                    if p.is_absolute() { p } else { cwd.join(p) }
-                })
-                .collect(),
-        }],
+        "fs.read" => vec![Effect::FsRead { paths: abs(values) }],
+        "fs.write" => vec![Effect::FsWrite { paths: abs(values) }],
+        "fs.delete" => vec![Effect::FsDelete { paths: abs(values) }],
+        // A declared spawn (`proc.spawn(container)`) is name-only: the argument
+        // is a description, not a locatable binary, so the hash stays empty
+        // (matching the name-only fallback the adapter's own bin uses when it
+        // isn't installed). Previously silently ignored (A7).
+        "proc.spawn" => values
+            .into_iter()
+            .map(|v| Effect::ProcSpawn {
+                bin_hash: String::new(),
+                argv0: v,
+            })
+            .collect(),
         "net.connect" => values
             .into_iter()
             .map(|v| {
@@ -188,7 +192,21 @@ pub(crate) fn parse_declared_effect(
                 Effect::NetConnect { host, port }
             })
             .collect(),
-        _ => vec![],
+        "net.listen" => values
+            .into_iter()
+            .map(|v| Effect::NetListen {
+                port: v.parse().unwrap_or(0),
+            })
+            .collect(),
+        "env.read" => vec![Effect::EnvRead { names: values }],
+        "env.write" => vec![Effect::EnvWrite { names: values }],
+        "secret.use" => vec![Effect::SecretUse { names: values }],
+        "session.write" => vec![Effect::SessionWrite],
+        "journal.read" => vec![Effect::JournalRead],
+        "time" => vec![Effect::Time],
+        // Unrecognized effect kind: never silently dropped — require approval by
+        // planning it as opaque (A7, fail-closed).
+        _ => vec![Effect::Opaque],
     }
 }
 

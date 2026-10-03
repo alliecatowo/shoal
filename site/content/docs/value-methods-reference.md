@@ -81,7 +81,7 @@ If the callback errors, the method errors. The receiver is cloned for the callba
 value.json() -> str
 ```
 
-Returns compact JSON from Shoal's generic value encoder. This is a representation helper, not a stable protocol schema for tasks, streams, errors, or outcomes. Secrets remain redacted. A content-addressed bytes value used as the top-level receiver is fully loaded; the same value nested inside another record/table becomes a bounded preview/ref object.
+Returns compact JSON from Shoal's generic value encoder. This is a representation helper, not a stable protocol schema for tasks, streams, errors, or outcomes. Secrets remain redacted. A content-addressed bytes value used as the top-level receiver is loaded only within the 16 MiB eager wall; a larger one raises `cas_materialization_limit`. The same value nested inside another record/table becomes a bounded preview/ref object without loading.
 
 ### `save` and `append`
 
@@ -97,7 +97,7 @@ report.save("report.json")
 "next line\n".append("events.log")
 ```
 
-Current security boundary: these value methods call `std::fs::OpenOptions` directly. They do not use the evaluator `Fs` port, do not inherently consult Leash policy, and do not automatically install journal undo. Treat them as direct host filesystem effects in the preview implementation.
+Security boundary: these value methods write through the evaluator's injected `Fs` port, so an embedding host can observe or deny them. The default production port is still `StdFs`; port routing does not by itself apply Leash policy or install journal undo.
 
 ### `feed`
 
@@ -138,14 +138,14 @@ The eager collection core accepts `list`, `table`, and `range`. Many operations 
 | `each` | `(item => any)` | `null` |
 | `any`, `all` | `(item => bool)` | bool |
 | `find` | `(item => bool)` | item or null |
-| `flat_map` | `(item => collection)` | flattened list |
+| `flat_map` | `(item => collection)` | flattened list; eager output is limited to 16,384 values / 16 MiB |
 | `sort` | `()` or `(item => key)` | list |
 | `sort_by` | `(item => key)` | list |
 | `reverse` | `()` | list |
 | `uniq` | `()` | list |
 | `sum` | `()` | accumulated value; empty is integer 0 |
 | `min`, `max` | `()` | item or null |
-| `flatten` | `()` | one-level flattened list |
+| `flatten` | `()` | one-level flattened list; eager output is limited to 16,384 values / 16 MiB |
 | `enumerate` | `()` | list of `[index, item]` |
 | `skip`, `take` | `(n)` | list |
 | `chunks` | `(positive_n)` | list of lists |
@@ -154,6 +154,13 @@ The eager collection core accepts `list`, `table`, and `range`. Many operations 
 | `join` | `(separator = "")` | string; elements must be strings |
 | `contains` | `(item)` | bool |
 | `get` | see below | only list+int, not table/range |
+
+Methods that produce an eager collection (`first(n)`, `last(n)`, `map`, `where`, `sort`,
+`reverse`, `uniq`, `flat_map`, `flatten`, `enumerate`, `skip`, `take`, `chunks`, `zip`, `group`,
+record projections, and collection `tee`) share a 16,384-value / 16 MiB retained-state wall.
+They raise `collection_materialization_limit` before admitting the next result. Collection `tee`
+stores one admitted replay vector shared by all forks; it does not clone the complete vector for
+each fork.
 
 ### Size and endpoints
 
@@ -369,10 +376,14 @@ The implemented signatures are exactly:
 
 ```text
 list.get(index: int, default = null) -> value
+table.get(index: int, default = null) -> record | value
+range.get(index: int, default = null) -> int | value
 record.get(key: str, default = null) -> value
 ```
 
-Negative list indexes count from the end; out-of-range returns the default. `table.get` and `range.get` are not implemented even though current completion/did-you-mean metadata groups `get` with sequence methods.
+Negative sequence indexes count from the end; out-of-range returns the default. Table lookup returns
+the selected row as a record. Range lookup computes the integer directly without materializing the
+range.
 
 ## String methods
 
@@ -410,6 +421,11 @@ Negative list indexes count from the end; out-of-range returns the default. `tab
 ```
 
 Regex replacement expands `$1` and named captures. `.matches()` returns every non-overlapping full match, not capture records. `.match()` returns only the first full match.
+
+Eager string partitions and regex matches share the 16,384-value / 16 MiB collection wall.
+Concatenation, `join`, Unicode case conversion, and replacement share a 16 MiB output wall. They
+raise `collection_materialization_limit` or `string_materialization_limit` before retaining the
+next item/chunk; use a stream or chunked processing for larger data.
 
 ## Numeric methods
 
@@ -465,7 +481,12 @@ p.parent.join("lib.rs")
 p.read.lines()
 ```
 
-Relative filesystem methods resolve against the session cwd. `read` and `lines` use strict UTF-8 and raise `utf8_error`; `read_bytes` does not. `exists`/`is_dir`/`is_file` convert metadata errors to false, while `size` raises. `modified` may return null when the timestamp cannot be represented.
+Relative filesystem methods resolve against the session cwd. `read` and `read_bytes` stop at 16 MiB;
+`lines` reads incrementally and stops at 16 MiB of input, 16,384 lines, or 16 MiB of retained line
+values. Crossing any eager-read wall raises `path_read_limit` with a `.stream()`/`head` hint rather
+than partially returning data. `read` and `lines` use strict UTF-8 and raise `utf8_error`;
+`read_bytes` does not. `exists`/`is_dir`/`is_file` convert metadata errors to false, while `size`
+raises. `modified` may return null when the timestamp cannot be represented.
 
 A bare path is not feedable because it denotes a name, not contents:
 
@@ -492,8 +513,14 @@ Large command capture may spill into the journal CAS and retain only a resident 
 | `len`, `count` | true total length from metadata, no load |
 | `is_empty` | metadata-only |
 | `ref` | `val:blake3:HASH`, no load |
-| `load`, `bytes` | load and return resident bytes |
-| any other bytes method | load full content, then dispatch |
+| `load`, `bytes` | explicitly load and return resident bytes |
+| `stream` | lazily decode logical lines; one line may be at most 1 MiB |
+| `save`, `append` | copy incrementally through the CAS reader and filesystem port |
+| any other bytes method | load only when declared length is at most 16 MiB, then dispatch |
+
+An implicit resident operation above the wall raises `cas_materialization_limit` before opening the
+blob. An oversized unframed line raises `stream_line_limit`. `.load()` and `.bytes()` remain the
+deliberate escape hatch when the caller truly wants the full allocation.
 
 Writing the short ref as a string value in the same journal-aware evaluator can resolve it for subsequent methods. Unknown/unavailable refs raise `not_found` or `io_error`.
 
@@ -529,15 +556,15 @@ A table is semantically an ordered record collection, but method outputs are usu
 - `map`, `where`, `filter`, `sort`, `reverse`, and grouping return `list`;
 - `collect()` returns the table unchanged;
 - `len` counts rows;
-- `get(index)` is currently not implemented;
+- `get(index, default = null)` returns a row record or the default;
 - `table[index]` is also not implemented by strict index access;
-- use `.first()`, `.last()`, `.find()`, `.take(n)`, or convert via a mapping when row selection is needed.
+- `.first()`, `.last()`, `.find()`, and `.take(n)` remain useful for selection by shape or predicate.
 
-This inconsistency is a current API rough edge.
+Strict bracket indexing and forgiving `.get()` deliberately remain different operations.
 
 ## Range methods
 
-Ranges share eager collection transforms and materialize integers when needed. `1..5` yields 1,2,3,4; `1..=5` includes 5. They support iteration, length, collect, transforms, aggregations, and finite stream conversion. `.get()` is not implemented despite sequence completion metadata.
+Ranges are compact. `1..5` yields 1,2,3,4; `1..=5` includes 5. Eager collection transforms, JSON conversion, and `collect` may materialize at most 16,384 integers and otherwise raise `range_materialization_limit`. `.stream()` and range expansions returned from stream `flat_map` iterate lazily, so use `.take(n)` before collecting a much larger range. Length and `.get(index, default = null)` remain non-materializing; an exact length outside Shoal's signed integer domain raises `range_length_overflow`.
 
 ## Glob fields and methods
 
@@ -655,7 +682,9 @@ if (!t.is_done()) { t.cancel() }
 t.await()
 ```
 
-Task handles compare by identity. Awaiting observes the stored completion. Local evaluator suspension can signal registered process groups; kernel wire suspend/resume currently returns `TASK_CONTROL_UNAVAILABLE` and is not equivalent.
+Task handles compare by identity. Awaiting observes the stored completion. Local evaluator task
+hooks and raw kernel task control can both signal owned process groups, but they use different task
+identities; kernel evaluator-only work still returns `TASK_CONTROL_UNAVAILABLE`.
 
 ## Stream methods
 
@@ -668,7 +697,7 @@ A stream is single-consumer. Calling a lazy combinator moves its source into a n
 | `map` | `(item => value)` | transformed item |
 | `where`, `filter` | `(item => bool)` | selected original item |
 | `scan` | `(initial, (acc,item)=>acc)` | each new accumulator |
-| `flat_map` | `(item => collection|stream-compatible)` | flattened values |
+| `flat_map` | `(item => collection|stream-compatible)` | each returned shape drained sequentially |
 | `take` | `(n)` | first n, then end; makes bounded |
 | `take_until` | `(predicate|other_stream)` | until predicate/other stream |
 | `dedupe` | `()` | remove adjacent duplicates |
@@ -676,10 +705,10 @@ A stream is single-consumer. Calling a lazy combinator moves its source into a n
 | `debounce` | `(duration)` | quiet-period emission |
 | `throttle` | `(duration)` | rate-limited emission |
 | `window` | `(positive_count|duration)` | list windows |
-| `buffer` | `(capacity = 1)` | identity stage today; no queue or pacing effect |
+| `buffer` | `(capacity = 1)` | eager lossless queue; `0` is a rendezvous |
 | `enumerate` | `()` | `[index,item]` |
-| `merge` | `(stream)` | interleaved streams |
-| `zip` | `(stream)` | paired `[left,right]` until one ends |
+| `merge` | `(stream)` | fair interleave; round-robin while both are ready |
+| `zip` | `(stream)` | positional pairs, at most one pending item per side |
 
 ```shoal
 every(1s)
@@ -695,24 +724,29 @@ Durations must be non-negative. Window count must be positive. `merge`/`zip` req
 | Method | Result | Notes |
 | --- | --- | --- |
 | `each(f)` | `null` | run callback per item |
-| `collect()` | list | requires a bounded stream |
+| `collect()` | list | requires bounded metadata; capped at 16,384 values / 16 MiB |
 | `save(path)` | path | appends one encoded line per item |
 | `append(path)` | path | same implementation as stream `save` today |
-| `tee(n=2)` | list of streams | bounded replay or live shared queues |
+| `tee(n=2)` | list of streams | 1–64 forks; bounded replay or live shared queues |
 | `into(channel)` | `null` | emit every item to named channel |
 | `render()` | `null` | drive items to evaluator statement sink |
 
 Stream `save` and `append` both open the file in append mode today; neither truncates. Strings/bytes become their bytes plus newline; other items become compact JSON plus newline.
 
-Like value save, stream file sinks call the platform filesystem directly rather than the evaluator `Fs`/Leash policy path. They are not a policy-safe logging primitive in the current preview.
+Like value save, stream file sinks resolve relative paths against the evaluator cwd and open once
+through the injected `Fs` port. A recording or denying adapter can therefore observe or refuse the
+write, though these sinks still bypass journal undo and the production default remains `StdFs`.
 
-For a bounded stream, unfamiliar eager methods such as `.sort()`, `.sum()`, or `.len()` first collect the entire stream and then dispatch to collection logic. For a live/unbounded stream this raises `stream_unbounded`; bound it explicitly with `.take(n)` or `.take_until(...)`.
+For a bounded stream, unfamiliar eager methods such as `.sort()`, `.sum()`, or `.len()` first collect up to the shared 16,384-value / 16 MiB wall and then dispatch to collection logic. Exceeding it raises `stream_collect_limit`. For a live/unbounded stream this raises `stream_unbounded`; bound it explicitly with `.take(n)` or `.take_until(...)`.
 
-`.feed(command)` on a stream is not implemented. It returns a type error suggesting bounded collection; there is no incremental child-stdin bridge yet.
+`.feed(command)` incrementally pumps a finite or live stream into captured child stdin. Ordinary
+values are line-framed; bytes and outcome output remain raw. The bounded stdin path holds 16 chunks
+of at most 64 KiB, applies lossless backpressure, and stops on cancellation, child exit, closed
+stdin, or a serialization/upstream error. Buffer and feed pumps share a maximum of 64 active pumps.
 
 ### Live `tee`
 
-Bounded streams materialize once and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items for each fork. If a fork is not driven and its queue fills, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{dropped: n}` marker once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics.
+Bounded streams materialize once within the collection walls and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items and 1 MiB per fork. If a fork is not driven, its queue fills, or a value exceeds the byte wall, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics, and `n > 64` is rejected before source consumption.
 
 ## Channel handle methods
 
@@ -725,7 +759,10 @@ Bounded streams materialize once and create independent replay streams. A live s
 | `latest` | `()` | latest payload or null |
 | `take` | `(timeout: duration?)` | next future payload |
 
-Event stream items are `{channel, seq, ts, payload}`. `.events()` replays the ring; `.take()` subscribes only to future events. Channel specifics are in [Streams and channels](@/docs/streams-channels.md).
+Event stream items are `{channel, seq, ts, payload}`. Each subscriber holds at most 256 deliveries;
+overflow and stale cursors yield explicit `stream_gap` records with dropped counts and sequence
+ranges. `.events()` queues retained ring entries before going live; `.take()` subscribes only to
+future events. Channel specifics are in [Streams and channels](@/docs/streams-channels.md).
 
 ## Closure, command, and secret values
 
@@ -748,7 +785,7 @@ Generic `.save()`/`.json()` on a secret writes only the redacted/tagged represen
 | other `list`, `record`, `table` | compact JSON |
 | `outcome` | encoded structured `.out`; raw stdout for ordinary text |
 | `path` | rejected: name is not content |
-| `stream` | rejected: incremental feed not implemented |
+| `stream` | incrementally serialized items; ordinary values line-framed, bytes/outcomes raw |
 | `secret` | `feed_error` |
 | `task`, `closure`, `error`, `glob`, `regex` | `feed_error` |
 | `null`, `command`, other unsupported | `type_error` |

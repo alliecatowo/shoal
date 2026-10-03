@@ -1,7 +1,7 @@
 //! User-facing journal/history operations, separated from presentation and CLI parsing.
 
 use serde_json::{Value, json};
-use shoal_journal::{EntryRow, GcOptions, GcReport, Journal, JournalQuery, UndoReport};
+use shoal_journal::{EntryKind, EntryRow, GcOptions, GcReport, Journal, JournalQuery, UndoReport};
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use std::time::Duration;
 pub struct QueryFilter {
     pub since_ns: Option<i64>,
     pub principal: Option<String>,
+    pub kind: Option<EntryKind>,
     pub effect: Option<String>,
     pub head: Option<String>,
     pub ok: Option<bool>,
@@ -19,52 +20,63 @@ pub fn query(journal: &Journal, filter: &QueryFilter) -> Result<Vec<EntryRow>, r
     let requested = if filter.limit == 0 { 100 } else { filter.limit };
     let q = JournalQuery {
         since_ts_ns: filter.since_ns,
+        session: None,
         head: filter.head.clone(),
         principal: filter.principal.clone(),
+        kind: filter.kind,
         ok: filter.ok,
-        limit: if filter.effect.is_some() {
-            usize::MAX
-        } else {
-            requested
-        },
+        limit: requested,
     };
-    let mut rows = journal.query(&q)?;
     if let Some(effect) = &filter.effect {
-        rows.retain(|r| {
-            serde_json::from_str::<Value>(&r.effects_json)
-                .ok()
-                .is_some_and(|v| effect_matches(&v, effect))
-        });
-        rows.truncate(requested);
-    }
-    Ok(rows)
-}
-
-fn effect_matches(value: &Value, wanted: &str) -> bool {
-    match value {
-        Value::Array(xs) => xs.iter().any(|v| effect_matches(v, wanted)),
-        Value::String(s) => s.contains(wanted),
-        Value::Object(m) => m
-            .get("kind")
-            .and_then(Value::as_str)
-            .is_some_and(|s| s.contains(wanted)),
-        _ => false,
+        journal.query_effect_contains(&q, effect)
+    } else {
+        journal.query(&q)
     }
 }
 
 pub fn entry(journal: &Journal, id: i64) -> Result<Option<EntryRow>, rusqlite::Error> {
-    Ok(journal
-        .query(&JournalQuery {
-            limit: usize::MAX,
-            ..Default::default()
-        })?
-        .into_iter()
-        .find(|r| r.id == id))
+    Ok(journal.entries_by_id(&[id])?.into_iter().next())
 }
 
 pub fn entry_json(journal: &Journal, row: &EntryRow) -> Value {
-    let outputs=row.outputs.iter().map(|o|{let available=journal.read_blob(&o.hash).ok().flatten().is_some();json!({"kind":o.kind,"hash":o.hash,"stored_len":o.len,"meta":o.meta.as_ref().map(|m|json!({"truncated":m.truncated,"original_len":m.original_len,"stored_len":m.stored_len})),"available":available,"aged_out":!available})}).collect::<Vec<_>>();
-    json!({"id":row.id,"session":row.session,"principal":row.principal,"ts_ns":row.ts_ns,"dur_ns":row.dur_ns,"cwd":String::from_utf8_lossy(&row.cwd),"src":row.src,"ast":serde_json::from_str::<Value>(&row.ast_json).unwrap_or(Value::String(row.ast_json.clone())),"effects":serde_json::from_str::<Value>(&row.effects_json).unwrap_or(Value::String(row.effects_json.clone())),"status":row.status,"ok":row.ok,"opaque":row.opaque,"outputs":outputs})
+    let outputs = row
+        .outputs
+        .iter()
+        .map(|output| {
+            let available = journal.read_blob(&output.hash).ok().flatten().is_some();
+            json!({
+                "kind": output.kind,
+                "hash": output.hash,
+                "stored_len": output.len,
+                "meta": output.meta.as_ref().map(|meta| json!({
+                    "truncated": meta.truncated,
+                    "original_len": meta.original_len,
+                    "stored_len": meta.stored_len,
+                })),
+                "available": available,
+                "aged_out": !available,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": row.id,
+        "kind": row.kind.as_str(),
+        "parent_id": row.parent_id,
+        "session": row.session,
+        "principal": row.principal,
+        "ts_ns": row.ts_ns,
+        "dur_ns": row.dur_ns,
+        "cwd": String::from_utf8_lossy(&row.cwd),
+        "src": row.src,
+        "ast": serde_json::from_str::<Value>(&row.ast_json)
+            .unwrap_or(Value::String(row.ast_json.clone())),
+        "effects": serde_json::from_str::<Value>(&row.effects_json)
+            .unwrap_or(Value::String(row.effects_json.clone())),
+        "status": row.status,
+        "ok": row.ok,
+        "opaque": row.opaque,
+        "outputs": outputs,
+    })
 }
 
 pub fn render_human(journal: &Journal, rows: &[EntryRow], verbose: bool) -> String {
@@ -76,8 +88,9 @@ pub fn render_human(journal: &Journal, rows: &[EntryRow], verbose: bool) -> Stri
             None => "unfinished",
         };
         out.push_str(&format!(
-            "{}  {}  {}  {}\n",
+            "{}  {}  {}  {}  {}\n",
             row.id,
+            row.kind,
             row.principal,
             verdict,
             row.src.lines().next().unwrap_or("")
@@ -128,6 +141,8 @@ mod tests {
     use shoal_journal::{EntryRecord, JournalOptions};
     fn rec(src: &str, effects: &str) -> EntryRecord {
         EntryRecord {
+            kind: EntryKind::Statement,
+            parent_id: None,
             session: "s".into(),
             principal: "agent:x".into(),
             ts_ns: 10,
@@ -156,6 +171,44 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, a);
+    }
+
+    #[test]
+    fn effect_filter_stops_at_requested_matches_and_ignores_non_kind_fields() {
+        let j = Journal::in_memory().unwrap();
+        for index in 0..20 {
+            let effects = if index % 2 == 0 {
+                r#"[{"kind":"fs.read","path":"net-decoy"}]"#
+            } else {
+                r#"[{"kind":"net.connect"}]"#
+            };
+            j.append(&rec(&format!("cmd-{index}"), effects)).unwrap();
+        }
+        let rows = query(
+            &j,
+            &QueryFilter {
+                effect: Some("net".into()),
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|row| row.effects_json.contains("net.connect"))
+        );
+    }
+
+    #[test]
+    fn entry_fetch_is_targeted_and_missing_ids_are_absent() {
+        let j = Journal::in_memory().unwrap();
+        let first = j.append(&rec("first", "[]")).unwrap();
+        for index in 0..200 {
+            j.append(&rec(&format!("noise-{index}"), "[]")).unwrap();
+        }
+        assert_eq!(entry(&j, first).unwrap().unwrap().src, "first");
+        assert!(entry(&j, i64::MAX).unwrap().is_none());
     }
     #[test]
     fn show_reports_available_and_aged_out() {

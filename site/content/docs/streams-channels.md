@@ -70,7 +70,9 @@ watch(path("./src"), recursive: true)
 A glob watches its literal directory prefix and filters full paths. The current consumer queue holds 64 events. When a burst overflows it, events are dropped and a summary event is owed:
 
 ```text
-{ path: watched_root, kind: "modified", ts: datetime, coalesced: true }
+{ marker: "stream_gap", reason: "watch_overflow", dropped: n,
+  from_seq: null, to_seq: null,
+  path: watched_root, kind: "modified", ts: datetime, coalesced: true }
 ```
 
 Consumers that require an exact audit trail must rescan authoritative state after `coalesced: true`; a watch stream is a notification channel, not a durable journal.
@@ -89,7 +91,8 @@ tail(path("./service.log"))
 Its queue also holds 64 items. Dropped lines are represented by a marker value:
 
 ```text
-{ dropped: 37 }
+{ marker: "stream_gap", reason: "tail_overflow", dropped: 37,
+  from_seq: null, to_seq: null }
 ```
 
 That means the stream can contain either strings or marker records under pressure. Branch on shape instead of assuming every element is text.
@@ -103,18 +106,18 @@ Current stream-specific combinators are:
 | `map(f)` | transform each item |
 | `where(f)` / `filter(f)` | retain items whose predicate is true |
 | `scan(initial, f)` | emit running state |
-| `flat_map(f)` | emit items from each returned collection/stream shape supported by runtime |
+| `flat_map(f)` | drain each returned collection/stream before pulling the next outer item |
 | `take(n)` | stop after `n`; makes the stream bounded |
 | `take_until(f_or_stream)` | stop when predicate triggers or another stream produces |
 | `dedupe()` | drop adjacent duplicates |
-| `distinct()` | drop all previously seen values; history can grow |
+| `distinct(limit?)` | hash and drop all previously seen equal values; default 4,096, fail typed at the caller/default identity limit or 16 MiB retained history |
 | `debounce(duration)` | emit after quiet interval |
 | `throttle(duration)` | rate-limit emissions |
-| `window(count_or_duration)` | collect count/time windows |
-| `buffer(n)` | identity stage in the current synchronous pull model |
+| `window(count_or_duration)` | collect exact count/time windows; at most 4,096 items and 16 MiB retained history |
+| `buffer(n)` | eager lossless producer queue with capacity `n` (maximum 4,096); zero is a rendezvous; queued state is capped at 16 MiB |
 | `enumerate()` | pair items with sequence positions |
-| `merge(other)` | interleave two streams |
-| `zip(other)` | pair two streams |
+| `merge(other)` | fair interleave; round-robin while both sides are ready |
+| `zip(other)` | pair positionally, holding at most one unpaired item per side |
 
 Every combinator consumes its input stream and returns a new one. Assign the new stream, not the old handle:
 
@@ -123,7 +126,7 @@ let filtered = watch(path("./src")).where(.kind == "modified")
 filtered.take(10).render()
 ```
 
-`distinct` is a deliberate memory tradeoff: source buffers remain bounded, but the set of every distinct value seen is inherently unbounded. Prefer `dedupe` or a bounded window when long-lived cardinality is unknown.
+`flat_map` is sequential, not concurrent. When the outer stream is bounded, a returned endless substream raises `stream_unbounded` so the result cannot falsely advertise a natural end; bound live children inside the closure with `.take(n)` or `.take_until(...)`. An unbounded outer stream may return an endless child, which prevents later outer items from being pulled. Compact range results are pulled lazily instead of first expanding into a queue. `distinct` uses equality-compatible hash buckets and preserves exact membership up to its caller/default 4,096-identity and 16 MiB walls; reaching either raises `stream_distinct_limit`. Prefer `dedupe` when only adjacent duplicate suppression is required.
 
 ## Sinks
 
@@ -138,25 +141,24 @@ stream.append(path("events.ndjson"))
 stream.into(channel("user.events"))
 ```
 
-`collect()` rejects an unbounded stream. `each` returns null after completion. `render` sends each value to the evaluator's statement sink.
+`collect()` rejects an unbounded stream. A bounded stream may collect at most 16,384 values and 16 MiB of measured retained state; exceeding either wall raises `stream_collect_limit`. Use `.take(n)` to tighten the bound or an incremental sink for larger flows. `each` returns null after completion. `render` sends each value to the evaluator's statement sink.
 
 For streams, both `.save(path)` and `.append(path)` currently open the file in append mode and write one line per item. Strings and bytes are written as their content; other values become JSON per line. `.save` does not truncate, despite its name—this is an important preview behavior.
 
-`buffer(n)` currently type-checks and documents intent, but it does not create a queue, background producer, or pacing boundary. Shoal's stream runtime is synchronously pulled today, so the operation returns the same stream unchanged.
+`buffer(n)` consumes its input immediately and starts an owned producer pump. Capacity is admitted from 0 through 4,096 before the source is consumed. The queue holds exactly `n` items and paces rather than dropping; the producer may additionally hold the item it is trying to enqueue. Queued and pending values share a 16 MiB measured retained-state budget, so byte pressure also paces the producer; a single value beyond that wall raises `stream_buffer_limit`. `buffer(0)` is a lossless rendezvous with no queued item. Dropping the buffered stream or canceling its parent stops the pump. Buffer and stream-feed pumps share a process-wide limit of 64 workers with live `every`, `watch`, and `tail` sources; creating another returns `stream_pump_limit` until one finishes or is dropped.
 
-`tee(n)` returns independently drivable streams. A bounded stream materializes once for exact replay. A live stream uses a queue of at most 64 pending items per fork. When a slow fork falls behind, overflowed values are dropped and later represented in order by a `{dropped: n}` marker. The marker appears as soon as that fork's queue has room, or after its buffered items drain; overflow does not raise an error and is never silent.
+`tee(n)` returns 1–64 independently drivable streams and rejects a larger count before consuming the source. A bounded stream materializes once for exact replay. A live stream uses a queue of at most 64 pending items and 1 MiB of measured retained state per fork. When a slow fork falls behind—or an individual value cannot fit its byte wall—overflowed values are dropped and later represented in order by a `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record. The marker appears as soon as that fork's queue has room, or after its buffered items drain; overflow does not raise an error and is never silent.
 
-## Streams cannot feed processes yet
+## Feed a process incrementally
 
-The finite-value `feed` serializer rejects streams. Incremental stream-to-child-stdin is not wired:
+`.feed(command)` drives a finite or live stream into captured child stdin without collecting it first:
 
 ```text
-# current workaround
-let batch = source.take(100).collect()
-batch.feed(^consumer)
+tail(path("service.log")).take(100).feed(grep ERROR)
+["alpha", "beta"].stream().feed(sort)
 ```
 
-Likewise, the kernel wire does not currently expose a general stream-ref chunk-pull protocol. Keep live consumption inside language code or bridge through `user.*` channels.
+Ordinary values are line-framed so item boundaries survive; byte values and outcome output remain raw. The child-stdin queue holds 16 chunks of at most 64 KiB (at most 1 MiB queued). Backpressure is lossless, and the pump stops on cancellation, child exit, closed stdin, or a serialization/upstream error. Feeding forces captured execution rather than a PTY. The kernel wire still does not expose a general stream-ref chunk-pull protocol.
 
 ## Named channels
 
@@ -185,7 +187,16 @@ Event records have a common shape:
 { channel: str, seq: int, ts: datetime, payload: value }
 ```
 
-Sequence numbers are monotonic per channel. Each channel retains its most recent 1,024 events. `events()` replays the current ring then goes live; `events(since: n)` replays only records with `seq > n`. If a cursor is older than the ring, evicted history cannot be recovered from the channel; persist it separately.
+Each subscriber queue is capped at 256 deliveries. If it falls behind, the oldest queued entries are compacted into an in-band record before the newest event:
+
+```text
+{ marker: "stream_gap",
+  reason: "subscriber_overflow" | "history_evicted" | "mixed_overflow",
+  dropped: n, from_seq: first_missing, to_seq: last_missing,
+  channel: str, seq: null, ts: datetime, payload: null, overflow: true }
+```
+
+Sequence numbers are monotonic per channel. Each channel retains its most recent 1,024 events. `events()` queues retained records then goes live, subject to the same 256-delivery bound. `events(since: n)` selects records with `seq > n`; if the cursor predates the ring, a queued `history_evicted` gap accounts for the missing range. A replay that itself exceeds 256 deliveries can compact that marker with later loss into `mixed_overflow` while preserving the count and widest sequence range. Persist events separately when recovery of the missing payloads matters.
 
 `take()` subscribes without replay, so it sees only an event published after the call. A timeout raises `timeout` rather than returning null.
 
@@ -200,13 +211,15 @@ watch(path("./src"))
   .into(channel("user.files"))
 ```
 
-`on(channel_or_name, handler)` subscribes before spawning its handler task so the startup gap does not lose an event. It is equivalent in intent to spawning `.events().each(handler)`.
+`on(channel_or_name, handler)` subscribes before spawning its handler task so the startup gap does not lose an event. It is equivalent in intent to spawning `.events().each(handler)`. An idle receive checks `task.cancel()` every 25 ms and cancellation takes priority over queued backlog; a handler already running must still return cooperatively.
 
 There is no `on channel(...) { ... }` keyword form; `on(...)` is a function call in the current grammar.
 
 ## Kernel bridge
 
 In a kernel-hosted session, only channels beginning with `user.` bridge bidirectionally between language code and the external event bus. This prevents language code from spoofing kernel-owned semantic channels such as approvals, journal notifications, or session transcript events.
+
+Wire `events.publish` treats the wire event as authoritative and reports the language-side result in `language_mirror`. A full or quarantined bounded language bus returns `language_mirror.ok = false`; the wire event remains committed, so clients should not retry it as though the publish itself failed.
 
 ```mermaid
 flowchart LR
@@ -222,6 +235,6 @@ The local standalone REPL has no external forwarder; its channels remain session
 
 ## Cancellation and resources
 
-Dropping/finishing a stream usually disconnects its bounded receiver, causing timer/watch/tail producers to exit and release resources. A timer thread sleeping until its next interval notices disconnection only when it wakes and tries to send. `Ctrl-C` and task cancellation propagate through host cancellation paths, but code should still bound live workflows explicitly.
+Dropping/finishing a stream usually disconnects its bounded receiver, causing timer/watch/tail producers to exit and release resources. A timer thread sleeping until its next interval notices disconnection only when it wakes and tries to send. Owned buffer/feed pumps and `on` receives poll cancellation explicitly; generic sinks over other live sources can still depend on source shutdown, so bound live workflows explicitly.
 
 For durable event history use `.save`, journal-aware workflows, or an external store. Channels and source buffers intentionally trade completeness under overload for bounded memory.

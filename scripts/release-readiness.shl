@@ -1,0 +1,30 @@
+#!/usr/bin/env shoal
+# Produce a release preflight from Git, Cargo, docs, installed artifacts, and Reef.
+
+let strict = args.map(.str()).contains("--strict")
+let status_result = run("git", "status", "--short")
+assert(status_result.ok, "git status failed: {status_result.stderr}")
+let changes = status_result.out.str().lines().where(line => !line.is_empty())
+let branch = run("git", "branch", "--show-current").out.str().trim()
+let head = run("git", "rev-parse", "--short=12", "HEAD").out.str().trim()
+let metadata_result = run("cargo", "metadata", "--format-version", "1", "--no-deps")
+assert(metadata_result.ok, "cargo metadata failed: {metadata_result.stderr}")
+let metadata = metadata_result.out
+let man_pages = glob("man/*.1").expand()
+let reef_findings = (reef doctor)
+let reef_broken = reef_findings.where(row => row.status != "ok" && row.status != "shadowed")
+let expected_binaries = 10
+
+let report = {
+  ready: changes.is_empty() && reef_broken.is_empty() && man_pages.len() == expected_binaries,
+  branch: branch,
+  head: head,
+  version: metadata.packages.where(.name == "shoal").first().version,
+  workspace_packages: metadata.packages.len(),
+  working_tree_changes: changes,
+  man_pages: man_pages.len(),
+  reef_failures: reef_broken,
+}
+
+if strict { assert(report.ready, "release preflight failed: {report}") }
+report

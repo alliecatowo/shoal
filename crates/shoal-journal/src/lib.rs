@@ -15,10 +15,11 @@
 //! # Concurrency
 //!
 //! A [`Journal`] is a single-handle, single-thread object (`Send` but not `Sync`,
-//! courtesy of the underlying `rusqlite::Connection`). Each write is a single
-//! SQLite statement and therefore atomic; the WAL journal makes an unfinished
-//! entry (appended but never [`Journal::finish`]ed, e.g. across a crash) durable
-//! and visible with `NULL` status on reopen.
+//! courtesy of the underlying `rusqlite::Connection`). Writes run in admitted
+//! SQLite transactions; multi-row completion commits its outputs, optional
+//! transcript event, and final marker atomically. The WAL journal makes an
+//! unfinished entry (appended but never [`Journal::finish`]ed, e.g. across a
+//! crash) durable and visible with `NULL` status on reopen.
 //!
 //! # Module layout
 //!
@@ -35,17 +36,22 @@
 //!   `entries_by_id` fetch.
 //! - [`transcript`] — durable `session.transcript` channel event payloads, keyed by `entry_id`.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 
 mod cas;
 mod gc;
+mod lease;
 mod query;
 mod schema;
+mod storage;
 #[cfg(test)]
 mod tests;
 mod transcript;
@@ -53,10 +59,16 @@ mod undo;
 
 pub use cas::{Cas, JournalOptions, OutputMeta, OutputRow};
 pub use gc::{GcBlob, GcOptions, GcReport};
-pub use query::{EntryRow, JournalQuery};
-pub use schema::EntryRecord;
+pub use lease::PinLease;
+pub use query::{DurableEventSeed, EntryRow, JournalQuery};
+pub use schema::{EntryKind, EntryRecord};
+pub use storage::{
+    DEFAULT_JOURNAL_CAS_MAX_BYTES, DEFAULT_JOURNAL_DATABASE_MAX_BYTES, JournalStorageLimits,
+    JournalStorageStatus, MAX_JOURNAL_CAS_MAX_BYTES, MAX_JOURNAL_DATABASE_MAX_BYTES,
+    StorageAdmissionError, StorageDomain,
+};
 pub use transcript::TranscriptEventRow;
-pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoReport, UndoStatus, UndoStep};
+pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoIo, UndoReport, UndoStatus, UndoStep};
 
 /// Handle to a journal: a SQLite database plus an on-disk CAS directory.
 ///
@@ -65,9 +77,69 @@ pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoReport, UndoStatus, 
 pub struct Journal {
     conn: Connection,
     cas_root: PathBuf,
-    /// Keeps the CAS temp dir alive for the lifetime of an in-memory journal.
-    _cas_tempdir: Option<tempfile::TempDir>,
+    /// Owns the process-visible lease lock and keeps throwaway storage alive.
+    /// Ref-backed values clone this owner through [`PinLease`], so their CAS
+    /// cannot disappear merely because the originating evaluator is dropped.
+    lease_owner: std::sync::Arc<lease::LeaseOwner>,
     output_hard_cap: usize,
+    storage_limits: JournalStorageLimits,
+    /// CAS+spill bytes observed when this handle opened. This makes crash
+    /// orphans admission-visible without an O(number-of-blobs) walk per write.
+    reconciled_cas_physical_bytes: u64,
+    blob_page_cache: RefCell<BlobPageCache>,
+}
+
+const BLOB_PAGE_CACHE_MAX_BYTES: usize = 1024 * 1024;
+const BLOB_PAGE_CACHE_MAX_ENTRIES: usize = 256;
+
+struct BlobPageCacheEntry {
+    hash: String,
+    offset: u64,
+    length: usize,
+    total: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct BlobPageCache {
+    entries: VecDeque<BlobPageCacheEntry>,
+    bytes: usize,
+}
+
+impl BlobPageCache {
+    fn get(&mut self, hash: &str, offset: u64, length: usize) -> Option<(u64, Vec<u8>)> {
+        let index = self.entries.iter().position(|entry| {
+            entry.hash == hash && entry.offset == offset && entry.length == length
+        })?;
+        let entry = self.entries.remove(index)?;
+        let result = (entry.total, entry.bytes.clone());
+        self.entries.push_back(entry);
+        Some(result)
+    }
+
+    fn insert(&mut self, entry: BlobPageCacheEntry) {
+        if entry.bytes.len() > BLOB_PAGE_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|existing| {
+            existing.hash == entry.hash
+                && existing.offset == entry.offset
+                && existing.length == entry.length
+        }) && let Some(replaced) = self.entries.remove(index)
+        {
+            self.bytes = self.bytes.saturating_sub(replaced.bytes.len());
+        }
+        self.bytes = self.bytes.saturating_add(entry.bytes.len());
+        self.entries.push_back(entry);
+        while self.bytes > BLOB_PAGE_CACHE_MAX_BYTES
+            || self.entries.len() > BLOB_PAGE_CACHE_MAX_ENTRIES
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.bytes.len());
+        }
+    }
 }
 
 impl Journal {
@@ -83,46 +155,95 @@ impl Journal {
         state_dir: &Path,
         options: JournalOptions,
     ) -> rusqlite::Result<Journal> {
+        fs::create_dir_all(state_dir.join("cas")).map_err(io_to_sql)?;
+        // Pin guards may outlive the caller and reopen SQLite from `Drop`.
+        // Anchor them to an absolute stable path even if an embedding later
+        // changes its process cwd after opening a relative state directory.
+        let state_dir = fs::canonicalize(state_dir).map_err(io_to_sql)?;
         let cas_root = state_dir.join("cas");
-        fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
-        let conn = Connection::open(state_dir.join("journal.db"))?;
-        // `PRAGMA journal_mode=WAL` returns a result row; consume it.
-        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // Wait (rather than immediately fail with SQLITE_BUSY) for a competing
-        // writer's lock: the journal is shared across processes and every
-        // journaling call site swallows errors, so a busy failure here silently
-        // drops the entry and its undo inverse. See `JournalOptions::busy_timeout`.
-        conn.busy_timeout(options.busy_timeout)?;
-        Self::migrate(&conn)?;
+        let db_path = state_dir.join("journal.db");
+        let started = Instant::now();
+        let conn = loop {
+            let attempt = (|| {
+                let conn = Connection::open(&db_path)?;
+                // Install contention handling before *any* pragma or schema
+                // write. `journal_mode=WAL` itself takes a database lock.
+                conn.busy_timeout(options.busy_timeout.saturating_sub(started.elapsed()))?;
+                // `PRAGMA journal_mode=WAL` returns a result row; consume it.
+                conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                Self::migrate(&conn)?;
+                Self::configure_storage_pragmas(&conn, options.storage_limits())?;
+                Ok(conn)
+            })();
+            match attempt {
+                Ok(conn) => break conn,
+                Err(error)
+                    if is_sqlite_contention(&error)
+                        && !options.busy_timeout.is_zero()
+                        && started.elapsed() < options.busy_timeout =>
+                {
+                    // SQLite's busy handler covers SQLITE_BUSY while waiting
+                    // on a lock, but concurrent first-open DDL/journal-mode
+                    // transitions can also return SQLITE_LOCKED immediately.
+                    // Reopen and retry within the same bounded policy window.
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let reconciled_cas_physical_bytes = storage::reconciled_physical_bytes(&cas_root)?;
+        let lease_owner = lease::LeaseOwner::new(&state_dir, db_path, None)?;
         Ok(Journal {
             conn,
             cas_root,
-            _cas_tempdir: None,
+            lease_owner,
             output_hard_cap: options.output_hard_cap,
+            storage_limits: options.storage_limits(),
+            reconciled_cas_physical_bytes,
+            blob_page_cache: RefCell::default(),
         })
     }
 
-    /// Open a throwaway journal: in-memory SQLite database, CAS in a fresh
-    /// temporary directory that lives exactly as long as the returned `Journal`.
+    /// Open a throwaway journal in a fresh temporary directory. The SQLite
+    /// file is temporary too (rather than process-memory-only) so lazy values
+    /// can own and release the same crash-safe pin leases as persistent stores.
     pub fn in_memory() -> rusqlite::Result<Journal> {
         Self::in_memory_with_options(JournalOptions::default())
     }
 
     pub fn in_memory_with_options(options: JournalOptions) -> rusqlite::Result<Journal> {
         let tempdir = tempfile::tempdir().map_err(io_to_sql)?;
-        let cas_root = tempdir.path().join("cas");
+        let state_dir = tempdir.path().to_path_buf();
+        let cas_root = state_dir.join("cas");
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
-        let conn = Connection::open_in_memory()?;
+        let db_path = state_dir.join("journal.db");
+        let conn = Connection::open(&db_path)?;
         conn.busy_timeout(options.busy_timeout)?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::migrate(&conn)?;
+        Self::configure_storage_pragmas(&conn, options.storage_limits())?;
+        let reconciled_cas_physical_bytes = storage::reconciled_physical_bytes(&cas_root)?;
+        let lease_owner = lease::LeaseOwner::new(&state_dir, db_path, Some(tempdir))?;
         Ok(Journal {
             conn,
             cas_root,
-            _cas_tempdir: Some(tempdir),
+            lease_owner,
             output_hard_cap: options.output_hard_cap,
+            storage_limits: options.storage_limits(),
+            reconciled_cas_physical_bytes,
+            blob_page_cache: RefCell::default(),
         })
     }
+}
+
+fn is_sqlite_contention(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 /// rusqlite has no dedicated I/O error variant; `ToSqlConversionFailure` is the
@@ -151,11 +272,32 @@ fn now_ns() -> i64 {
 }
 
 fn hex_bytes(hex: &str) -> Result<Vec<u8>, ()> {
-    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Every CAS key in this crate is a complete BLAKE3 digest. Requiring the
+    // exact shape here keeps malformed caller input and corrupted DB values
+    // away from the sharded path helper, whose byte slicing relies on it.
+    if hex.len() != blake3::OUT_LEN * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(());
     }
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| ()))
         .collect()
+}
+
+fn hash_string(bytes: &[u8], column: usize) -> rusqlite::Result<String> {
+    if bytes.len() != blake3::OUT_LEN {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Blob,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal hash has {} bytes; expected {}",
+                    bytes.len(),
+                    blake3::OUT_LEN
+                ),
+            )),
+        ));
+    }
+    Ok(hex_string(bytes))
 }

@@ -1,0 +1,29 @@
+#!/usr/bin/env shoal
+# Measure the normative language corpus and surface its largest suites.
+
+let suites = glob("spec/cases/*.toml").expand().map(file => {
+  let source = file.read
+  {
+    suite: file.name,
+    cases: source.matches(re"(?m)^\[\[case\]\]").len(),
+    expected_values: source.matches(re"(?m)^value\s*=").len(),
+    expected_errors: source.matches(re"(?m)^error\s*=").len(),
+    expected_stdout: source.matches(re"(?m)^stdout\s*=").len(),
+    skipped: source.matches(re"(?m)^skip\s*=").len(),
+  }
+}).sort_by(.suite)
+
+let cases = suites.map(.cases).sum()
+let skips = suites.map(.skipped).sum()
+assert(cases > 0, "the conformance corpus contains no cases")
+
+{
+  suite_files: suites.len(),
+  cases: cases,
+  active_cases: cases - skips,
+  skipped: skips,
+  expected_values: suites.map(.expected_values).sum(),
+  expected_errors: suites.map(.expected_errors).sum(),
+  expected_stdout: suites.map(.expected_stdout).sum(),
+  largest_suites: suites.sort_by(row => -row.cases).first(15),
+}

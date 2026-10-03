@@ -85,7 +85,6 @@ fn allowed_for(prefix: &str) -> Option<&'static [&'static str]> {
             "conflicted",
             "stashed",
             "stale_symbol",
-            "engine",
         ],
         "prompt.module.git_state" => &[
             "enabled",
@@ -148,7 +147,6 @@ fn walk(v: &toml::Value, prefix: &str, warnings: &mut Vec<String>) {
                 "ascii_symbol",
                 "style",
                 "when",
-                "probe_ttl_s",
                 "format",
             ]
         } else {

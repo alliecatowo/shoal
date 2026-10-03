@@ -3,12 +3,13 @@
 //! logging, no side effects — a golden/snapshot suite drives it with hand-built
 //! `PromptContext` values, no kernel required.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::config::{ParsedFormats, PromptConfig};
-use crate::context::PromptContext;
+use crate::context::{EditMode, PromptContext};
 use crate::format::FormatToken;
-use crate::style::parse_style;
+use crate::style::{Style, parse_style};
 
 mod helpers;
 mod modules;
@@ -21,6 +22,16 @@ pub struct RenderedPrompt {
     pub right: String,
     pub continuation: String,
     pub indicator: String,
+}
+
+/// Timing result from rendering every interactive prompt side once.
+///
+/// Hosts can sample this between commands and surface a bounded warning without
+/// putting logging or other side effects in the per-keystroke render path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderBudgetReport {
+    pub slowest: Duration,
+    pub over_budget: bool,
 }
 
 /// Which format string to render.
@@ -38,6 +49,7 @@ pub enum Side {
 pub struct Renderer {
     config: PromptConfig,
     formats: ParsedFormats,
+    styles: BTreeMap<String, Style>,
 }
 
 /// Classification of a rendered segment for the whitespace-collapse pass.
@@ -59,8 +71,45 @@ impl Renderer {
     /// unknown-module / style warnings (site/content/internals/prompt-editor-lsp.md).
     pub fn new(config: PromptConfig) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
+        if !matches!(
+            config.module.directory.truncate_style.as_str(),
+            "start" | "middle" | "end"
+        ) {
+            warnings.push(format!(
+                "invalid prompt.module.directory.truncate_style `{}`; using `middle`",
+                config.module.directory.truncate_style
+            ));
+        }
+        for (name, module) in &config.module.language {
+            if !matches!(module.when.as_str(), "constrained" | "resolved") {
+                warnings.push(format!(
+                    "invalid prompt.module.language.{name}.when `{}`; using `constrained`",
+                    module.when
+                ));
+            }
+        }
+        let mut config = config;
+        if !matches!(
+            config.module.directory.truncate_style.as_str(),
+            "start" | "middle" | "end"
+        ) {
+            config.module.directory.truncate_style = "middle".into();
+        }
+        for module in config.module.language.values_mut() {
+            if !matches!(module.when.as_str(), "constrained" | "resolved") {
+                module.when = "constrained".into();
+            }
+        }
         let formats = config.parse_formats(&mut warnings);
-        (Self { config, formats }, warnings)
+        let styles = cache_styles(&config, &formats, &mut warnings);
+        (
+            Self {
+                config,
+                formats,
+                styles,
+            },
+            warnings,
+        )
     }
 
     pub fn config(&self) -> &PromptConfig {
@@ -77,9 +126,34 @@ impl Renderer {
         }
     }
 
+    /// Render each interactive side once and report the slowest call.
+    pub fn budget_report(&self, ctx: &PromptContext) -> RenderBudgetReport {
+        let mut slowest = Duration::ZERO;
+        for side in [Side::Left, Side::Right, Side::Continuation] {
+            let start = Instant::now();
+            let _ = self.render_side(side, ctx);
+            slowest = slowest.max(start.elapsed());
+        }
+        RenderBudgetReport {
+            slowest,
+            over_budget: slowest > Duration::from_millis(self.config.budget.render_deadline_ms),
+        }
+    }
+
     /// Render a single side, honoring the site/content/internals/prompt-editor-lsp.md deadline: once elapsed exceeds the
     /// budget, every remaining module renders its cheapest fallback (empty).
     pub fn render_side(&self, side: Side, ctx: &PromptContext) -> String {
+        self.render_side_with_edit_mode(side, ctx, ctx.edit_mode)
+    }
+
+    /// Render a side with editor state supplied by the live line-editor
+    /// adapter. All other values still come from the immutable context.
+    pub fn render_side_with_edit_mode(
+        &self,
+        side: Side,
+        ctx: &PromptContext,
+        edit_mode: EditMode,
+    ) -> String {
         let tokens = match side {
             Side::Left => &self.formats.left,
             Side::Right => &self.formats.right,
@@ -89,7 +163,7 @@ impl Renderer {
         let start = Instant::now();
         let deadline = Duration::from_millis(self.config.budget.render_deadline_ms);
         let mut segs = Vec::with_capacity(tokens.len());
-        self.render_tokens(tokens, ctx, start, deadline, &mut segs);
+        self.render_tokens(tokens, ctx, edit_mode, start, deadline, &mut segs);
         join_collapsing(&segs)
     }
 
@@ -97,6 +171,7 @@ impl Renderer {
         &self,
         tokens: &[FormatToken],
         ctx: &PromptContext,
+        edit_mode: EditMode,
         start: Instant,
         deadline: Duration,
         out: &mut Vec<Seg>,
@@ -117,7 +192,7 @@ impl Renderer {
                     let text = if start.elapsed() > deadline {
                         String::new()
                     } else {
-                        self.render_placeholder(id, ctx)
+                        self.render_placeholder_with_edit_mode(id, ctx, edit_mode)
                     };
                     out.push(Seg {
                         empty: text.is_empty(),
@@ -127,7 +202,7 @@ impl Renderer {
                 }
                 FormatToken::Group { inner, style } => {
                     let mut inner_segs = Vec::new();
-                    self.render_tokens(inner, ctx, start, deadline, &mut inner_segs);
+                    self.render_tokens(inner, ctx, edit_mode, start, deadline, &mut inner_segs);
                     let joined = join_collapsing(&inner_segs);
                     let text = self.paint(style, &joined, ctx);
                     out.push(Seg {
@@ -142,6 +217,15 @@ impl Renderer {
 
     /// Render one `$placeholder` to its styled string, or `""` when hidden.
     pub fn render_placeholder(&self, id: &str, ctx: &PromptContext) -> String {
+        self.render_placeholder_with_edit_mode(id, ctx, ctx.edit_mode)
+    }
+
+    fn render_placeholder_with_edit_mode(
+        &self,
+        id: &str,
+        ctx: &PromptContext,
+        edit_mode: EditMode,
+    ) -> String {
         if let Some(tool) = id.strip_prefix("language_") {
             return self.render_language(tool, ctx);
         }
@@ -149,7 +233,7 @@ impl Renderer {
             return self.render_custom(name, ctx);
         }
         match id {
-            "character" => self.render_character(ctx),
+            "character" => self.render_character(ctx, edit_mode),
             "directory" => self.render_directory(ctx),
             "git_branch" => self.render_git_branch(ctx),
             "git_status" => self.render_git_status(ctx),
@@ -175,9 +259,13 @@ impl Renderer {
         if text.is_empty() {
             return String::new();
         }
-        let resolved = self.config.style.resolve(spec);
-        let style = parse_style(resolved, &mut Vec::new());
-        style.paint(text, ctx.no_color)
+        if let Some(style) = self.styles.get(spec) {
+            return style.paint(text, ctx.no_color);
+        }
+        // Every config-owned style is admitted into `styles` at construction.
+        // Keep this total for future internal callers without introducing
+        // logging or mutable cache state into the pure render path.
+        parse_style(self.config.style.resolve(spec), &mut Vec::new()).paint(text, ctx.no_color)
     }
 
     /// nerd-font symbol when available (site/content/internals/prompt-editor-lsp.md), else the ascii fallback.
@@ -192,6 +280,84 @@ impl Renderer {
     fn ellipsis(&self, ctx: &PromptContext) -> &'static str {
         if ctx.unicode { "…" } else { "..." }
     }
+}
+
+fn cache_styles(
+    config: &PromptConfig,
+    formats: &ParsedFormats,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, Style> {
+    let mut styles = BTreeMap::new();
+    let module = &config.module;
+    let mut specs = vec![
+        "ok",
+        "error",
+        "warn",
+        "info",
+        "muted",
+        "accent",
+        &module.character.success_style,
+        &module.character.error_style,
+        &module.character.vicmd_style,
+        &module.directory.style,
+        &module.git_branch.style,
+        &module.git_status.style,
+        &module.git_state.style,
+        &module.cmd_duration.style,
+        &module.exit_status.style,
+        &module.jobs.style,
+        &module.time.style,
+        &module.username.style,
+        &module.username.root_style,
+        &module.hostname.style,
+        &module.reef.style,
+        &module.principal.style,
+        &module.principal.agent_style,
+        &module.battery.low_style,
+        &module.battery.style,
+    ];
+    specs.extend(module.leash.style_by_tier.values().map(String::as_str));
+    specs.extend(module.language.values().map(|entry| entry.style.as_str()));
+    specs.extend(module.custom.values().map(|entry| entry.style.as_str()));
+    for spec in specs {
+        cache_style(config, spec, &mut styles, warnings);
+    }
+    for tokens in [
+        &formats.left,
+        &formats.right,
+        &formats.continuation,
+        &formats.transient,
+    ] {
+        cache_format_styles(config, tokens, &mut styles, warnings);
+    }
+    styles
+}
+
+fn cache_format_styles(
+    config: &PromptConfig,
+    tokens: &[FormatToken],
+    styles: &mut BTreeMap<String, Style>,
+    warnings: &mut Vec<String>,
+) {
+    for token in tokens {
+        if let FormatToken::Group { inner, style } = token {
+            cache_style(config, style, styles, warnings);
+            cache_format_styles(config, inner, styles, warnings);
+        }
+    }
+}
+
+fn cache_style(
+    config: &PromptConfig,
+    spec: &str,
+    styles: &mut BTreeMap<String, Style>,
+    warnings: &mut Vec<String>,
+) {
+    if styles.contains_key(spec) {
+        return;
+    }
+    let style = parse_style(config.style.resolve(spec), warnings);
+    styles.insert(spec.to_string(), style);
 }
 
 /// Join rendered segments applying the whitespace-collapse rule (site/content/internals/prompt-editor-lsp.md): a

@@ -223,7 +223,7 @@ The approving system should display the source and complete effect list, not onl
 
 If the requested list omits a required kind, Shoal keeps it pending and lists uncovered effects.
 
-Current security caveat: raw `cap.request` does not authenticate the approving caller. This workflow is valid only inside a fully trusted socket boundary. Do not present it as multi-party authorization.
+`cap.request` authenticates the approving attachment, denies requester self-approval by default, requires explicit cross-principal approval authority, and durably records the immutable grant binding. It is a one-shot approval workflow, not a durable policy edit or transferable capability.
 
 ### Step 3: re-inspect and apply promptly
 
@@ -239,7 +239,7 @@ Then:
 {"plan_ref":"plan:7b2fd854cb805ba1"}
 ```
 
-Plan references can collide because the current 16-hex fingerprint excludes source/session/principal. Inspect immediately before apply, avoid long delays/concurrent same-shape plans, and re-plan after any ambiguity or daemon restart. The application path checks stored caller/source metadata, but collision can invalidate the handle.
+Plan references bind full source/AST/effects/Session/principal identity and include a unique per-kernel object suffix, so same-shape and identical repeated plans do not overwrite one another. Still inspect before apply and re-plan after a daemon restart: the object is ephemeral and approval is one-shot.
 
 ### Step 4: verify the effect
 
@@ -312,7 +312,10 @@ Task output is captured as a whole transcript value after completion; it is not 
 
 The response means cancellation was requested, not necessarily that every descendant is already gone. Continue observing until a terminal state. Decide how partial filesystem/network effects will be reconciled; cancellation is not rollback.
 
-Kernel task suspend/resume exists only as raw stub methods and currently returns unavailable. Do not design a workflow that depends on pausing background tasks.
+Raw kernel task suspend/resume controls process-backed tasks; the task record's `controls` object
+advertises current availability and pure evaluator work reports neither operation. MCP task resources
+can display that record, but MCP intentionally exposes cancellation—not the raw pause/resume methods—
+so do not design an MCP workflow around pausing tasks.
 
 ## Resumable event processing
 
@@ -342,21 +345,25 @@ Pseudocode:
 
 ```text
 cursor = durable_load(channel)
-events = read(channel, since=cursor)
-for event in events ordered by seq:
-    if event.seq <= cursor: continue
-    if event.seq != cursor + 1: reconcile()
-    handle_idempotently(event)
-    durable_store(event.seq)
-    cursor = event.seq
+do:
+    page = read(channel, since=cursor)
+    for event in page.events ordered by seq:
+        if event.seq <= cursor: continue
+        if event.seq != cursor + 1: reconcile()
+        handle_idempotently(event)
+        durable_store(event.seq)
+        cursor = event.seq
+while page.truncated
 subscribe(channel)
 ```
 
 The first event in a channel is `seq=0`, so an implementation may represent “no cursor” separately instead of initializing to zero and skipping it.
 
-`journal` and `session.transcript` can reconstruct surviving durable history beyond their 1,024-event ring. Task, approval, render, and user channels cannot. A `{dropped, latest_seq}` event means pull/reconcile before proceeding.
+`journal` and `session.transcript` can reconstruct surviving durable history beyond their count/byte-bounded ring. Task, approval, render, and user channels cannot. A `{dropped, dropped_bytes, latest_seq}` event means pull/reconcile before proceeding.
 
-MCP `resources/unsubscribe` currently acknowledges without actually stopping its dedicated kernel connection. Subscribe once per URI per MCP process, and rely on facade process termination for cleanup.
+MCP `resources/unsubscribe` removes that URI's registered worker, shuts down its dedicated kernel
+connection, and joins the forwarding thread. Facade process termination performs the same cleanup
+for subscriptions that remain active.
 
 ## Interactive PTY workflow
 
@@ -454,11 +461,11 @@ See [Command adapters](@/docs/adapters.md) for parser and schema contracts.
 
 ## Reef-aware agent work
 
-Read `shoal://session/reef` before assuming a tool version/provider. Reef resolution is lazy and the evaluator caches its discovered scope; same-cwd manifest changes may not be noticed until a relevant state transition/restart.
+Read `shoal://session/reef` before assuming a tool version/provider. Reef resolution is lazy. The evaluator fingerprints every manifest candidate and adjacent lock from cwd to root, so same-cwd creation, edits, replacement, and removal invalidate its cached scope on the next relevant resolution.
 
 When reproducibility matters:
 
-- commit the manifest and lockfile;
+- commit exact manifest constraints and materialize the host-local lock during setup;
 - verify hash-pinned tools;
 - use hermetic Reef scope intentionally;
 - distinguish Reef's tool selection from Leash's behavior policy;
@@ -479,7 +486,7 @@ See [Reef tool resolution](@/docs/reef.md).
 | `-32012` | Plan absent/overwritten/restart | Derive a fresh plan. |
 | `-32021` | Task absent/other session/restart | Reconcile journal/artifact; cannot restore live task. |
 | `-32022` | PTY absent/closed/other session | Do not replay keystrokes blindly; reopen after confirmation. |
-| auth failed | Token invalid/expired/revoked/not loaded | Align store, restart after token change, refresh secret. |
+| auth failed | Token invalid/expired/revoked or store unavailable | Align the state path, repair the store, or refresh the bearer. |
 | event sequence gap | Dropped/retention/restart | Pull cursor, then reconcile authoritative state. |
 
 Never retry an effectful `shoal_exec` automatically merely because the client lost its response. The command may have completed. Query the journal, transcript events, expected artifact, or an idempotency key in the target system first.
@@ -541,7 +548,7 @@ Before automating consequential work, confirm:
 
 - the socket is private and every connector process is trusted;
 - the token principal exists in explicit policy;
-- token changes were followed by kernel restart;
+- token CLI and kernel use the same state path (changes are observed live);
 - `caps_enforced` and platform dimension gaps are acceptable;
 - the plan's effects are concrete and reviewed;
 - the session is not shared with an untrusted principal;

@@ -38,13 +38,12 @@ src = "{a: 1}.get(0, 9)"
 error = "type_error"
 
 [[case]]
-name = "lrerr-get-table-is-type-error"
-# `.get` admits exactly `record+str` or `list+int` — a `table` receiver
-# (`ls`'s structured output) has no arm of its own, unlike the seq()-backed
-# methods that treat a table as a list-of-records.
+name = "lrerr-get-table-index-returns-record"
+# A table is the sequence-of-records value, so its advertised `.get` method
+# indexes rows with the same checked/default semantics as list indexing.
 fixture = ["a.txt"]
-src = 'ls.get(0, 9)'
-error = "type_error"
+src = 'ls.get(0, 9).name'
+value = '"a.txt"'
 
 [[case]]
 name = "lrerr-zip-non-collection-argument-is-type-error"

@@ -68,7 +68,41 @@ cargo install --path crates/shoal-secret
 cargo install --path crates/shoal-history
 cargo install --path crates/shoal-doctor
 cargo install --path crates/shoal-exec
+cargo install --path crates/shoal-leash
 ```
+
+The repository's mise tasks build and install the complete set together, so a
+main binary cannot be updated while its required companions remain stale:
+
+```bash
+mise install
+mise run install            # staged, verified install with automatic failure rollback
+mise run install:clean      # remove the managed set, then reinstall transactionally
+mise run install:check      # compare binaries, man pages, and completions
+mise run install:test       # exercise the lifecycle under a temporary prefix
+mise run install:uninstall  # remove only managed Shoal artifacts
+```
+
+Executables go to `${CARGO_HOME:-$HOME/.cargo}/bin` and section-1 man pages to
+the sibling `share/man/man1`; set `SHOAL_INSTALL_DIR` or `SHOAL_MAN_DIR` to
+override either destination. Bash, zsh, and fish completions are installed under the prefix's
+standard `share/bash-completion`, `share/zsh/site-functions`, and
+`share/fish/vendor_completions.d` directories. The installer stages and validates every input before
+the first destination mutation, replaces each file through a same-directory rename, and restores
+the complete prior managed set if a commit fails. `--uninstall` is source-independent and leaves
+unrelated prefix files untouched.
+
+Release archives contain `install.shl` beside the binaries and `man/`. From an extracted archive,
+run it through the included executable with explicit destinations when desired:
+
+```bash
+SHOAL_RELEASE_DIR="$PWD" SHOAL_INSTALL_DIR="$HOME/.local/bin" \
+  ./shoal ./install.shl
+```
+
+Installation does
+not restart an existing durable kernel because that would discard its live
+in-memory Sessions. Restart it explicitly after an upgrade when appropriate.
 
 Installing the sandbox helper beside the other executables matters when Leash resolves a concrete OS sandbox: the spawn layer searches beside the current executable, not arbitrary `PATH`, for `shoal-sandbox-exec`.
 
@@ -77,7 +111,7 @@ Check:
 ```bash
 for bin in shoal shoal-kernel shoal-mcp shoal-lsp \
            shoal-token shoal-secret shoal-history shoal-doctor \
-           shoal-sandbox-exec
+           shoal-sandbox-exec shoal-landlock-helper
 do
   command -v "$bin" || printf 'missing: %s\n' "$bin"
 done
@@ -85,32 +119,35 @@ done
 
 ## XDG path matrix
 
-The companions do not yet use one perfectly consistent root. This table is operationally important:
+State and data are intentionally separate. This table is operationally important:
 
 | Component | Default state/data path |
 | --- | --- |
 | `shoal-kernel` journal/tokens | `$XDG_STATE_HOME/shoal`, else `~/.local/state/shoal` |
 | main `shoal` journal/history | state-rooted (`XDG_STATE_HOME`) |
-| `shoal-history` | `$XDG_DATA_HOME/shoal`, else `~/.local/share/shoal` |
-| evaluator secrets | `$SHOAL_SECRET_DIR`, else `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` |
-| `shoal-secret` | `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` (ignores `SHOAL_SECRET_DIR`) |
-| `shoal-doctor` “state dir” probe | `$XDG_DATA_HOME/shoal`, else `~/.local/share/shoal` |
+| `shoal-history` | explicit `--state-dir`, else layered `journal.state_dir`, else the shared XDG state root |
+| evaluator and `shoal-secret` | `$SHOAL_SECRET_DIR`, else `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` |
+| `shoal-doctor` “state dir” probe | effective `journal.state_dir`, else the shared state root above |
 | user config/policy/adapters | `$XDG_CONFIG_HOME/shoal`, else `~/.config/shoal` |
 
-When operating a kernel or the main shell journal, pass `shoal-history --state-dir` explicitly. When using `SHOAL_SECRET_DIR` for the evaluator, the CLI cannot target it by flag or environment today; temporarily align `XDG_DATA_HOME`, or manage the store with a process/environment layout that points both at the same directory.
+Relative `journal.state_dir` and `SHOAL_SECRET_DIR` values resolve from each process's startup cwd. Use explicit `--state-dir` for a durable kernel launched with its own root, to override config, or to recover while layered config is malformed. The evaluator and `shoal-secret` share the same secret-directory discovery contract.
 
 ## `shoal-kernel`
 
 ```text
-shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]
+shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store PATH] [--policy FILE]
+             [--require-token] [--require-peer-uid]
 ```
 
 | Option | Default | Notes |
 | --- | --- | --- |
 | `--session NAME` | `default` | Derives default socket filename only; clients choose attached session. |
 | `--socket PATH` | runtime discovery | Explicit Unix socket path. |
-| `--state-dir PATH` | XDG state | Journal/CAS/tokens. |
+| `--state-dir PATH` | XDG state | Journal/CAS and the default token-store parent. |
+| `--token-store PATH` | `SHOAL_TOKEN_STORE`, then `<state-dir>/tokens.json` | Exact credential authority file. |
 | `--policy FILE` | permissive local human | Explicit Leash TOML; load/parse failure is fatal. |
+| `--require-token` | off | Reject every tokenless public attachment. |
+| `--require-peer-uid` | off | Require the OS-reported peer UID to equal the kernel effective UID; unsupported platforms fail startup. |
 
 Example:
 
@@ -202,17 +239,24 @@ shoal lsp
 
 Both forms run an LSP server over stdin/stdout; the dispatcher resolves the companion through `PATH` and accepts no trailing options.
 
+The stdio transport accepts at most 16 KiB/64 headers and a 32 MiB body before tower-lsp sees a
+frame. Invalid, duplicate/missing `Content-Length`, oversized, or truncated frames close the server
+cleanly without echoing request content. Document analysis uses four blocking workers, coalesces one
+latest pending update per URI, and bounds queued analysis source to 32 MiB/64 URI jobs.
+
 Current server capabilities:
 
 | Capability | Behavior |
 | --- | --- |
-| Text sync | Full-document changes. |
-| Diagnostics | One syntax diagnostic for incomplete/error parse; cleared on valid document/close. |
-| Formatting | Whole-document edit using the Shoal formatter, only when parse is complete. |
-| Completion | Keywords, canonical builtin command heads, and earlier lexical `let`/`var`/`fn`/`alias` declarations. |
-| Hover | Short help for `let`, `var`, `fn`, `match`, `with`, `spawn`, `sh`, and `it`. |
+| Text sync | True incremental UTF-16 range edits, with full-document replacement accepted when clients send it. Malformed/stale edits are rejected without corrupting the stored document. |
+| Diagnostics | Syntax diagnostics plus side-effect-free planner analysis; cleared/refreshed for the latest document version. |
+| Formatting | Whole-document edit only when parse is complete and the shared token-aware safety pass can preserve all semantic source. Comments/shebangs return no edit and publish `format_trivia`. |
+| Completion | Keywords, canonical builtin heads, and parser-derived visible bindings/functions/parameters/aliases with source details/docs. |
+| Hover | Declaration details/docs for visible symbols plus language/builtin resolution help. |
+| Goto definition | Scope-aware local declarations and exported members/paths of directly used file modules. |
+| Document symbols | Parser-derived bindings, functions, parameters, aliases, and nested scopes. |
 
-Not currently advertised: goto definition, references, rename, code actions, workspace symbols, semantic tokens, signature help, incremental sync, workspace configuration, or file watching.
+Not currently advertised: references, rename, code actions, workspace symbols/index, semantic tokens, signature help, workspace configuration, project/manifest graph, or file watching.
 
 Generic editor configuration should launch one of:
 
@@ -232,7 +276,7 @@ Formatting returns no edits when the current document is incomplete or invalid. 
 
 ### Completion caveat
 
-Local declaration discovery is intentionally lexical and simple. It scans text before the cursor, not the full semantic scope graph. Expect suggestions for declarations that may be shadowed/out of scope, and no project-wide symbol index.
+Local declaration discovery walks the parsed AST and models lexical visibility/shadowing, including function parameters and nested patterns. It is not type-aware and has no project-wide symbol index. Cross-file definition is deliberately narrow: direct file `use` paths and exported members, not a general module/workspace resolver.
 
 ## `shoal-token`
 
@@ -261,7 +305,14 @@ The bearer secret is the only stdout line. Creation metadata (`created ID (secre
 
 If PROFILE is omitted, it is `default`. `--cap` is repeatable. `--ttl` is parsed as signed seconds and converted to nanoseconds; zero or negative values create immediately expired tokens and are not useful.
 
-Important: profile/capability values are metadata reported at attachment, not grants. Leash authorization uses the principal's policy entry. See [Security and trust boundaries](@/docs/security.md#profile-and-cap-are-metadata-today).
+Creation rejects empty/control-bearing or oversized identity fields, duplicate capability labels,
+more than 128 capability labels, a full 4,096-record store, or a candidate document over 4 MiB.
+Capability labels are stored in deterministic sorted order. Rejection is transactional: the prior
+authority file remains unchanged.
+
+Important: profile/capability values do not grant Leash effects; those use the principal's policy
+entry. Exact administrative labels such as `token.admin` are consumed by their named handlers. See
+[Security and trust boundaries](@/docs/security.md#profile-and-cap-mostly-describe-metadata).
 
 ### List
 
@@ -285,11 +336,13 @@ shoal-token revoke 0123456789abcdef
 
 Unknown IDs fail. Revocation writes a timestamp rather than deleting metadata.
 
-### Kernel reload warning
+### Live kernel visibility
 
-The daemon loads its token store once. Create/revoke through this CLI does not update a running kernel's in-memory copy. Restart every affected kernel after token changes. Expiry is still checked against current time on each validation.
+Create/revoke is visible to a running kernel without restart. Writers take an exclusive fd lock and
+reload before mutation; the kernel revalidates an attached bearer from a fresh shared-locked snapshot
+before every request. Revocation or expiry therefore fails the next request and clears the attachment.
 
-The kernel always uses `<--state-dir>/tokens.json`, ignoring `SHOAL_TOKEN_STORE`; align the paths.
+The CLI and kernel share token-store discovery. Kernel precedence is explicit `--token-store`, then nonempty `SHOAL_TOKEN_STORE`, then `<--state-dir>/tokens.json`. The CLI uses the same environment override, then the shared XDG state default. Empty overrides are ignored. Prefer absolute overrides so supervised processes with different startup directories cannot diverge.
 
 ## `shoal-secret`
 
@@ -319,7 +372,9 @@ Or from a protected file:
 shoal-secret set signing-key < "$HOME/.private/signing-key"
 ```
 
-Names must be nonempty ASCII letters, digits, `_`, or `-`.
+Names must be nonempty ASCII letters, digits, `_`, or `-`, with a maximum of 128 bytes. A value is
+limited to 256 KiB. The CLI applies that wall while reading stdin, before asking the store to mutate,
+so an unbounded pipe cannot become an unbounded plaintext buffer.
 
 ### List and delete
 
@@ -335,23 +390,37 @@ Names are printed sorted. Deleting a missing name is a successful no-op from the
 Directory:
 
 ```text
+$SHOAL_SECRET_DIR
 $XDG_DATA_HOME/shoal/secrets
 ~/.local/share/shoal/secrets
 ```
 
-The directory is set to `0700`. `master.key` is 32 random bytes and `secrets.json` is an AES-256-GCM authenticated envelope with a new 12-byte nonce for each save; both files must have no group/world bits (effectively `0600`) or open fails. Writes use a synced temporary file and atomic persist.
+An empty `SHOAL_SECRET_DIR` is ignored. A nonempty value is used exactly; relative values are relative to the process startup directory.
+
+The directory is set to `0700`. `master.key` is 32 raw random bytes (there is no password or KDF)
+and `secrets.json` is an AES-256-GCM authenticated envelope with a new 12-byte nonce for each save;
+both files must be regular files with no group/world bits (effectively `0600`) or open fails. Writes
+use a synced temporary file, atomic persist, and a directory sync.
+
+The encrypted file is capped at 16 MiB before JSON/base64/decryption, ciphertext and decrypted JSON
+have independent caps, and the plaintext map admits at most 4,096 identities, 256 KiB per value,
+and 2 MiB of aggregate secret bytes. JSON depth/shape, canonical base64, duplicate identities,
+unknown/duplicate envelope fields, nonce length, and authentication tag are checked. AES-GCM adds a
+fixed 16-byte tag and does not have decompression-like output amplification.
+
+Malformed, ambiguous, non-regular, or oversized snapshots fail closed for `set`, `delete`, `list`,
+and `secret.get`. Shoal never truncates or replaces such a file automatically; it remains intact for
+diagnosis and recovery. Replacing an existing identity remains allowed when the map is at its
+identity cap, provided the value and aggregate limits still hold.
 
 The key is stored beside the ciphertext. Encryption prevents accidental plaintext inspection and detects tampering; it does not protect against an attacker who can read the whole directory. Filesystem permissions and OS-user isolation remain the boundary.
 
 Every set/delete decrypts and rewrites the complete map. This store is appropriate for a modest number of local secrets, not a high-concurrency remote vault.
 
-### Path mismatch
-
-The evaluator honors `SHOAL_SECRET_DIR` before XDG/HOME. This CLI does not. If `SHOAL_SECRET_DIR=/custom` is set, `shoal-secret set` still writes to the XDG location while `secret.get` reads `/custom`.
-
-Until the CLI gains a directory option, align by choosing `XDG_DATA_HOME` such that its `shoal/secrets` equals the intended store, avoid the override, or populate the custom store using a trusted program built on the library.
-
-Exit codes: usage/store-open failure 2, set/list/delete operation failure 1, success 0.
+Exit codes: usage/store-open failure 2, set/list/delete operation failure 1, success 0. At the
+library boundary, caller admission failures use `InvalidInput`; malformed/ambiguous persisted state
+uses `InvalidData`; permission and ordinary I/O errors retain their native kinds. Error text never
+contains secret values.
 
 ## `shoal-history`
 
@@ -361,27 +430,26 @@ shoal-history [--state-dir PATH] [--json] [COMMAND] [COMMAND OPTIONS]
 
 Global flags are removed before command parsing and may appear before or after the command. The omitted command is `query`.
 
-### Always select the right journal
+### Journal selection
 
-The utility defaults to XDG **data**:
+Selection precedence is:
 
-```text
-$XDG_DATA_HOME/shoal
-~/.local/share/shoal
-```
+1. explicit `--state-dir` (also bypasses layered config loading);
+2. bounded, validated layered `journal.state_dir`, relative to startup cwd;
+3. the shared XDG state root.
 
-The main shell and kernel normally write under XDG **state**. Use:
+An explicitly launched durable kernel does not inherit shell config; target its CLI root directly:
 
 ```bash
 shoal-history --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/shoal" query
 ```
 
-An empty result from the default location often means path mismatch, not absent history.
+An empty result can still mean the history process started from a different cwd with a relative configured root, or that a durable kernel uses a separate explicit root.
 
 ### Query
 
 ```text
-query [--since NS] [--principal NAME] [--effects TEXT]
+query [--since NS] [--principal NAME] [--kind statement|exec|approval] [--effects TEXT]
       [--head COMMAND] [--status ok|failed] [--limit N]
 ```
 
@@ -391,14 +459,15 @@ Example:
 shoal-history --state-dir "$STATE" --json query \
   --since 1750000000000000000 \
   --principal agent:reviewer \
+  --kind statement \
   --effects fs_write \
   --status failed \
   --limit 50
 ```
 
-`--since` is a signed nanosecond timestamp. `--effects` is one substring-style effect matcher, despite the plural spelling; repeat/multiple all-of matching is not implemented. Default limit is 100; if an effect filter is present the library scans all rows, filters in memory, then truncates.
+`--since` is a signed nanosecond timestamp. `--kind` selects one schema-v2 granularity. `--effects` is one structured effect-kind matcher, despite the plural spelling; repeat/multiple all-of matching is not implemented. Default limit is 100. The journal steps candidates and stops after retaining the requested number of matching entries rather than materializing the entire history.
 
-Human output prints ID, principal, verdict, and first source line. `--json` adds AST, effects, cwd, timing/status, and output descriptors. Treat it as sensitive.
+Human output prints ID, kind, principal, verdict, and first source line. `--json` adds `parent_id`, AST, effects, cwd, timing/status, and output descriptors. Treat it as sensitive.
 
 ### Show
 

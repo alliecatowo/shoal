@@ -4,6 +4,8 @@
 
 use super::*;
 
+pub(crate) const MAX_CALL_DEPTH: usize = 128;
+
 impl Evaluator {
     pub(crate) fn eval_args(&mut self, args: &Args) -> VResult<CallArgs> {
         Ok(CallArgs {
@@ -23,16 +25,16 @@ impl Evaluator {
     pub(crate) fn call_value(&mut self, f: &Value, args: CallArgs) -> VResult<Value> {
         // Runtime recursion guard (defect #9): unbounded native recursion aborts
         // the process, so cap the interpreter call stack well below that.
-        self.call_depth += 1;
-        if self.call_depth > 10_000 {
-            self.call_depth -= 1;
+        self.exec.control.call_depth += 1;
+        if self.exec.control.call_depth > MAX_CALL_DEPTH {
+            self.exec.control.call_depth -= 1;
             return Err(ErrorVal::new(
                 "recursion_limit",
-                "recursion limit exceeded (10000 nested calls)",
+                format!("maximum call depth of {MAX_CALL_DEPTH} exceeded"),
             ));
         }
         let r = self.call_value_inner(f, args);
-        self.call_depth -= 1;
+        self.exec.control.call_depth -= 1;
         r
     }
 
@@ -65,8 +67,42 @@ impl Evaluator {
                         format!("unknown argument `{name}`"),
                     ));
                 }
-                let old = self.env.clone();
-                self.env = c.env.child();
+                for param in &c.params {
+                    if let Some(ty) = &param.ty
+                        && let Err(error) = crate::coerce::validate_annotation(ty)
+                    {
+                        return Err(ErrorVal::new(
+                            error.code,
+                            format!("argument `{}`: {}", param.name, error.msg),
+                        )
+                        .or_span(ty.span));
+                    }
+                }
+                if let Some(rest) = &c.rest
+                    && let Some(ty) = &rest.ty
+                    && let Err(error) = crate::coerce::validate_annotation(ty)
+                {
+                    return Err(ErrorVal::new(
+                        error.code,
+                        format!("variadic argument `{}`: {}", rest.name, error.msg),
+                    )
+                    .or_span(ty.span));
+                }
+                if let Some(ty) = &c.ret
+                    && let Err(error) = crate::coerce::validate_annotation(ty)
+                {
+                    return Err(ErrorVal::new(
+                        error.code,
+                        format!(
+                            "function `{}` return: {}",
+                            c.name.as_deref().unwrap_or("<lambda>"),
+                            error.msg
+                        ),
+                    )
+                    .or_span(ty.span));
+                }
+                let old = self.exec.shell.env.clone();
+                self.exec.shell.env = c.env.child();
                 for (i, p) in c.params.iter().enumerate() {
                     let val = args
                         .named
@@ -76,40 +112,85 @@ impl Evaluator {
                         .or_else(|| args.pos.get(i).cloned());
                     let val = match (val, &p.default) {
                         (Some(v), _) => v,
-                        (None, Some(d)) => self.eval_expr(d, Position::Value)?,
+                        (None, Some(d)) => match self.eval_expr(d, Position::Value) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                self.exec.shell.env = old;
+                                return Err(error);
+                            }
+                        },
                         _ => {
-                            self.env = old;
+                            self.exec.shell.env = old;
                             return Err(ErrorVal::new(
                                 "arg_error",
                                 format!("missing argument `{}`", p.name),
                             ));
                         }
                     };
-                    // A `list<T>` annotation coerces per element (site/content/internals/language-conformance-contract.md
-                    // site 2) on the EXPR path too; CMD calls arrive with
-                    // word lists pre-coerced, so this is idempotent there.
-                    let val = match crate::coerce::coerce_list_param(val, p.ty.as_ref()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            self.env = old;
-                            return Err(e);
+                    let val = if let Some(ty) = &p.ty {
+                        match crate::coerce::coerce_param(val, ty) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                self.exec.shell.env = old;
+                                return Err(ErrorVal::new(
+                                    error.code,
+                                    format!("argument `{}`: {}", p.name, error.msg),
+                                )
+                                .or_span(ty.span));
+                            }
                         }
+                    } else {
+                        val
                     };
-                    self.env.declare(p.name.clone(), val, false);
+                    if let Err(limit) = self.exec.shell.env.declare(p.name.clone(), val, false) {
+                        self.exec.shell.env = old;
+                        return Err(limit);
+                    }
                 }
                 if let Some(rest) = &c.rest {
-                    self.env.declare(
-                        rest.name.clone(),
-                        Value::List(args.pos.iter().skip(c.params.len()).cloned().collect()),
-                        false,
-                    );
+                    let items = args.pos.iter().skip(c.params.len()).cloned().collect();
+                    let value = if let Some(ty) = &rest.ty {
+                        match crate::coerce::coerce_rest(items, ty) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                self.exec.shell.env = old;
+                                return Err(ErrorVal::new(
+                                    error.code,
+                                    format!("variadic argument `{}`: {}", rest.name, error.msg),
+                                )
+                                .or_span(ty.span));
+                            }
+                        }
+                    } else {
+                        Value::List(items)
+                    };
+                    if let Err(limit) = self.exec.shell.env.declare(rest.name.clone(), value, false)
+                    {
+                        self.exec.shell.env = old;
+                        return Err(limit);
+                    }
                 }
                 // Track fn-body nesting so `cd`/env writes can be rejected (#10).
-                self.in_fn_body += 1;
-                let out = self.eval_expr(&c.body, Position::Value);
-                self.in_fn_body -= 1;
-                self.env = old;
-                out
+                self.exec.control.in_fn_body += 1;
+                let out = self.eval_closure_body(&c.body);
+                self.exec.control.in_fn_body -= 1;
+                self.exec.shell.env = old;
+                let out = out?;
+                if let Some(ty) = &c.ret {
+                    crate::coerce::check_return(out, ty).map_err(|error| {
+                        ErrorVal::new(
+                            error.code,
+                            format!(
+                                "function `{}` return: {}",
+                                c.name.as_deref().unwrap_or("<lambda>"),
+                                error.msg
+                            ),
+                        )
+                        .or_span(ty.span)
+                    })
+                } else {
+                    Ok(out)
+                }
             }
             Value::CmdRef(call) => {
                 let mut call = (**call).clone();
@@ -138,6 +219,24 @@ impl Evaluator {
                 format!("{} is not callable", f.type_name()),
             )),
         }
+    }
+
+    /// Function bodies are normally block expressions. Enter their block
+    /// evaluator directly so each Shoal call does not retain a second copy of
+    /// `eval_expr`'s large native dispatch frame for the entire nested call.
+    /// Keep the same expression-span decoration the generic path applies.
+    fn eval_closure_body(&mut self, body: &Expr) -> VResult<Value> {
+        let Expr::Block { block, .. } = body else {
+            return self.eval_expr(body, Position::Value);
+        };
+        let result = match self.eval_block(block, false) {
+            Ok(Flow::Value(value) | Flow::Return(value)) => Ok(value),
+            Ok(Flow::Break | Flow::Continue) => {
+                Err(ErrorVal::new("custom", "loop control outside loop"))
+            }
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| error.or_span(body.span()))
     }
 
     /// `assert(cond: bool, msg: str?)` (site/content/internals/intercrate-protocol-contracts.md): raise `assert_failed`
@@ -172,6 +271,9 @@ impl Evaluator {
     }
 
     pub(crate) fn call_constructor(&self, name: &str, args: &CallArgs) -> VResult<Option<Value>> {
+        let Some(constructor) = crate::constructors::Constructor::named(name) else {
+            return Ok(None);
+        };
         let one = || {
             if !args.named.is_empty() || args.pos.len() != 1 {
                 Err(ErrorVal::new(
@@ -182,8 +284,8 @@ impl Evaluator {
                 Ok(&args.pos[0])
             }
         };
-        match name {
-            "path" => match one()? {
+        match constructor {
+            crate::constructors::Constructor::Path => match one()? {
                 Value::Str(s) => Ok(Some(Value::Path(PathBuf::from(s)))),
                 Value::Path(p) => Ok(Some(Value::Path(p.clone()))),
                 v => Err(ErrorVal::new(
@@ -191,7 +293,7 @@ impl Evaluator {
                     format!("path expects str, found {}", v.type_name()),
                 )),
             },
-            "glob" => match args.pos.as_slice() {
+            crate::constructors::Constructor::Glob => match args.pos.as_slice() {
                 [Value::Str(pattern)]
                     if args
                         .named
@@ -200,7 +302,7 @@ impl Evaluator {
                 {
                     Ok(Some(Value::Glob(shoal_value::GlobVal {
                         pattern: pattern.clone(),
-                        cwd: self.cwd.clone(),
+                        cwd: self.exec.shell.cwd.clone(),
                         hidden: args
                             .named
                             .iter()
@@ -217,7 +319,7 @@ impl Evaluator {
                     "glob expects one pattern and optional hidden/follow arguments",
                 )),
             },
-            "regex" => match one()? {
+            crate::constructors::Constructor::Regex => match one()? {
                 Value::Str(src) => Ok(Some(Value::Regex(Arc::new(
                     shoal_value::RegexVal::compile(src)?,
                 )))),
@@ -230,14 +332,14 @@ impl Evaluator {
             // yield a lazy `stream<T>` (channels via `.events()`); `channel(name)`
             // itself yields a handle whose `.emit/.events/.latest/.take` the
             // evaluator intercepts.
-            "channel" => match one()? {
-                Value::Str(name) => Ok(Some(crate::channels::channel_handle(name))),
+            crate::constructors::Constructor::Channel => match one()? {
+                Value::Str(name) => Ok(Some(crate::channels::channel_handle(name)?)),
                 v => Err(ErrorVal::type_error(format!(
                     "channel expects a str name, found {}",
                     v.type_name()
                 ))),
             },
-            "every" => match one()? {
+            crate::constructors::Constructor::Every => match one()? {
                 Value::Duration(ns) if *ns >= 0 => Ok(Some(
                     self.source_every(std::time::Duration::from_nanos(*ns as u64))?,
                 )),
@@ -246,7 +348,7 @@ impl Evaluator {
                     v.type_name()
                 ))),
             },
-            "watch" => {
+            crate::constructors::Constructor::Watch => {
                 if args.pos.len() != 1 {
                     return Err(ErrorVal::arg_error("watch expects one path or glob"));
                 }
@@ -256,7 +358,7 @@ impl Evaluator {
                     .unwrap_or(true);
                 Ok(Some(self.source_watch(&args.pos[0], recursive)?))
             }
-            "tail" => {
+            crate::constructors::Constructor::Tail => {
                 if args.pos.len() != 1 {
                     return Err(ErrorVal::arg_error("tail expects one file path"));
                 }
@@ -266,7 +368,6 @@ impl Evaluator {
                     .unwrap_or(false);
                 Ok(Some(self.source_tail(&args.pos[0], from_start)?))
             }
-            _ => Ok(None),
         }
     }
 

@@ -22,7 +22,7 @@ src = '''
 reef add sometool@1.0
 '''
 error = "reef_provider"
-error_contains = "not a table"
+error_contains = "expected a map"
 
 [[case]]
 name = "reefprovider-add-requires-a-tool-at-version-spec"

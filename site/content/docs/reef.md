@@ -71,7 +71,7 @@ node --version
 # reef: locked node@22.x.y via mise (.../node)
 ```
 
-Commit both `.reef.toml` and `reef.lock` when the repository expects repeatable tool bindings.
+Commit `.reef.toml` with exact constraints when the repository expects repeatable versions. Generate `reef.lock` on each host after installing tools; the lock binds that host's absolute executable paths and byte hashes and is ignored by Git by default.
 
 ## What engages Reef
 
@@ -113,27 +113,20 @@ $XDG_CONFIG_HOME/shoal/shoal.toml
 Its `[reef]` table becomes the lowest-priority user scope.
 
 
-Discovery is best-effort. Unreadable or malformed files are silently skipped by the scope walk. Use `reef add` or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` and reports `reef_provider` instead of quietly editing an ancestor.
+Discovery parsing is best-effort. Unreadable or malformed files are skipped by the scope walk and retained within fixed warning limits. Interactive evaluation prints those warnings once per unchanged scope identity and can keep using valid farther scopes. Noninteractive scripts and agent sessions refuse external execution with `reef_provider` until the bad manifest is fixed, so a malformed nearer authority cannot silently expose an ambient or farther tool. Evaluator-hosted discovery reads through the installed filesystem capability with a one MiB regular-file/UTF-8 wall. Use `reef doctor`, `reef add`, or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` instead of quietly editing an ancestor.
 
-### An important tools-table requirement
+### Tool-free scopes
 
-The current discovery implementation adds a manifest to the chain only when its parsed `[tools]` table is non-empty. A file containing only `[runners]` or `[options]` is ignored completely. The same is true of a user `[reef]` table with runners/options but no tools.
-
-Use at least one genuine tool constraint in any manifest meant to activate runners or hermetic behavior:
+A native project manifest containing only `[runners]` or `hermetic = true` is an active scope. The same applies to a user `[reef]` table, so runner and isolation policy do not require a dummy tool constraint:
 
 ```toml
-[tools]
-python = "3.12"
-
 [runners]
 py = "python"
 ```
 
-This is a current implementation limitation, not a recommended schema convention.
-
 ### Cache behavior
 
-The evaluator caches the discovered chain and reloads it when `cwd` changes. Editing a manifest while remaining in the same directory does not currently invalidate that evaluator cache, even though the lower-level chain type has path/mtime keys. `reef add` explicitly invalidates the cache; a manual edit may require `cd` away and back or restarting the session.
+The evaluator caches parsed scopes, but checks a fixed-size metadata fingerprint covering every candidate and adjacent `reef.lock` path from `cwd` to the root plus the user scope. Creating, editing, repairing, replacing, or removing a manifest or lock invalidates the cache without requiring `cd` or a session restart. The fingerprint includes file kind, device, inode, byte length, modification time, and Unix change time; contents are reparsed only after that identity changes.
 
 ## Native manifest schema
 
@@ -253,6 +246,15 @@ The default provider stack is ordered:
 
 Provider order breaks ties; it does not always choose the winner first. Reef collects satisfying candidates across providers, selects the highest version, then breaks equal-version ties by provider order and path.
 
+Each provider must build an admitted discovery result rather than return a raw vector. One discovery
+is limited to 4,096 candidates and 16 MiB of measured identity/path state; crossing either wall is a
+`reef_provider` error, never silent truncation. This bounds provider enumeration before resolver
+ranking or `which --all` result admission begins. Built-in providers also meter at most 4,096
+filesystem visits and 16 MiB of encoded visited paths, including entries that do not become
+candidates. Filesystem enumeration and inspection errors are explicit provider failures. Resolution
+keeps only the current best satisfying candidate instead of cloning every candidate into a second
+ranking vector.
+
 | Provider | Discovery | Version knowledge | Fetch support |
 | --- | --- | --- | --- |
 | `npm-local` | nearest ancestor `node_modules/.bin/<tool>` | unknown | no |
@@ -283,7 +285,7 @@ mise install TOOL@CONSTRAINT
 
 Then it rediscovers candidates and returns the highest satisfying installed version. Reef never fetches during normal resolution.
 
-`reef fetch TOOL` loops providers in the default order and uses the nearest constraint. Since only mise implements fetch, it normally delegates there or reports `{fetched: false, note: "no provider can fetch this tool"}`. The current command does not enforce a manifest's provider pin while choosing the fetching provider; inspect the returned provider and follow with `reef lock`.
+`reef fetch TOOL` loops providers in the default order and uses the nearest constraint and provider pin. Since only mise implements fetch, it normally delegates there or reports `{fetched: false, note: "no provider can fetch this tool"}`. Follow a successful fetch with `reef lock`.
 
 ## Lockfiles
 
@@ -336,11 +338,13 @@ An unreadable locked binary becomes `reef_not_found` with the same refresh hint.
 
 Hashing is cached by file identity/metadata to avoid repeatedly reading unchanged binaries.
 
-### Lock persistence caveats
+### Lock persistence and portability
 
-The evaluator writes spawn-time interactive auto-locks and explicit `reef lock` results to disk. Lock persistence is currently best-effort: a write error is ignored by the spawn path after the in-memory resolution succeeds. Treat the presence and committed contents of `reef.lock` as a deployment precondition rather than assuming an auto-lock notice proves durable storage.
+The evaluator persists spawn-time interactive auto-locks, bare `reef` resolutions, `which TOOL`, `reef add`, and explicit `reef lock` results before publishing them as locked evaluator state. Manifest and lock reads/writes use the evaluator's installed filesystem capability. Lockfiles and `reef add` manifest edits use atomic replacement; a write failure is `reef_provider`, an auto-lock failure stops before process spawn, and `reef lock` cannot return successful rows for a file it did not write.
 
-The bare `reef` binding-table command resolves entries interactively into its working in-memory lock, but does not currently persist newly created entries at the end of that command. `which TOOL`, an actual interactive spawn, `reef add`, or `reef lock` does persist when their normal write path runs.
+An invalid, oversized, non-UTF-8, or non-regular existing lock also fails closed instead of being treated as an unlocked project and overwritten. `reef doctor` reports the invalid lockfile; inspect or remove it before intentionally rebuilding it.
+
+`reef.lock` is a host-local materialization record, not a cross-platform dependency lock. Its absolute paths and BLAKE3 executable hashes are deliberately specific to the installed artifacts on one machine. Keep it ignored, commit exact constraints in `.reef.toml` or a supported foreign manifest, install those versions on each host, and run `reef lock` during environment/CI setup. Requiring one committed digest across Linux and macOS would either reject legitimate platform artifacts or weaken the byte-identity guarantee, so Reef does neither implicitly.
 
 ## Candidate selection in detail
 
@@ -373,7 +377,7 @@ $TMPDIR/shoal-views-<uid>
 # /tmp is used when TMPDIR is absent
 ```
 
-The binding-set hash is order-independent and covers each tool name and path. Construction uses a staging directory and atomic rename, so concurrent identical builders converge on one view.
+The binding-set hash is order-independent and covers each tool name and path. Construction uses a staging directory and atomic rename, so concurrent identical builders converge on one view. Reuse is verified rather than trusted: the root must be an owned real `0700` directory, binding names cannot contain traversal/separators, targets must be absolute executable regular files, and `bin` must contain exactly the expected symlinks. A tampered view is quarantined and rebuilt before its path is returned.
 
 The spawned child's `PATH` becomes:
 
@@ -398,7 +402,7 @@ Reef returns the resolved binary's full BLAKE3 digest to the evaluator. When the
 Two qualifications matter:
 
 - an empty or absent `proc_spawn` list means unrestricted spawning; it is not default-deny;
-- child evaluators created by `spawn`, `.shl` execution, `parallel`, and channel handlers do not currently inherit the parent policy/principal, and some do not inherit Reef resolver/configuration state. Do not treat nested evaluator execution as a complete policy-preserving boundary yet.
+- every production child evaluator (`spawn`, `.shl`, parallel, stream, and channel routes) now inherits the audited parent policy/principal and Reef resolver/configuration through one constructor. Treat a divergence as a security regression; this still does not remove the external-spawn TOCTOU window.
 
 See [Security and trust boundaries](@/docs/security.md) for the full enforcement matrix.
 
@@ -452,7 +456,7 @@ Also, typing `./script.py` directly as a command head does not currently route t
 
 ### Script isolation
 
-A `.shl` script receives a fresh language scope with `args` and `script` bindings plus copied process environment/adapters/ports/bus. It does not leak its `let` bindings into the caller. It also does not currently inherit every Reef and Leash field from the parent evaluator; see the security warning above.
+A `.shl` script receives a fresh language scope with `args` and `script` bindings plus the audited inherited process environment/adapters/ports/bus, Reef, and Leash context. It does not leak its `let` bindings into the caller. The outer statement owns journaling rather than creating implicit nested script rows.
 
 ## `which`
 
@@ -509,7 +513,7 @@ Target selection is intentionally careful:
 
 The command inserts/updates the `[tools]` string entry, invalidates scope cache, and attempts a fresh lock. Its record contains `added`, `manifest`, `locked`, and, on success, `version` and `path`. If the constraint is written but resolution fails, the edit remains and `locked` is false with a note.
 
-`reef add` rejects malformed TOML and a non-table `tools` key. It requires exactly the `name@version` shape with nonempty sides.
+`reef add` reads at most one MiB, rejects non-UTF-8, over-nested, or malformed TOML and a non-table `tools` key, and atomically replaces the updated manifest. It requires exactly the `name@version` shape with nonempty sides.
 
 ### `reef lock [--refresh]`
 
@@ -574,11 +578,11 @@ For a repository adopting Reef:
 2. Use exact major/minor prefixes your project can support; do not write unsupported semver operators.
 3. Run `which TOOL --all` to understand available candidates.
 4. Run `reef lock` and review paths/providers/hashes.
-5. Commit `.reef.toml` and `reef.lock` together.
-6. Run `reef doctor` in local diagnostics and CI setup.
+5. Commit `.reef.toml`; keep the host-local `reef.lock` ignored.
+6. Install the constrained versions, run `reef lock`, and run `reef doctor` in local diagnostics and CI setup.
 7. Use `hermetic = true` only after all nested tool dependencies are represented by locked bindings.
 8. Configure runners and exercise each script extension with `run(...)`.
-9. Treat lock refreshes like dependency changes: review executable provenance, not only version text.
+9. Treat manifest constraint changes like dependency changes and review local lock refresh provenance, not only version text.
 10. Add Leash policy separately when you need enforced filesystem/network/process capabilities.
 
 ## Current boundaries
@@ -587,13 +591,11 @@ Reef is implemented and actively used for constrained external spawns, but it is
 
 - Windows provider executability, symlink views, and resolution semantics are deferred.
 - Scope discovery silently skips malformed/unreadable manifests.
-- A manifest without tools is ignored, including its runners/options.
-- Evaluator scope cache does not notice manual same-directory edits.
-- Lock persistence after auto-resolution is best-effort.
-- `reef fetch` is mise-only and does not enforce the declared provider pin.
+- A completely empty manifest, or one whose options retain their defaults, has no scope effect.
+- Lockfiles are deliberately host-local; portable multi-platform artifact locking is not implied.
+- `reef fetch` is mise-only in the shipped provider stack. Restricted principals must allow its opaque installer effect and spawn pin. Version probes and mise installers use bounded, cancellation-aware evaluator process authority; requested filesystem scopes are OS-sandboxed or fail closed when enforcement is unavailable. This does not provide an OS network sandbox.
 - General bare-path command heads do not use runners; spell `run(PATH)`.
-- Runner defaults outside the fixed fallback require an active tools-bearing scope.
-- Child evaluators do not consistently inherit Reef/Leash context.
+- Child evaluators inherit Reef/Leash context through the audited unified child constructor; future child routes must join that inventory.
 - Hermetic controls only the emitted `PATH`, not all process effects.
 - Provider inventory and `which --all` are host-dependent by design.
 

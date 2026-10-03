@@ -63,13 +63,13 @@ outside the per-keystroke path.
 
 ## Prompt configuration layers
 
-The rich prompt loader is intentionally more capable than `shoal-config::Prompt`, but its discovery
-is currently independent. Lowest to highest precedence:
+The rich prompt loader is intentionally more capable than `shoal-config::Prompt`. Lowest to highest
+precedence:
 
 1. `/etc/shoal/shoal.toml` `[prompt]`;
 2. user `$XDG_CONFIG_HOME/shoal/shoal.toml` `[prompt]`;
 3. user `$XDG_CONFIG_HOME/shoal/prompt.toml`, whose root is the prompt table;
-4. `cwd/.shoal.toml` `[prompt]`—only the current directory, no ancestor search;
+4. the nearest ancestor `.shoal.toml` `[prompt]`, selected by `shoal_config::find_project_config`;
 5. prompt-specific environment overrides.
 
 After ordinary layers merge, the selected built-in theme is loaded underneath them and the layers
@@ -77,10 +77,17 @@ are replayed on top. Therefore a theme supplies defaults but never defeats a use
 
 
 Unlike core configuration, a prompt deserialization error does not stop shell startup. It warns and
-falls back to all defaults. File reads also use a best-effort path: unreadable files are treated as
-absent; malformed files generate warnings. This is a deliberate “a broken prompt must not break the
-shell” policy, but it means permission failures and absence are not distinguishable in current
-diagnostics.
+falls back to all defaults. A missing optional file is silent; unreadable, non-regular, non-UTF-8,
+oversized, or malformed files emit path-specific warnings and that layer is ignored. This is a
+deliberate “a broken prompt must not break the shell” policy.
+
+Prompt admission is bounded before merge: each source is at most 1 MiB, TOML depth is at most 64,
+the merged graph is at most 16,384 nodes, strings are at most 64 KiB, and each of
+`module.language` and `module.custom` retains at most 128 identities. At most 16 layers are
+accepted, preserving the highest-precedence layers if an embedding caller supplies more. Prompt
+environment values are capped at 64 KiB and only the five recognized names are copied from the
+process environment. A rejected advisory layer remains visible as a warning while valid layers and
+the built-in defaults remain usable.
 
 ### Environment controls
 
@@ -95,6 +102,10 @@ diagnostics.
 Nerd-font `auto` detection checks, in order of a single boolean expression, `WEZTERM_PANE`,
 `KITTY_WINDOW_ID`, `WT_SESSION`, then `SHOAL_NERD_FONT=1`. Unicode and nerd-font support are
 separate: a nerd glyph is used only when both are true.
+
+The producer's direct Git control reads are also bounded: worktree `.git` pointers and `HEAD` are
+regular UTF-8 files of at most 8 KiB. A hostile control file degrades branch metadata instead of
+allocating an unbounded buffer or breaking the shell.
 
 ### Legacy template migration
 
@@ -118,7 +129,7 @@ Top-level configuration is:
 | `format.transient` | `$character ` | post-submit replacement prompt |
 | `transient.enabled` | `false` | install Reedline transient prompt |
 | `budget.render_deadline_ms` | `5` | stop rendering later modules after elapsed budget |
-| `budget.warn_on_exceed` | `true` | accepted but **not observed by renderer/host** |
+| `budget.warn_on_exceed` | `true` | sample once per refreshed snapshot and enqueue a bounded warning on overrun |
 | `style.*` | semantic palette | named style indirection |
 | `module.*` | per-module defaults | visibility, symbols, format, style |
 
@@ -170,8 +181,13 @@ This is a degradation budget, not preemption: one unexpectedly slow module can i
 deadline before later modules are skipped. Today modules are pure and small, so the main protection
 is against future renderer regressions.
 
-`warn_on_exceed` is not consulted. The standalone `shoal prompt bench` command returns a failure
-status when measured p99 exceeds the deadline, but ordinary prompt rendering does not warn.
+Between commands, the interactive host renders all three interactive sides once against the newly
+refreshed snapshot and compares the slowest call with the configured deadline. When
+`warn_on_exceed` is enabled, an overrun is sent through Reedline's bounded nonblocking notice
+queue. Queue saturation never delays input; a later warning reports how many notices were
+suppressed. This sampling does not add logging or mutable state to per-keystroke rendering. The
+standalone `shoal prompt bench` command separately returns failure when measured p99 exceeds the
+deadline.
 
 ## Style grammar
 
@@ -183,10 +199,10 @@ A style is a whitespace-separated set of attributes and colors:
 - `none`: explicit no-op.
 
 Tokens are order-independent and the last foreground/background color wins. Unknown tokens are
-ignored; a spec with no recognized token produces a warning when parsed through a warning-aware
-call. Rendering currently calls `parse_style` with a throwaway warning vector, so a style typo can
-be warned in direct tests but is not necessarily surfaced during a normal render. `NO_COLOR` or an
-empty/plain style returns the original text without SGR escapes.
+ignored; a spec with no recognized token produces a startup warning. `Renderer::new` walks every
+palette entry, fixed/dynamic module style, Leash tier style, and recursively nested format-group
+style, then caches the parsed result. Per-keystroke rendering performs no style parsing or warning
+side effects. `NO_COLOR` or an empty/plain style returns the original text without SGR escapes.
 
 Palette names `ok`, `error`, `warn`, `info`, `muted`, and `accent` expand only when the **whole**
 style spec equals that name. They are not macros inside a compound spec such as `muted bold`.
@@ -195,43 +211,43 @@ style spec equals that name. They are not macros inside a compound spec such as 
 
 | Placeholder | Snapshot input | Visibility/format behavior | Wiring status |
 |---|---|---|---|
-| `character` | last outcome, edit mode, Unicode | success/error/Vi-normal symbol | edit mode producer is hardcoded Emacs |
-| `directory` | cwd, home, repo-relative path, read-only | home collapse, component truncation | `truncate_style` accepted but ignored |
+| `character` | last outcome, edit mode, Unicode | success/error/Vi-normal-or-visual symbol | lock-free live Reedline mode bridge |
+| `directory` | cwd, home, repo-relative path, read-only | home collapse; `start`/`middle`/`end` component truncation | active |
 | `git_branch` | branch or detached SHA | symbol, truncation, template | active |
-| `git_status` | counts/degraded flag | staged/worktree/untracked/conflict/stash/ahead/behind | stash always zero; `engine` ignored |
+| `git_status` | counts/degraded flag | staged/worktree/untracked/conflict/stash/ahead/behind | one explicit bounded Git CLI reader |
 | `git_state` | Git operation state | rebase/merge/cherry-pick/bisect/revert label | active |
 | `cmd_duration` | last outcome duration | hides below `min_ms` | active |
 | `exit_status` | status/signal/ok | optional success display | active, disabled by default |
-| `jobs` | running/suspended/total | threshold + template | active |
+| `jobs` | running/suspended/active total + bounded completed history | active total drives threshold; `${completed}` is history | active |
 | `time` | local h:m:s | small `%H/%M/%S` formatter | active |
 | `username` | session identity | root/SSH/show-always gate | active |
 | `hostname` | session identity | SSH/show-always gate | active |
 | `reef` | cached bindings | constrained by default; version shortened | active |
-| `principal` | human/agent | symbols and optional agent name | producer always Human |
-| `leash` | detected tier/enforced | per-tier style/symbol | capability snapshot, not loaded policy identity |
-| `battery` | optional battery snapshot | charging/low threshold | producer always `None` |
-| `language_<name>` | matching Reef binding | constrained/resolved visibility | no independent probe/TTL producer |
-| `custom_<name>` | `Ready/Pending/Stale/Error` segment | ready/stale output only | producer map always empty |
+| `principal` | authenticated human/agent | symbols and optional agent name | kernel snapshot authority; standalone is local human |
+| `leash` | actual authority tier/enforced | per-tier style/symbol | kernel policy/backend forecast or standalone detection |
+| `battery` | optional battery snapshot | charging/low threshold | cached Linux/macOS host producer when enabled |
+| `language_<name>` | matching Reef binding | exact constrained/resolved visibility | consumes Reef-owned discovery/cache state |
+| `custom_<name>` | `Ready/Pending/Stale/Error` segment | ready/stale output only | bounded background producer with TTL cache |
 | `indent` | none | empty reserved placeholder | active as no-op |
 
-This split is crucial: renderer unit tests can prove that a hand-built battery or agent snapshot
-renders correctly even though the real host never produces one. Renderer completeness and
-end-to-end feature completeness are different maturity claims.
+This split is crucial: renderer unit tests prove snapshot semantics, while kernel-backed producer
+tests prove that authenticated agent/human authority reaches the real host. Renderer completeness
+and end-to-end feature completeness remain different maturity claims.
 
-### Module-specific inert fields
+### Trimmed schema and host-owned producers
 
-The current source contains several schema promises without a consuming path:
+The former `git_status.engine`, `language.probe_ttl_s`, and `PromptContext.multiline` fields were
+removed instead of preserving choices with no consuming implementation. Git status has one honest
+CLI-backed acquisition path. Language modules consume Reef-owned resolution/cache state and accept
+only `constrained` or `resolved`. Reedline chooses the continuation side directly, so a duplicate
+unused multiline bit was not a meaningful snapshot fact.
 
-- `directory.truncate_style` does not choose another truncation algorithm;
-- `git_status.engine` does not select an engine; the host always uses its current reader;
-- `budget.warn_on_exceed` does not emit a runtime warning;
-- `battery.sample_interval_s` has no sampler;
-- `language.probe_ttl_s` has no prompt-side probe cache;
-- custom `command`, `when`, and `cache_ttl` have no host task/cache;
-- custom `when` is not evaluated by the pure renderer either;
-- `PromptContext.multiline` exists but no module currently reads it.
-
-These fields are preserved as intended extension points, not documented as operational behavior.
+Directory truncation now implements all three advertised edge-selection modes. Battery sampling is
+cached by the host when enabled. Trusted system/user configuration may also define custom modules,
+while automatically discovered project config has its entire `module.custom` table removed before
+merge. The interactive host owns two bounded workers, treats `command` as quoted argv rather than
+shell source, gates it on one exact nonempty environment variable, enforces a 250 ms process-group
+deadline and 4 KiB output cap, and publishes only sanitized snapshots to the pure renderer.
 
 ## PromptContext snapshot
 
@@ -239,7 +255,7 @@ These fields are preserved as intended extension points, not documented as opera
 
 | Domain | Fields |
 |---|---|
-| terminal | width, no-color, nerd-font, Unicode, edit mode, multiline |
+| terminal | width, no-color, nerd-font, Unicode, edit mode |
 | location | cwd, home, read-only |
 | prior command | outcome ok/status/signal/duration/head |
 | session | jobs, principal, Leash tier/enforcement, user/host/SSH/root |
@@ -259,7 +275,8 @@ It does not perform discovery.
 - Leash enforcement capability/status;
 - home directory;
 - `NO_COLOR`, Unicode, and nerd-font decision;
-- principal, currently hardcoded to `Human`.
+- standalone fallback principal (`Human`); kernel-backed authority is refreshed from the
+  authenticated session snapshot.
 
 These do not refresh during the process. Environment or enforcement changes after startup therefore
 do not alter the prompt unless a future reload path reconstructs static facts.
@@ -305,31 +322,20 @@ accDescr: Shows the components and relationships described in Per-command facts.
 
 Repository discovery walks ancestors for `.git`, supporting both directories and worktree
 `gitdir:` files. `HEAD` and in-progress operation markers are read directly. One
-`git -C <cwd> status --porcelain=v2 --branch` subprocess per context build supplies ahead/behind,
-staged, unstaged, untracked, and conflict counts. Failure leaves branch/state available, zeros
+`git -C <cwd> status --porcelain=v2 --branch --show-stash` subprocess per context build supplies
+ahead/behind, staged, unstaged, untracked, conflict, and stash counts. Failure leaves branch/state available, zeros
 counts, and sets `degraded = true`—it never reports a failed status lookup as confidently clean.
 
-Stash count is always zero because it would require another command. Snapshot age is also always
-zero; there is no asynchronous stale-cache engine today.
+`--show-stash` keeps stash truth inside the existing single-process budget; Shoal does not launch a
+second `git stash` command. The former always-zero `GitSnapshot.age` field had no renderer consumer
+or asynchronous cache behind it and was removed rather than preserving inert schema.
 
-### Known hardcoded context gaps
-
-The host currently builds every live context with:
-
-```text
-edit_mode = Emacs
-multiline = false
-principal = Human
-battery = None
-custom = {}
-git.stashed = 0
-git.age = 0
-```
-
-The shell can genuinely run Reedline in Vi mode, but the prompt never sees Vi normal/insert/visual
-state. Consequently `character.vicmd_symbol` is non-operational in the real shell. Agent principal,
-battery, custom-command, stash, and stale-age render branches are similarly renderer-complete but
-producer-incomplete.
+The Reedline adapter wraps the selected edit mode and publishes Emacs/Vi insert/normal/visual state
+through a lock-free scalar before each paint; the pure renderer accepts that state as an overlay on
+the frozen context. Kernel-backed contexts require an authenticated `authority` projection and use
+its human/agent identity plus real Leash tier/enforcement forecast. Standalone mode is explicitly a
+local-human evaluator. Battery and custom values are host-produced only when their modules are
+configured.
 
 ## Reedline prompt adapter
 
@@ -362,14 +368,13 @@ style groups. The renderer still handles nested placeholders; this is an observa
 
 ## Validator and multiline decisions
 
-`ShoalValidator` currently uses the host's `input_is_incomplete` scanner rather than
-`shoal_syntax::parse_status`. It tracks quotes, triple quotes, escapes, comments, and delimiter
-balance to decide whether Enter should submit or continue. That keeps incomplete editing cheap but
-duplicates part of lexical/parser knowledge.
+`ShoalValidator` asks `shoal_syntax::parse` first. A complete modal AST submits immediately,
+including command arguments ending in `/`; an `Incomplete` parse continues the line. Only a parse
+error falls back to the host's bounded quote/comment/delimiter scanner, preserving tolerant editing
+for malformed text without overriding a successful grammar decision.
 
-The LSP diagnostics path does use `parse_status`, and the formatter requires a complete AST. A
-future unification should preserve interactive tolerance while eliminating disagreement about novel
-syntax.
+The LSP diagnostics path uses `parse_status`, and the formatter requires a complete AST. The small
+fallback scanner is deliberately recovery-only rather than a competing primary grammar.
 
 ## Completion architecture
 
@@ -423,14 +428,20 @@ trailing dot/optional-chain position and tries to infer the receiver type from:
 
 Computed calls, chains, indexing, and unknown receiver forms fall back to the union of all method
 names. This is deliberately conservative: uncertainty yields broader results rather than false
-precision. The method registry still has known metadata/dispatch drift documented in
+precision. Receiver-aware metadata matches the formerly drifted table/range `.get` and boolean
+conversion pairs; exact arity and value constraints still belong to executable dispatch. See
 [Value method dispatch](@/internals/value-method-dispatch.md).
 
 ### Matching and result shaping
 
-With fuzzy mode enabled, matching is a case-sensitive or folded non-contiguous subsequence test—not
-edit-distance typo correction. Results sort lexically, deduplicate, truncate to `max_results`, and
-replace exactly the detected word span. A directory suggestion suppresses appended whitespace.
+With fuzzy mode enabled, matching accepts a case-sensitive or folded non-contiguous subsequence and
+one adjacent transposition (for example, `exampel` → `example`). It does not run a general
+edit-distance search on every repaint. Results sort lexically, deduplicate, and are admitted to
+`max_results` during discovery rather than materialized and truncated afterward. One completion
+request scans at most 4,096 argument-directory entries and retains at most 4 MiB of candidate text;
+PATH discovery also caps directories, executable names, and retained text. A suggestion replaces
+exactly the detected word span. Directory suggestions retain `/`, suppress appended whitespace, and
+offer their children on the next completion request.
 
 When `completion.menu = false`, Reedline quick and partial completion are enabled. Multiple
 candidates with no common prefix can still cause a popup because Reedline has no separate completer
@@ -491,8 +502,9 @@ external editor, enter/submit, no-op, deletion/clear/cut, completion, undo, and 
 parameterized selection/motion commands are not expressible. Bad chord or action entries warn and
 are skipped; they never prevent startup.
 
-The configured Reedline edit mode is active, but—as noted above—the prompt's context is always
-Emacs. There is no state bridge from Reedline's current Vi submode into `PromptContext`.
+The configured Reedline edit mode is active and wrapped by the prompt's lock-free mode tracker.
+Emacs and Vi insert/normal/visual state therefore reach `$character` before each paint without
+mutating or cloning the frozen context.
 
 ## History adapter
 
@@ -529,35 +541,42 @@ presses act. Single-select returns the highlighted candidate or null if none; mu
 list and uses toggled originals when any exist. Escape becomes a typed evaluator cancellation-style
 custom error, while non-TTY use becomes an argument error.
 
-Known UI limit: drawing iterates only the first `height` ranked rows while cursor navigation can move
-beyond that range. There is no viewport offset, so a cursor below the first page is not visible.
+Drawing uses a fixed-height viewport that follows row and page navigation through the complete
+ranked result set. The cursor index and multi-selection identities remain global; scrolling changes
+only the visible slice, so accepting after several page moves still returns the original value.
 
 ## LSP architecture
 
-`shoal-lsp` is a Tokio/tower-lsp stdio server. It stores complete document text in an
-`Arc<RwLock<HashMap<Url, String>>>`. The advertised capabilities are full-document sync,
-formatting, completion, and hover.
+`shoal-lsp` is a Tokio/tower-lsp stdio server. It stores versioned document text, AST,
+diagnostics, and scoped symbols. The advertised capabilities are incremental sync, formatting,
+completion, hover, goto definition, and document symbols.
+
+Tower-lsp's private codec sits behind Shoal's bounded transport pump: at most 16 KiB/64 headers and
+a 32 MiB JSON body reach it. The body allowance covers worst-case escaping of a 4 MiB document;
+accepted bodies stream through a 64 KiB pipe instead of being copied by the pump. Malformed,
+duplicate/missing-length, over-limit, or truncated frames close stdin processing with a constant
+error and never echo body content.
 
 ```mermaid
 flowchart LR
 accTitle: LSP request and semantic-drift pipeline
 accDescr: Editor text flows through authoritative parser and formatter services, while completion and hover approximations are checked against shared language registries to expose drift.
-  Editor["editor document"] --> Docs["in-memory full text"]
-  Docs --> Parser["authoritative parse_status"]
+  Editor["incremental UTF-16 edits"] --> Docs["versioned text + AST + symbols"]
+  Docs --> Parser["authoritative parser + planner"]
   Parser --> Diagnostics["published diagnostics"]
   Docs --> Formatter["parse + canonical formatter"]
   Formatter --> Edit["whole-document TextEdit"]
-  Docs --> Assist["completion + hover"]
+  Docs --> Assist["completion + hover + definition + symbols"]
   Grammar["commands + methods + adapter registries"] --> Assist
   Parser -. "drift check" .-> Assist
 ```
 
 ### Diagnostics
 
-Complete input publishes no diagnostics. Both `Incomplete` and `Error` publish one error-severity
-diagnostic with code `parse_error`, the parser message, and its span. Treating incomplete syntax as
-an error is sensible after a document change but can be noisy during typing. There is no semantic,
-name-resolution, type, adapter, Reef, or security diagnostic.
+Parse failures publish syntax diagnostics. Successfully parsed documents also receive
+side-effect-free planner diagnostics such as opaque effects. Analysis runs on a blocking worker and
+is installed only when both version and text still match, so stale work cannot overwrite newer
+edits. There is still no type, adapter-version, Reef-project, or full name-resolution diagnostic.
 
 ### Formatting
 
@@ -572,42 +591,53 @@ The LSP vocabulary combines:
 - parser reserved words;
 - extra parser statement forms `with`, `spawn`, and `sh`;
 - the canonical syntax builtin-name registry;
-- declaration-like names found lexically before the cursor.
+- parser-derived symbols visible at the cursor.
 
-Declaration discovery splits text on non-identifier characters and records the word following
-`let`, `var`, `fn`, or `alias`. It is not scope-aware, comment/string-aware, shadow-aware, or AST
-based. Every item is labeled `KEYWORD`; there are no insertion edits, signatures, methods, fields,
-paths, adapter flags, or documentation payloads.
+Symbol discovery walks the AST for bindings (including nested patterns), functions, parameters,
+aliases, and nested scopes. Visibility and shadowing follow source order and lexical ranges.
+Completion replaces the exact identifier span and carries symbol kinds, resolution detail, and
+function docs where available. It remains type-unaware and has no methods, fields, adapter flags,
+filesystem paths, or workspace index.
 
 ### Hover
 
-Hover identifies the ASCII identifier at the UTF-16 cursor position and serves static Markdown for
-`let`, `var`, `fn`, `match`, `with`, `spawn`, `sh`, and `it`. It does not resolve user declarations,
-builtins, value methods, adapter commands, or symbols across files.
+Hover resolves visible user declarations and their docs/details first, then static language help and
+canonical command-source information. It does not infer value types/methods or perform a workspace
+symbol search.
+
+### Definition and document symbols
+
+Goto definition follows scope-aware local declarations. For a direct file `use`, it can open the
+module path and resolve an exported member; this is intentionally narrower than a project/module
+graph. Document symbols expose the same AST-derived declarations and nesting. References, rename,
+workspace symbols, and semantic tokens are not advertised.
 
 ### Position conversion
 
-LSP character positions count UTF-16 code units. `byte_to_position` and `position_to_byte` explicitly
-convert Rust UTF-8 byte offsets and clamp beyond-document/line requests. Tests include emoji and CJK
-text. Word scanning itself is ASCII alphanumeric/underscore only.
+LSP character positions count UTF-16 code units. Incremental changes validate exact line/range
+boundaries and optional `range_length`, reject positions inside surrogate pairs, and apply multiple
+changes sequentially. Internal spans remain UTF-8 bytes and are converted back to LSP positions.
 
 ### Concurrency and lifecycle
 
-Open/change writes the document and awaits diagnostic publication. Reads hold the async docs read
-lock while parsing/formatting or assembling results; this can delay a concurrent change on a large
-document. Close removes the document and clears diagnostics. Shutdown has no persistence or worker
-cleanup.
+Open/change stages a pending version, then enters a 4-worker analysis scheduler with at most 64 URI
+jobs and 32 MiB of active/pending source clones. Repeated changes for one URI replace its single
+pending job with the latest arrival. Budget rejection is logged, blocking-worker panic releases its
+permit, and results publish only when version and text still match; older work cannot install over a
+new edit. Close discards pending analysis, removes the document, and clears diagnostics. Symbol and
+completion projections are capped at 1,024 entries and diagnostics at 256. Shutdown has no persisted
+index because there is no workspace database.
 
 ## Shared semantic drift risks
 
-The parser, REPL validator, completion classifier, highlighter dispatcher, and LSP declaration
-scanner each answer related syntax questions at different fidelity:
+The parser, REPL validator, completion classifier, highlighter dispatcher, and LSP symbol analysis
+still answer related syntax questions at different fidelity:
 
 
-The builtin list is now shared, which is a strong anti-drift improvement. Statement dispatch,
-incompleteness, and declaration/scope logic remain duplicated. Changes to path-head rules, new
-statement forms, optional chaining, literals, or callable dispatch require a deliberate audit of all
-five consumers.
+The builtin list and LSP AST are shared sources of truth, which are strong anti-drift improvements.
+Statement dispatch, incompleteness, and some cursor classification remain separate. Changes to
+path-head rules, statement forms, optional chaining, literals, or callable dispatch still require a
+deliberate audit across consumers.
 
 ## Maturity and risk matrix
 
@@ -617,30 +647,26 @@ five consumers.
 | prompt latency | speed test + Criterion bench + CLI bench | context producer cost not fully gated | strong render, medium end-to-end |
 | Git prompt | parser/reader tests | once-per-command producer tests | implemented with deliberate stash gap |
 | jobs/Reef prompt | renderer tests | evaluator mapping tests | implemented |
-| Vi/principal/battery/custom prompt | renderer tests | no real producer | scaffolded/inert |
+| custom prompt | renderer + scheduler admission/cache tests | real config → bounded worker → CLI/render integration | implemented, host-side only |
+| battery prompt | renderer + platform parser tests | cached Linux/macOS producer | implemented when enabled |
+| Vi/principal/Leash prompt | renderer + tracker/projection tests | live editor state and authenticated kernel authority | implemented |
 | completion | large context/matching/cache test set | Reedline composition | strong heuristic implementation |
 | highlighting | broad token/dispatch tests | environment-sensitive color tests | implemented; PATH repaint cost |
-| keybindings | chord/action tests | edit-mode construction tests | implemented, mode-state prompt gap |
-| picker | pure model/scoring/Unicode tests | terminal loop has no pseudo-TTY integration | implemented with viewport issue |
-| LSP | vocabulary/position/diagnostic unit tests | no editor protocol integration suite | useful lexical baseline |
+| keybindings | chord/action/tracked-mode tests | edit-mode construction and live prompt bridge | implemented |
+| picker | pure model/scoring/Unicode/viewport tests | terminal loop has no pseudo-TTY integration | implemented; restoration integration proof remains thin |
+| LSP | AST scope/definition/incremental/diagnostic unit tests | no editor protocol integration suite | useful local semantic baseline |
 
 ## Prioritized improvements
 
-1. **Bridge real editor state into prompt context.** Expose Emacs/Vi normal/insert/visual and
-   multiline state without adding I/O to rendering.
-2. **Either implement or remove security/status-like prompt producers.** Agent principal and Leash
-   display must represent the actual evaluator/client authority, not only process defaults.
-3. **Complete or trim inert prompt schema.** Battery/custom caches, language probes, engine choice,
-   deadline warnings, and truncation strategy need producer tests before being advertised.
-4. **Unify project prompt discovery with core configuration.** The current-directory-only prompt
-   layer visibly disagrees with nearest-ancestor typed config.
-5. **Move command-resolution checks out of repaint.** Share the completer's cache or a host command
+1. **Keep prompt schema tied to real owners.** New fields need a consuming host path and producer
+   tests before being advertised; do not reintroduce speculative engine/probe toggles.
+2. **Move command-resolution checks out of repaint.** Share the completer's cache or a host command
    index with highlighting, including Reef and adapters.
-6. **Give the picker a scrolling viewport** and add pseudo-TTY restoration/cancellation tests.
+3. **Add picker pseudo-TTY restoration/cancellation tests** across accept, cancel, read failure, and panic unwinding.
 7. **Build a syntax-service layer** for incomplete-state, cursor context, declarations, symbols, and
    docs so REPL and LSP stop hand-copying grammar decisions.
-8. **Make LSP completion typed and scoped** after symbol identity exists; add builtin/method hover
-   from executable registries rather than another static table.
+8. **Extend the scoped LSP into a workspace graph** for references/rename and add type/method hover
+   from executable registries.
 
 ## Change checklist
 

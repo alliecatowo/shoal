@@ -19,6 +19,7 @@
 //! - [`suggest`] — did-you-mean hints for the unknown-method fall-through.
 
 mod list;
+pub(crate) mod materialize;
 mod num;
 mod outcome;
 mod path;
@@ -60,22 +61,38 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
     // metadata-only answer calls it instead of hand-rolling this match, so it
     // can't silently drift out of sync with `json_preview`'s equivalent
     // metadata-only answer for a NESTED occurrence (`crate::json`).
-    // `.load`/`.bytes` materialize to a resident `bytes`; anything else
-    // materializes the full content once and re-dispatches through the normal
-    // `bytes` path, so no per-method arm has to know about CAS backing. This
-    // is the one call site where a full CAS load of a bare (non-nested)
-    // CasBytes value is deliberate and expected — see `crate::json`'s doc
-    // comment on why the nested case (a CasBytes buried in a record/table
-    // field) does NOT take this path.
+    // `.load`/`.bytes` are explicit full-materialization operations. `.stream`
+    // and filesystem sinks stay incremental; every other fallback preflights
+    // the blob length before loading and redispatching.
     if let Value::CasBytes(c) = &recv {
-        if let Some(v) = c.cheap_method(name) {
+        if let Some(v) = c.cheap_method(name)? {
             return Ok(v);
         }
         match name {
             "load" | "bytes" => {
                 return c.resolve().map(|b| Value::Bytes(std::sync::Arc::new(b)));
             }
+            "stream" => {
+                no_args(&args)?;
+                return Ok(Value::Stream(StreamVal::from_cas_lines(c.clone())));
+            }
+            "save" | "append" => {
+                return path::save_cas(ctx, c.clone(), arg(&args, 0)?, name == "append");
+            }
             _ => {
+                if c.len > materialize::EAGER_STRING_MAX_BYTES as u64 {
+                    return Err(ErrorVal::new(
+                        "cas_materialization_limit",
+                        format!(
+                            "method .{name} would materialize {} bytes (limit {})",
+                            c.len,
+                            materialize::EAGER_STRING_MAX_BYTES
+                        ),
+                    )
+                    .with_hint(
+                        "use `.stream()`/`.save(path)` for incremental access or `.load()` for an explicit full load",
+                    ));
+                }
                 let full = c.resolve()?;
                 return dispatch(ctx, Value::Bytes(std::sync::Arc::new(full)), name, args);
             }
@@ -177,27 +194,15 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         // concatenation) — unlike the required-argument predicates below, a
         // zero-arg join has one obvious, harmless meaning.
         "join" => list::join(recv, str_arg(&args, 0, "")?),
-        "lines" => strops::string_unary(recv, |s| {
-            Value::List(
-                s.lines()
-                    .map(|x| Value::Str(x.trim_end_matches('\r').into()))
-                    .collect(),
-            )
-        }),
-        "words" => strops::string_unary(recv, |s| {
-            Value::List(s.split_whitespace().map(|x| Value::Str(x.into())).collect())
-        }),
-        "chars" => strops::string_unary(recv, |s| {
-            Value::List(s.chars().map(|x| Value::Str(x.to_string())).collect())
-        }),
+        "lines" => strops::lines_method(recv),
+        "words" => strops::words_method(recv),
+        "chars" => strops::chars_method(recv),
         "trim" => strops::string_unary(recv, |s| Value::Str(s.trim().into())),
-        "upper" => strops::string_unary(recv, |s| Value::Str(s.to_uppercase())),
-        "lower" => strops::string_unary(recv, |s| Value::Str(s.to_lowercase())),
+        "upper" => strops::case_method(recv, true),
+        "lower" => strops::case_method(recv, false),
         "split" => {
             let sep = req_str_arg(&args, 0, ".split requires a separator argument")?;
-            strops::string_unary(recv, |s| {
-                Value::List(s.split(sep).map(|x| Value::Str(x.into())).collect())
-            })
+            strops::split_method(recv, sep)
         }
         "starts_with" => strops::string_pred(
             recv,
@@ -240,7 +245,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "str" => strops::to_str(recv, false),
         "display" => strops::to_str(recv, true),
         "json" => Ok(Value::Str(
-            serde_json::to_string(&value_to_json(&recv))
+            serde_json::to_string(&value_to_json(&recv)?)
                 .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
         )),
         "abs" => num::numeric_unary(recv, f64::abs, i64::checked_abs),
@@ -323,526 +328,4 @@ pub(crate) fn req_str_arg<'a>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{RegexVal, StreamVal};
-    struct C {
-        cwd: PathBuf,
-    }
-    impl CallCtx for C {
-        fn call_closure(&mut self, f: &Value, args: Vec<Value>) -> VResult<Value> {
-            match f {
-                Value::Str(s) if s == "double" => match args[0] {
-                    Value::Int(i) => Ok(Value::Int(i * 2)),
-                    _ => unreachable!(),
-                },
-                Value::Str(s) if s == "even" => match args[0] {
-                    Value::Int(i) => Ok(Value::Bool(i % 2 == 0)),
-                    _ => unreachable!(),
-                },
-                _ => Err(ErrorVal::new("custom", "bad test callback")),
-            }
-        }
-        fn cwd(&self) -> PathBuf {
-            self.cwd.clone()
-        }
-    }
-    fn c() -> C {
-        C {
-            cwd: std::env::temp_dir(),
-        }
-    }
-    fn a(xs: Vec<Value>) -> CallArgs {
-        CallArgs {
-            pos: xs,
-            named: vec![],
-        }
-    }
-    fn call(v: Value, n: &str, args: Vec<Value>) -> VResult<Value> {
-        call_method(&mut c(), v, n, a(args), Span::default())
-    }
-    #[test]
-    fn collection_basics() {
-        let x = Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(3)]);
-        assert_eq!(
-            call(x.clone(), "sort", vec![]).unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(3), Value::Int(3)])
-        );
-        assert_eq!(
-            call(x, "uniq", vec![]).unwrap(),
-            Value::List(vec![Value::Int(3), Value::Int(1)])
-        );
-    }
-    #[test]
-    fn higher_order() {
-        let x = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
-        assert_eq!(
-            call(x.clone(), "map", vec![Value::Str("double".into())]).unwrap(),
-            Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
-        );
-        assert_eq!(
-            call(x, "where", vec![Value::Str("even".into())]).unwrap(),
-            Value::List(vec![Value::Int(2)])
-        );
-    }
-    #[test]
-    fn stream_consumption_and_tee() {
-        let s = StreamVal::from_iter("int", (0..3).map(|i| Ok(Value::Int(i))));
-        let clone = s.clone();
-        assert!(
-            matches!(call(Value::Stream(s),"collect",vec![]).unwrap(),Value::List(x) if x.len()==3)
-        );
-        assert_eq!(
-            call(Value::Stream(clone), "collect", vec![])
-                .unwrap_err()
-                .code,
-            "stream_consumed"
-        );
-        let t = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
-        assert!(
-            matches!(call(Value::Stream(t),"tee",vec![Value::Int(2)]).unwrap(),Value::List(x) if x.len()==2)
-        );
-    }
-    #[test]
-    fn strings_regex_records() {
-        assert_eq!(
-            call(Value::Str(" a b ".into()), "trim", vec![]).unwrap(),
-            Value::Str("a b".into())
-        );
-        let re = Value::Regex(std::sync::Arc::new(RegexVal::compile("[0-9]+").unwrap()));
-        assert_eq!(
-            call(Value::Str("a12b3".into()), "matches", vec![re]).unwrap(),
-            Value::List(vec![Value::Str("12".into()), Value::Str("3".into())])
-        );
-        let mut r = Record::new();
-        r.insert("a".into(), Value::Int(1));
-        assert_eq!(
-            call(Value::Record(r), "get", vec![Value::Str("a".into())]).unwrap(),
-            Value::Int(1)
-        );
-    }
-    #[test]
-    fn chunks_flatten_sum() {
-        let x = Value::List((1..=5).map(Value::Int).collect());
-        assert!(
-            matches!(call(x.clone(),"chunks",vec![Value::Int(2)]).unwrap(),Value::List(v) if v.len()==3)
-        );
-        assert_eq!(call(x, "sum", vec![]).unwrap(), Value::Int(15));
-        let nested = Value::List(vec![
-            Value::List(vec![Value::Int(1)]),
-            Value::List(vec![Value::Int(2)]),
-        ]);
-        assert_eq!(
-            call(nested, "flatten", vec![]).unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
-        );
-    }
-    #[test]
-    fn first_last_arity_variants() {
-        let x = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
-        // Zero-arg forms return a single element.
-        assert_eq!(call(x.clone(), "first", vec![]).unwrap(), Value::Int(1));
-        assert_eq!(call(x.clone(), "last", vec![]).unwrap(), Value::Int(3));
-        // `.first(n)`/`.last(n)` return a LIST of n.
-        assert_eq!(
-            call(x.clone(), "first", vec![Value::Int(2)]).unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
-        );
-        assert_eq!(
-            call(x.clone(), "last", vec![Value::Int(2)]).unwrap(),
-            Value::List(vec![Value::Int(2), Value::Int(3)])
-        );
-        // Overrun clamps to the collection length (no error).
-        assert_eq!(
-            call(x, "first", vec![Value::Int(9)]).unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
-        );
-    }
-
-    #[test]
-    fn outcome_methods_forward_to_out() {
-        use crate::OutcomeVal;
-        use std::sync::Arc;
-        // An outcome whose `.out` is a list forwards collection methods.
-        let outcome = Value::Outcome(Arc::new(OutcomeVal {
-            status: Some(0),
-            signal: None,
-            ok: true,
-            stdout: Arc::new(Vec::new()),
-            stdout_ref: None,
-            stderr: Arc::new(Vec::new()),
-            dur_ns: 0,
-            pid: 0,
-            cmd: "x".into(),
-            parsed: Some(Value::List(vec![
-                Value::Int(1),
-                Value::Int(2),
-                Value::Int(3),
-            ])),
-            streamed: false,
-            span: None,
-        }));
-        assert_eq!(call(outcome.clone(), "len", vec![]).unwrap(), Value::Int(3));
-        assert_eq!(
-            call(outcome, "first", vec![Value::Int(2)]).unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
-        );
-    }
-
-    #[test]
-    fn task_lifecycle_methods() {
-        let t = crate::TaskVal::new("t");
-        t.finish(Ok(Value::Int(42)));
-        assert_eq!(
-            call(Value::Task(t.clone()), "is_done", vec![]).unwrap(),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            call(Value::Task(t.clone()), "await", vec![]).unwrap(),
-            Value::Int(42)
-        );
-        assert_eq!(call(Value::Task(t), "cancel", vec![]).unwrap(), Value::Null);
-        // Wrong receiver type is a type error.
-        assert_eq!(
-            call(Value::Int(1), "await", vec![]).unwrap_err().code,
-            "type_error"
-        );
-    }
-
-    #[test]
-    fn task_suspend_resume_methods() {
-        let t = crate::TaskVal::new("t");
-        assert_eq!(
-            call(Value::Task(t.clone()), "is_suspended", vec![]).unwrap(),
-            Value::Bool(false)
-        );
-        // `.suspend()` returns the task (chainable) and flips the flag.
-        assert!(matches!(
-            call(Value::Task(t.clone()), "suspend", vec![]).unwrap(),
-            Value::Task(_)
-        ));
-        assert!(t.is_suspended());
-        assert_eq!(
-            call(Value::Task(t.clone()), "is_suspended", vec![]).unwrap(),
-            Value::Bool(true)
-        );
-        call(Value::Task(t.clone()), "resume", vec![]).unwrap();
-        assert!(!t.is_suspended());
-        // Suspend/resume hooks fire.
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let f = flag.clone();
-        t.on_suspend(Box::new(move || {
-            f.store(true, std::sync::atomic::Ordering::SeqCst)
-        }));
-        t.suspend();
-        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
-        // Wrong receiver type is a type error.
-        assert_eq!(
-            call(Value::Int(1), "suspend", vec![]).unwrap_err().code,
-            "type_error"
-        );
-    }
-
-    #[test]
-    fn path_pure_component_methods() {
-        let p = || Value::Path(PathBuf::from("/a/b/file.tar.gz"));
-        assert_eq!(
-            call(p(), "name", vec![]).unwrap(),
-            Value::Str("file.tar.gz".into())
-        );
-        assert_eq!(
-            call(p(), "stem", vec![]).unwrap(),
-            Value::Str("file.tar".into())
-        );
-        assert_eq!(call(p(), "ext", vec![]).unwrap(), Value::Str("gz".into()));
-        assert_eq!(
-            call(p(), "parent", vec![]).unwrap(),
-            Value::Path(PathBuf::from("/a/b"))
-        );
-        assert_eq!(
-            call(p(), "join", vec![Value::Str("x".into())]).unwrap(),
-            Value::Path(PathBuf::from("/a/b/file.tar.gz/x"))
-        );
-        // An extensionless / rootless path yields nulls where appropriate.
-        assert_eq!(
-            call(Value::Path(PathBuf::from("README")), "ext", vec![]).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            call(Value::Path(PathBuf::from("/")), "parent", vec![]).unwrap(),
-            Value::Null
-        );
-        // `.abs()` absolutizes a relative path against the ctx cwd.
-        let cwd = std::env::temp_dir();
-        assert_eq!(
-            call(Value::Path(PathBuf::from("rel/x")), "abs", vec![]).unwrap(),
-            Value::Path(cwd.join("rel/x"))
-        );
-        // `.str()` remains the fallible converter, still reaching a path.
-        assert_eq!(
-            call(Value::Path(PathBuf::from("/a/b")), "str", vec![]).unwrap(),
-            Value::Str("/a/b".into())
-        );
-    }
-
-    #[test]
-    fn unknown_method_carries_did_you_mean_hint() {
-        let list = Value::List(vec![Value::Int(1)]);
-        let e = call(list.clone(), "length", vec![]).unwrap_err();
-        assert_eq!(e.code, "field_missing");
-        assert_eq!(e.hint.as_deref(), Some("did you mean .len()?"));
-        let e = call(list.clone(), "size", vec![]).unwrap_err();
-        assert_eq!(e.hint.as_deref(), Some("did you mean .len()?"));
-        let e = call(Value::Str("a".into()), "to_upper", vec![]).unwrap_err();
-        assert_eq!(e.hint.as_deref(), Some("did you mean .upper()?"));
-        let e = call(Value::Path(PathBuf::from("x")), "read_str", vec![]).unwrap_err();
-        assert_eq!(e.hint.as_deref(), Some("did you mean .read()?"));
-        let e = call(list.clone(), "push", vec![Value::Int(2)]).unwrap_err();
-        assert!(e.hint.unwrap().contains("immutable"));
-        let e = call(Value::Str("ab".into()), "substring", vec![Value::Int(1)]).unwrap_err();
-        assert!(e.hint.unwrap().contains(".take"));
-        // A near-typo resolves by edit distance.
-        let e = call(list, "sortt", vec![]).unwrap_err();
-        assert_eq!(e.hint.as_deref(), Some("did you mean .sort()?"));
-        // Nothing plausible → no hint, same error as before.
-        let e = call(Value::Int(1), "frobnicate", vec![]).unwrap_err();
-        assert_eq!(e.code, "field_missing");
-        assert_eq!(e.hint, None);
-    }
-
-    #[test]
-    fn scalar_str_renders_canonical_form() {
-        assert_eq!(
-            call(Value::Int(42), "str", vec![]).unwrap(),
-            Value::Str("42".into())
-        );
-        assert_eq!(
-            call(Value::Float(1.5), "str", vec![]).unwrap(),
-            Value::Str("1.5".into())
-        );
-        assert_eq!(
-            call(Value::Bool(true), "str", vec![]).unwrap(),
-            Value::Str("true".into())
-        );
-        // Unconverted types keep erroring, now with a teaching hint.
-        let e = call(Value::List(vec![]), "str", vec![]).unwrap_err();
-        assert_eq!(e.code, "type_error");
-        assert!(e.hint.unwrap().contains("interpolation"));
-    }
-
-    #[test]
-    fn required_str_args_error_when_missing() {
-        let s = || Value::Str("hello".into());
-        for (method, args) in [
-            ("starts_with", vec![]),
-            ("ends_with", vec![]),
-            ("split", vec![]),
-            ("replace", vec![Value::Str("l".into())]),
-        ] {
-            let e = call(s(), method, args).unwrap_err();
-            assert_eq!(e.code, "arg_error", "{method} must require its argument");
-        }
-        let e = call(Value::Record(Record::new()), "set", vec![]).unwrap_err();
-        assert_eq!(e.code, "arg_error");
-        assert!(e.msg.contains("key"));
-        // Explicit empty-string arguments are still legal.
-        assert_eq!(
-            call(s(), "starts_with", vec![Value::Str("".into())]).unwrap(),
-            Value::Bool(true)
-        );
-        // `.join()` keeps its deliberate "" default (concatenation).
-        assert_eq!(
-            call(
-                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
-                "join",
-                vec![]
-            )
-            .unwrap(),
-            Value::Str("ab".into())
-        );
-    }
-
-    #[test]
-    fn zero_arg_aggregates_reject_stray_args() {
-        let x = || Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(2)]);
-        // A stray arg (classically a projection lambda) is a loud arg_error that
-        // names the method and points at the `.map(f).<agg>()` idiom — not a
-        // silently-dropped argument.
-        for agg in ["sum", "min", "max"] {
-            let e = call(x(), agg, vec![Value::Str("f".into())]).unwrap_err();
-            assert_eq!(e.code, "arg_error", "{agg} must reject a stray arg");
-            assert!(
-                e.msg.contains(&format!("{agg} takes no arguments")),
-                "{agg} error should name the method: {}",
-                e.msg
-            );
-            assert!(e.msg.contains(".map(f)"), "{agg} error should suggest .map");
-        }
-        // The no-arg forms are unaffected (the bare `.sum` field->method
-        // fallback also lands here with empty args).
-        assert_eq!(call(x(), "sum", vec![]).unwrap(), Value::Int(6));
-        assert_eq!(call(x(), "min", vec![]).unwrap(), Value::Int(1));
-        assert_eq!(call(x(), "max", vec![]).unwrap(), Value::Int(3));
-    }
-
-    #[test]
-    fn methods_for_agrees_with_dispatch() {
-        // Every name `methods_for` advertises for a receiver type must be a name
-        // `dispatch` actually recognizes — i.e. calling it never yields the
-        // `field_missing` "unknown method" error. (It may error on missing
-        // arguments or a type mismatch; that still proves the arm exists.) This
-        // is the guard that the completion vocabulary can't drift ahead of the
-        // real method table.
-        let sample = |ty: &str| -> Value {
-            match ty {
-                "list" => Value::List(vec![Value::Int(1), Value::Int(2)]),
-                "str" => Value::Str("hi".into()),
-                "record" => {
-                    let mut r = Record::new();
-                    r.insert("a".into(), Value::Int(1));
-                    Value::Record(r)
-                }
-                "int" => Value::Int(3),
-                "float" => Value::Float(1.5),
-                "bytes" => Value::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
-                _ => unreachable!(),
-            }
-        };
-        for ty in ["list", "str", "record", "int", "float", "bytes"] {
-            for m in methods_for(ty).unwrap() {
-                if let Err(e) = call(sample(ty), m, vec![]) {
-                    assert_ne!(
-                        e.code, "field_missing",
-                        "methods_for({ty}) advertises `.{m}` but dispatch rejects it as unknown"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn save_and_append() {
-        let d = std::env::temp_dir().join(format!("shoal-methods-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let mut ctx = C { cwd: d.clone() };
-        call_method(
-            &mut ctx,
-            Value::Str("a".into()),
-            "save",
-            a(vec![Value::Str("x".into())]),
-            Span::default(),
-        )
-        .unwrap();
-        call_method(
-            &mut ctx,
-            Value::Str("b".into()),
-            "append",
-            a(vec![Value::Str("x".into())]),
-            Span::default(),
-        )
-        .unwrap();
-        assert_eq!(std::fs::read_to_string(d.join("x")).unwrap(), "ab");
-        std::fs::remove_dir_all(d).unwrap();
-    }
-
-    #[test]
-    fn group_by_is_an_alias_for_group() {
-        let x = Value::List(vec![
-            Value::Int(1),
-            Value::Int(2),
-            Value::Int(3),
-            Value::Int(4),
-        ]);
-        let key = Value::Str("even".into());
-        assert_eq!(
-            call(x.clone(), "group_by", vec![key.clone()]).unwrap(),
-            call(x, "group", vec![key]).unwrap()
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // CasBytes chokepoint tests: the dispatch-level end-to-end
-    // proof that `cheap_method` and `json_preview` are actually wired in,
-    // on top of the direct unit tests in `value_types.rs`/`json.rs`.
-    // -------------------------------------------------------------------
-    mod cas_bytes_chokepoint {
-        use super::*;
-        use crate::value_types::test_support;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        fn probe() -> (Value, Arc<AtomicUsize>) {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
-            (Value::CasBytes(Arc::new(c)), calls)
-        }
-
-        #[test]
-        fn cheap_methods_never_load_through_dispatch() {
-            let (v, calls) = probe();
-            assert_eq!(call(v.clone(), "len", vec![]).unwrap(), Value::Int(11));
-            assert_eq!(call(v.clone(), "count", vec![]).unwrap(), Value::Int(11));
-            assert_eq!(
-                call(v.clone(), "is_empty", vec![]).unwrap(),
-                Value::Bool(false)
-            );
-            assert_eq!(
-                call(v, "ref", vec![]).unwrap(),
-                Value::Str("val:blake3:deadbeefcafef00d".into())
-            );
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-        }
-
-        #[test]
-        fn load_and_bytes_materialize_exactly_once() {
-            let (v, calls) = probe();
-            assert_eq!(
-                call(v, "load", vec![]).unwrap(),
-                Value::Bytes(Arc::new(b"hello world".to_vec()))
-            );
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
-        }
-
-        /// Existing behavior preserved: a bare `.json()` METHOD call on a
-        /// CasBytes value still fully materializes (unlike the nested case),
-        /// because it falls through `dispatch`'s `_ =>` arm to a resolved
-        /// `Value::Bytes` before `value_to_json` is ever consulted.
-        #[test]
-        fn bare_json_method_still_fully_materializes() {
-            let (v, calls) = probe();
-            let out = call(v, "json", vec![]).unwrap();
-            assert_eq!(out, Value::Str("\"hello world\"".into()));
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
-        }
-
-        /// The actual fix, exercised through the real dispatch path a shell
-        /// user hits: `.json()` on a RECORD whose field is a spilled capture
-        /// does not load the CAS just to serialize the record.
-        #[test]
-        fn json_on_a_record_with_a_nested_cas_bytes_field_does_not_load() {
-            let (v, calls) = probe();
-            let mut r = Record::new();
-            r.insert("out".into(), v);
-            let out = call(Value::Record(r), "json", vec![]).unwrap();
-            let Value::Str(s) = out else {
-                panic!("expected str");
-            };
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            let j: serde_json::Value = serde_json::from_str(&s).unwrap();
-            assert_eq!(j["out"]["$"], "bytes_ref");
-            assert_eq!(j["out"]["len"], 11);
-        }
-
-        /// `render()` stays cheap too (unchanged — verified end to end).
-        #[test]
-        fn render_does_not_load() {
-            let (v, calls) = probe();
-            let Value::CasBytes(c) = &v else {
-                unreachable!()
-            };
-            let rendered = crate::render::render_inline(&Value::CasBytes(c.clone()));
-            assert!(rendered.contains("val:blake3:deadbeefcafef00d"));
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-        }
-    }
-}
+mod tests;

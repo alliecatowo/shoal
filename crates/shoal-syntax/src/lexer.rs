@@ -190,6 +190,12 @@ impl<'s> Lexer<'s> {
     /// Lex one token at `pos` in `mode`. Returns token, span; the next
     /// position is the span's `end`.
     pub fn token(&self, pos: usize, mode: Mode) -> LexResult {
+        if pos < self.src.len() && !self.src.is_char_boundary(pos) {
+            return Err(LexError::new(
+                "token offset is not a UTF-8 character boundary",
+                Span::new(pos, pos),
+            ));
+        }
         let pos = self.skip_trivia(pos);
         if pos >= self.bytes.len() {
             return Ok((Tok::Eof, Span::new(pos, pos)));
@@ -550,6 +556,13 @@ impl<'s> Lexer<'s> {
     /// quotes (site/content/internals/language-conformance-contract.md). `open` is the position of `{`. Returns (payload,
     /// end position after `}`).
     pub fn raw_brace_block(&self, open: usize) -> Result<(String, usize), LexError> {
+        if open >= self.src.len() || !self.src.is_char_boundary(open) || self.at(open) != b'{' {
+            let pos = open.min(self.src.len());
+            return Err(LexError::new(
+                "raw block offset does not point to `{`",
+                Span::new(pos, pos),
+            ));
+        }
         let mut pos = open + 1;
         let mut depth = 1usize;
         while pos < self.bytes.len() {
@@ -738,6 +751,15 @@ mod tests {
     fn unterminated_raw_unicode_never_slices_inside_codepoint() {
         let result = Lexer::new("'𐣠").token(0, Mode::Expr);
         assert!(matches!(result, Err(LexError { ref msg, .. }) if msg.contains("unterminated")));
+    }
+
+    #[test]
+    fn caller_supplied_offsets_never_panic_on_utf8_or_overflow() {
+        let lexer = Lexer::new("é{}");
+        let error = lexer.token(1, Mode::Cmd).unwrap_err();
+        assert!(error.msg.contains("UTF-8"));
+        assert!(lexer.raw_brace_block(usize::MAX).is_err());
+        assert!(lexer.raw_brace_block(1).is_err());
     }
 
     /// A literal open-brace in an interpolating string starts a `{expr}`

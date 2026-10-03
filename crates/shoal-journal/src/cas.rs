@@ -3,19 +3,33 @@
 
 use std::fs;
 use std::io;
+use std::io::Read as _;
+use std::io::Seek as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::params;
+use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Journal, hex_bytes, io_to_sql, now_ns};
+use crate::storage::DB_WRITE_RESERVE_BYTES;
+use crate::{
+    DEFAULT_JOURNAL_CAS_MAX_BYTES, DEFAULT_JOURNAL_DATABASE_MAX_BYTES, Journal,
+    JournalStorageLimits, MAX_JOURNAL_CAS_MAX_BYTES, MAX_JOURNAL_DATABASE_MAX_BYTES, hex_bytes,
+    io_to_sql, now_ns,
+};
 
 /// zstd compression level for CAS blobs (3 = the zstd default: fast, good ratio).
 const ZSTD_LEVEL: i32 = 3;
+/// Absolute allocation ceiling of the journal's generic range API. Kernel raw
+/// pages use a smaller protocol wall; this protects direct embedders too.
+pub const BLOB_RANGE_MAX_BYTES: usize = 64 * 1024;
 
 const DEFAULT_OUTPUT_HARD_CAP: usize = 256 * 1024 * 1024;
+/// A completion has a small, fixed output vocabulary in every current host.
+/// Keep the aggregate API bounded so a direct embedder cannot turn one commit
+/// into an unbounded preparation/allocation loop.
+const MAX_COMPLETION_OUTPUTS: usize = 16;
 /// Default SQLite `busy_timeout`: how long a writer blocks waiting for a
 /// competing writer's lock before giving up with `SQLITE_BUSY`. The journal is
 /// shared across processes (REPL + kernel + shoal-history all open the same
@@ -32,14 +46,50 @@ pub struct JournalOptions {
     /// How long a write blocks on a busy database before failing (see
     /// [`DEFAULT_BUSY_TIMEOUT`]). Applied on every connection at open time.
     pub busy_timeout: Duration,
+    /// Physical SQLite main+WAL admission ceiling. This is conservative
+    /// headroom accounting, not a claim of a filesystem quota.
+    pub database_max_bytes: u64,
+    /// Logical uncompressed CAS admission ceiling (also reconciled against
+    /// physical CAS bytes so crash-orphans cannot be wholly invisible).
+    pub cas_max_bytes: u64,
 }
 impl Default for JournalOptions {
     fn default() -> Self {
         Self {
             output_hard_cap: DEFAULT_OUTPUT_HARD_CAP,
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
+            database_max_bytes: env_budget(
+                "SHOAL_JOURNAL_DATABASE_MAX_BYTES",
+                DEFAULT_JOURNAL_DATABASE_MAX_BYTES,
+                MAX_JOURNAL_DATABASE_MAX_BYTES,
+            ),
+            cas_max_bytes: env_budget(
+                "SHOAL_JOURNAL_CAS_MAX_BYTES",
+                DEFAULT_JOURNAL_CAS_MAX_BYTES,
+                MAX_JOURNAL_CAS_MAX_BYTES,
+            ),
         }
     }
+}
+
+impl JournalOptions {
+    pub(crate) fn storage_limits(self) -> JournalStorageLimits {
+        JournalStorageLimits {
+            database_max_bytes: self
+                .database_max_bytes
+                .clamp(1, MAX_JOURNAL_DATABASE_MAX_BYTES),
+            cas_max_bytes: self.cas_max_bytes.clamp(1, MAX_JOURNAL_CAS_MAX_BYTES),
+        }
+    }
+}
+
+fn env_budget(name: &str, default: u64, maximum: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .min(maximum)
 }
 
 /// One captured output linked to an entry: a CAS blob reference.
@@ -59,6 +109,16 @@ pub struct OutputMeta {
     pub truncated: bool,
     pub original_len: u64,
     pub stored_len: u64,
+}
+
+struct PreparedOutput {
+    kind: String,
+    stored: Vec<u8>,
+    hash: blake3::Hash,
+    hex: String,
+    stored_len: i64,
+    meta: Option<OutputMeta>,
+    meta_json: Option<String>,
 }
 
 impl Journal {
@@ -87,49 +147,125 @@ impl Journal {
         kind: &str,
         bytes: &[u8],
     ) -> rusqlite::Result<(String, Option<OutputMeta>)> {
-        let (stored, meta) = if bytes.len() > self.output_hard_cap {
-            let marker_len = TRUNCATION_MARKER.len().min(self.output_hard_cap);
-            let keep = self.output_hard_cap.saturating_sub(marker_len);
-            let mut stored = bytes[..keep].to_vec();
-            stored.extend_from_slice(&TRUNCATION_MARKER[..marker_len]);
-            let meta = OutputMeta {
-                truncated: true,
-                original_len: bytes.len() as u64,
-                stored_len: stored.len() as u64,
-            };
-            (stored, Some(meta))
-        } else {
-            (bytes.to_vec(), None)
-        };
-        let hash = blake3::hash(&stored);
-        let hex = hash.to_hex().to_string();
-        let path = self.blob_path(&hex);
-        if !path.exists() {
+        let prepared = prepare_output(self.output_hard_cap, kind, bytes)?;
+        let requested = DB_WRITE_RESERVE_BYTES
+            .saturating_add(kind.len() as u64)
+            .saturating_add(prepared.meta_json.as_ref().map_or(0, String::len) as u64);
+        self.with_database_admission(requested, |tx| {
+            self.write_prepared_output(tx, id, &prepared)
+        })?;
+        Ok((prepared.hex, prepared.meta))
+    }
+
+    /// Persist all completion outputs, the optional durable transcript event,
+    /// and the final entry marker in one SQLite transaction. CAS files are
+    /// still written before their rows and can become harmless GC orphans if a
+    /// later statement rolls back; no partial database completion is visible.
+    pub fn complete_with_outputs(
+        &self,
+        id: i64,
+        outputs: &[(&str, &[u8])],
+        transcript_event: Option<(i64, &str)>,
+        status: Option<i32>,
+        ok: bool,
+        dur_ns: i64,
+    ) -> rusqlite::Result<()> {
+        if outputs.len() > MAX_COMPLETION_OUTPUTS {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "journal completion has {} outputs; maximum is {MAX_COMPLETION_OUTPUTS}",
+                    outputs.len()
+                ),
+            )));
+        }
+        let prepared_bytes = outputs.iter().fold(0usize, |total, (_, bytes)| {
+            total.saturating_add(bytes.len().min(self.output_hard_cap))
+        });
+        if prepared_bytes > self.output_hard_cap {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "journal completion would prepare {prepared_bytes} output bytes; aggregate maximum is {}",
+                    self.output_hard_cap
+                ),
+            )));
+        }
+        let prepared = outputs
+            .iter()
+            .map(|(kind, bytes)| prepare_output(self.output_hard_cap, kind, bytes))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let requested = prepared.iter().fold(
+            DB_WRITE_RESERVE_BYTES.saturating_mul(prepared.len() as u64 + 2),
+            |total, output| {
+                total
+                    .saturating_add(output.kind.len() as u64)
+                    .saturating_add(output.meta_json.as_ref().map_or(0, String::len) as u64)
+            },
+        );
+        let requested = requested
+            .saturating_add(transcript_event.map_or(0, |(_, payload)| payload.len() as u64));
+        self.with_database_admission(requested, |tx| {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entry WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(rusqlite::Error::StatementChangedRows(0));
+            }
+            for output in &prepared {
+                self.write_prepared_output(tx, id, output)?;
+            }
+            if let Some((ts_ns, payload_json)) = transcript_event {
+                tx.execute(
+                    "INSERT INTO transcript_event (entry_id, ts, payload) VALUES (?1, ?2, ?3)",
+                    params![id, ts_ns, payload_json],
+                )?;
+            }
+            let changed = tx.execute(
+                "UPDATE entry SET status = ?1, ok = ?2, dur_ns = ?3 WHERE id = ?4",
+                params![status, ok, dur_ns, id],
+            )?;
+            if changed == 0 {
+                return Err(rusqlite::Error::StatementChangedRows(0));
+            }
+            Ok(())
+        })
+    }
+
+    fn write_prepared_output(
+        &self,
+        tx: &Transaction<'_>,
+        id: i64,
+        output: &PreparedOutput,
+    ) -> rusqlite::Result<()> {
+        let path = self.blob_path(&output.hex);
+        let admitted =
+            self.admit_cas_growth(tx, output.hash.as_bytes(), output.stored.len() as u64)?;
+        if admitted || !path.exists() {
             let parent = path.parent().expect("blob path always has a parent");
             fs::create_dir_all(parent).map_err(io_to_sql)?;
-            let compressed = zstd::encode_all(stored.as_slice(), ZSTD_LEVEL).map_err(io_to_sql)?;
+            let compressed =
+                zstd::encode_all(output.stored.as_slice(), ZSTD_LEVEL).map_err(io_to_sql)?;
             let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_to_sql)?;
             tmp.write_all(&compressed).map_err(io_to_sql)?;
-            tmp.persist(&path).map_err(|e| io_to_sql(e.error))?;
+            tmp.flush().map_err(io_to_sql)?;
+            tmp.persist(&path).map_err(|error| io_to_sql(error.error))?;
         }
         let now = now_ns();
-        self.conn.execute("INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",params![hash.as_bytes().as_slice(),stored.len() as i64,now])?;
-        let meta_json = meta
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        self.conn.execute(
+        tx.execute("INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",params![output.hash.as_bytes().as_slice(),output.stored_len,now])?;
+        tx.execute(
             "INSERT INTO output (entry_id, kind, hash, len, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id,
-                kind,
-                hash.as_bytes().as_slice(),
-                stored.len() as i64,
-                meta_json
+                &output.kind,
+                output.hash.as_bytes().as_slice(),
+                output.stored_len,
+                output.meta_json.as_deref()
             ],
         )?;
-        Ok((hex, meta))
+        Ok(())
     }
 
     /// Fetch and decompress a CAS blob by its blake3 hex hash.
@@ -145,7 +281,7 @@ impl Journal {
     pub fn read_blob(&self, hash: &str) -> rusqlite::Result<Option<Vec<u8>>> {
         // A hash that is not plain hex (or is too short to shard) cannot address
         // a blob; this also guards against path traversal.
-        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if hex_bytes(hash).is_err() {
             return Ok(None);
         }
         let compressed = match fs::read(self.blob_path(hash)) {
@@ -166,12 +302,95 @@ impl Journal {
             )));
         }
         if let Ok(raw) = hex_bytes(hash) {
-            self.conn.execute(
-                "UPDATE blob SET last_access_ns=?1 WHERE hash=?2",
-                params![now_ns(), raw],
-            )?;
+            self.touch_blob(&raw);
         }
         Ok(Some(bytes))
+    }
+
+    /// Read at most `length` uncompressed bytes beginning at `offset` without
+    /// materializing the complete blob. Integrity is verified before any
+    /// bytes are returned; compressed content is then streamed and discarded
+    /// up to the requested offset using bounded memory.
+    ///
+    /// The returned tuple is `(total_uncompressed_len, page)`. An offset past
+    /// EOF is clamped to EOF and returns an empty page. Missing/malformed hashes
+    /// return `Ok(None)`, matching [`Self::read_blob`].
+    pub fn read_blob_range(
+        &self,
+        hash: &str,
+        offset: u64,
+        length: usize,
+    ) -> rusqlite::Result<Option<(u64, Vec<u8>)>> {
+        let requested_offset = offset;
+        let length = length.min(BLOB_RANGE_MAX_BYTES);
+        if let Some(cached) = self.cached_blob_range(hash, requested_offset, length)? {
+            return Ok(Some(cached));
+        }
+        let Some(total) = self.blob_len(hash)? else {
+            return Ok(None);
+        };
+        let offset = offset.min(total);
+        let wanted = total.saturating_sub(offset).min(length as u64) as usize;
+        let mut reader = self.cas().open_verified(hash).map_err(io_to_sql)?;
+        let skipped =
+            io::copy(&mut reader.by_ref().take(offset), &mut io::sink()).map_err(io_to_sql)?;
+        if skipped != offset {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} ended before its recorded length"),
+            )));
+        }
+        let mut page = Vec::with_capacity(wanted);
+        reader
+            .take(wanted as u64)
+            .read_to_end(&mut page)
+            .map_err(io_to_sql)?;
+        if page.len() != wanted {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} ended before its recorded length"),
+            )));
+        }
+        if let Ok(raw) = hex_bytes(hash) {
+            self.touch_blob(&raw);
+        }
+        self.blob_page_cache
+            .borrow_mut()
+            .insert(crate::BlobPageCacheEntry {
+                hash: hash.to_ascii_lowercase(),
+                offset: requested_offset,
+                length,
+                total,
+                bytes: page.clone(),
+            });
+        Ok(Some((total, page)))
+    }
+
+    /// Return a previously verified exact range without reopening or
+    /// decompressing the CAS object. Cache entries are bounded by both byte
+    /// and count ceilings and are only served while the backing blob remains
+    /// live in the journal and on disk.
+    pub fn cached_blob_range(
+        &self,
+        hash: &str,
+        offset: u64,
+        length: usize,
+    ) -> rusqlite::Result<Option<(u64, Vec<u8>)>> {
+        let length = length.min(BLOB_RANGE_MAX_BYTES);
+        let cached =
+            self.blob_page_cache
+                .borrow_mut()
+                .get(&hash.to_ascii_lowercase(), offset, length);
+        let Some((total, bytes)) = cached else {
+            return Ok(None);
+        };
+        if self.blob_len(hash)? != Some(total) || !self.blob_path(hash).is_file() {
+            return Ok(None);
+        }
+        if let Ok(raw) = hex_bytes(hash) {
+            self.touch_blob(&raw);
+        }
+        Ok(Some((total, bytes)))
     }
 
     /// The stored (uncompressed) byte length of the CAS blob addressed by
@@ -238,9 +457,9 @@ impl Journal {
     /// `len` come from [`shoal_exec::CaptureSpill`] — the blake3 and byte length
     /// of the file's contents. The blob is written (zstd-streamed, so RAM stays
     /// bounded) only if not already present; a `blob` row is recorded and,
-    /// when `pin` is set, the blob is pinned so GC keeps it while the
-    /// in-language ref-backed value is live. The source file is removed on
-    /// success.
+    /// when `pin` is set, a permanent operator-style pin is added. Evaluator
+    /// lazy values use [`Journal::ingest_spill_leased`] instead. The source
+    /// file is removed on success.
     pub fn ingest_spill(
         &self,
         src: &Path,
@@ -248,29 +467,184 @@ impl Journal {
         len: u64,
         pin: bool,
     ) -> rusqlite::Result<()> {
+        self.ingest_spill_inner(src, hash, len, pin, false)
+    }
+
+    /// Adopt a spill and acquire one owner-scoped live-value lease atomically
+    /// with its blob row. Dropping the returned guard decrements the lease;
+    /// GC reaps it after a crash by observing the owner's released lockfile.
+    pub fn ingest_spill_leased(
+        &self,
+        src: &Path,
+        hash: &str,
+        len: u64,
+    ) -> rusqlite::Result<crate::PinLease> {
+        self.ingest_spill_inner(src, hash, len, false, true)?;
+        self.lease_owner.lease(hash)
+    }
+
+    fn ingest_spill_inner(
+        &self,
+        src: &Path,
+        hash: &str,
+        len: u64,
+        pin: bool,
+        lease: bool,
+    ) -> rusqlite::Result<()> {
         let raw = hex_bytes(hash)
             .map_err(|_| rusqlite::Error::InvalidParameterName("invalid hash".into()))?;
+        let stored_len = i64::try_from(len)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let mut infile = fs::File::open(src).map_err(io_to_sql)?;
+        let metadata = infile.metadata().map_err(io_to_sql)?;
+        if !metadata.is_file() || metadata.len() != len {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "capture spill length does not match its declared length",
+            )));
+        }
+        verify_spill(&mut infile, hash, len)?;
         let path = self.blob_path(hash);
-        if !path.exists() {
-            let parent = path.parent().expect("blob path always has a parent");
-            fs::create_dir_all(parent).map_err(io_to_sql)?;
-            let infile = fs::File::open(src).map_err(io_to_sql)?;
-            let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_to_sql)?;
-            zstd::stream::copy_encode(infile, &mut tmp, ZSTD_LEVEL).map_err(io_to_sql)?;
-            tmp.flush().map_err(io_to_sql)?;
-            tmp.persist(&path).map_err(|e| io_to_sql(e.error))?;
-        }
-        let now = now_ns();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",
-            params![raw.as_slice(), len as i64, now],
-        )?;
-        if pin {
-            self.pin(hash)?;
-        }
+        self.with_database_admission(DB_WRITE_RESERVE_BYTES, |tx| {
+            let admitted = self.admit_cas_growth(tx, &raw, len)?;
+            if admitted || !path.exists() {
+                infile.rewind().map_err(io_to_sql)?;
+                let parent = path.parent().expect("blob path always has a parent");
+                fs::create_dir_all(parent).map_err(io_to_sql)?;
+                let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_to_sql)?;
+                let mut verified = HashingReader::new(&mut infile);
+                zstd::stream::copy_encode(&mut verified, &mut tmp, ZSTD_LEVEL)
+                    .map_err(io_to_sql)?;
+                verified.finish(hash, len)?;
+                tmp.flush().map_err(io_to_sql)?;
+                tmp.persist(&path)
+                    .map_err(|error| io_to_sql(error.error))?;
+            }
+            let now = now_ns();
+            tx.execute(
+                "INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",
+                params![raw.as_slice(), stored_len, now],
+            )?;
+            if pin {
+                tx.execute(
+                    "INSERT OR IGNORE INTO pin(hash) VALUES(?1)",
+                    params![raw.as_slice()],
+                )?;
+            }
+            if lease {
+                tx.execute(
+                    "INSERT INTO pin_lease(hash,owner,ref_count) VALUES(?1,?2,1)
+                     ON CONFLICT(hash,owner) DO UPDATE SET ref_count=ref_count+1",
+                    params![raw.as_slice(), self.lease_owner.id()],
+                )?;
+            }
+            Ok(())
+        })?;
         // Best-effort cleanup: the blob is safely in the CAS now.
         let _ = fs::remove_file(src);
         Ok(())
+    }
+
+    fn touch_blob(&self, raw: &[u8]) {
+        // LRU freshness is optional metadata. Near exhaustion or under writer
+        // contention, serving already-verified bytes is more important than a
+        // timestamp update, and the read path must not bypass write admission.
+        let _ = self.with_database_admission(DB_WRITE_RESERVE_BYTES, |tx| {
+            tx.execute(
+                "UPDATE blob SET last_access_ns=?1 WHERE hash=?2",
+                params![now_ns(), raw],
+            )?;
+            Ok(())
+        });
+    }
+}
+
+fn prepare_output(
+    output_hard_cap: usize,
+    kind: &str,
+    bytes: &[u8],
+) -> rusqlite::Result<PreparedOutput> {
+    let (stored, meta) = if bytes.len() > output_hard_cap {
+        let marker_len = TRUNCATION_MARKER.len().min(output_hard_cap);
+        let keep = output_hard_cap.saturating_sub(marker_len);
+        let mut stored = bytes[..keep].to_vec();
+        stored.extend_from_slice(&TRUNCATION_MARKER[..marker_len]);
+        let meta = OutputMeta {
+            truncated: true,
+            original_len: bytes.len() as u64,
+            stored_len: stored.len() as u64,
+        };
+        (stored, Some(meta))
+    } else {
+        (bytes.to_vec(), None)
+    };
+    let hash = blake3::hash(&stored);
+    let hex = hash.to_hex().to_string();
+    let meta_json = meta
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let stored_len = i64::try_from(stored.len())
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    Ok(PreparedOutput {
+        kind: kind.to_owned(),
+        stored,
+        hash,
+        hex,
+        stored_len,
+        meta,
+        meta_json,
+    })
+}
+
+fn verify_spill(
+    file: &mut fs::File,
+    expected_hash: &str,
+    expected_len: u64,
+) -> rusqlite::Result<()> {
+    file.rewind().map_err(io_to_sql)?;
+    let mut reader = HashingReader::new(file);
+    io::copy(&mut reader, &mut io::sink()).map_err(io_to_sql)?;
+    reader.finish(expected_hash, expected_len)
+}
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+    bytes: u64,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self, expected_hash: &str, expected_len: u64) -> rusqlite::Result<()> {
+        let actual_hash = self.hasher.finalize().to_hex();
+        if self.bytes != expected_len || !actual_hash.as_str().eq_ignore_ascii_case(expected_hash) {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "capture spill content does not match its declared hash/length",
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl<R: io::Read> io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.bytes = self
+            .bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("capture spill length overflow"))?;
+        self.hasher.update(&buf[..read]);
+        Ok(read)
     }
 }
 
@@ -296,7 +670,7 @@ impl Cas {
     /// [`Journal::read_blob`]). A missing blob or malformed hash is a
     /// `NotFound` error; a hash mismatch is `InvalidData`.
     pub fn read(&self, hash: &str) -> io::Result<Vec<u8>> {
-        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if hex_bytes(hash).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{hash} does not address a CAS blob"),
@@ -315,5 +689,47 @@ impl Cas {
             ));
         }
         Ok(bytes)
+    }
+
+    /// Open a streaming decoder after verifying the full decompressed content
+    /// hash in a bounded-memory first pass. Verification precedes delivery, so
+    /// a consumer that intentionally stops early never observes bytes from a
+    /// corrupt content-addressed blob. The second pass trades additional disk
+    /// and decompression work for bounded memory and fail-closed integrity.
+    pub fn open_verified(&self, hash: &str) -> io::Result<Box<dyn io::Read + Send>> {
+        let mut verify = self.open_decoder(hash)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let n = verify.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&chunk[..n]);
+        }
+        if !hasher
+            .finalize()
+            .to_hex()
+            .as_str()
+            .eq_ignore_ascii_case(hash)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} failed integrity check: content hash mismatch"),
+            ));
+        }
+        self.open_decoder(hash)
+    }
+
+    fn open_decoder(&self, hash: &str) -> io::Result<Box<dyn io::Read + Send>> {
+        if hex_bytes(hash).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{hash} does not address a CAS blob"),
+            ));
+        }
+        let file = fs::File::open(self.blob_path(hash))?;
+        let decoder = zstd::Decoder::new(io::BufReader::new(file))?;
+        Ok(Box::new(decoder))
     }
 }

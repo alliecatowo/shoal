@@ -1,17 +1,22 @@
 //! Kernel connection: `Config`, Unix-socket discovery, and the JSON-RPC
 //! `KernelClient` used to talk to `shoal-kernel` over its Unix socket.
 
-use crate::{read_json_line, write_json_line, write_stdout_frame};
+use crate::{read_json_line, write_json_line};
 use serde_json::{Value, json};
+pub use shoal_proto::LocalAuthMode;
+use shoal_proto::{ATTACH_SECURITY_EPOCH, PRINCIPAL_SESSION_ISOLATION};
 use std::io::{self, BufReader};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub socket: PathBuf,
     pub session: Option<String>,
     pub token: Option<String>,
+    pub local_auth: LocalAuthMode,
 }
 
 impl Config {
@@ -22,6 +27,7 @@ impl Config {
             socket,
             session,
             token: std::env::var("SHOAL_TOKEN").ok(),
+            local_auth: LocalAuthMode::RestrictedAgent,
         })
     }
 }
@@ -38,43 +44,7 @@ impl Config {
 /// Without this, a bare `XDG_RUNTIME_DIR`-only lookup silently failed on macOS
 /// and socket discovery never found the running kernel.
 pub fn discover_socket(session: &str) -> PathBuf {
-    if let Some(explicit) = std::env::var_os("SHOAL_SOCKET").filter(|s| !s.is_empty()) {
-        return PathBuf::from(explicit);
-    }
-    runtime_dir().join("shoal").join(format!("{session}.sock"))
-}
-
-/// The runtime directory the kernel binds its socket under. Mirrors
-/// `shoal-kernel`'s `runtime_socket`, with a `$TMPDIR` step so a macOS session
-/// that exports `TMPDIR` (but not `XDG_RUNTIME_DIR`) is honored before the
-/// hard `/tmp/shoal-{uid}` fallback.
-fn runtime_dir() -> PathBuf {
-    runtime_dir_from(
-        std::env::var_os("XDG_RUNTIME_DIR"),
-        std::env::var_os("TMPDIR"),
-        unsafe { geteuid() },
-    )
-}
-
-/// Pure socket-directory selection (kept separate so the macOS no-`XDG` case is
-/// unit-testable without mutating process env): `$XDG_RUNTIME_DIR`, else
-/// `$TMPDIR/shoal-{uid}`, else `/tmp/shoal-{uid}` — identical to shoal-kernel.
-fn runtime_dir_from(
-    xdg: Option<std::ffi::OsString>,
-    tmpdir: Option<std::ffi::OsString>,
-    uid: u32,
-) -> PathBuf {
-    if let Some(xdg) = xdg.filter(|s| !s.is_empty()) {
-        return PathBuf::from(xdg);
-    }
-    if let Some(tmp) = tmpdir.filter(|s| !s.is_empty()) {
-        return PathBuf::from(tmp).join(format!("shoal-{uid}"));
-    }
-    PathBuf::from(format!("/tmp/shoal-{uid}"))
-}
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
+    shoal_paths::ShoalPaths::discover().socket(session)
 }
 
 pub struct KernelClient {
@@ -87,51 +57,58 @@ pub struct KernelClient {
 impl KernelClient {
     pub fn connect(config: &Config) -> Result<Self, BridgeError> {
         let stream = UnixStream::connect(&config.socket)?;
+        Self::from_stream(stream, config, "mcp", false)
+    }
+
+    /// Attach over an already-connected transport. The caller, not the wire,
+    /// is responsible for establishing the stream's provenance.
+    pub fn from_stream(
+        stream: UnixStream,
+        config: &Config,
+        client_kind: &str,
+        tty: bool,
+    ) -> Result<Self, BridgeError> {
+        let params = attach_params_for(config, client_kind, tty)?;
         let mut client = Self {
             reader: BufReader::new(stream.try_clone()?),
             writer: stream,
             next_id: 1,
             attach: Value::Null,
         };
-        client.attach = client.call(
-            "session.attach",
-            json!({
-                "session": config.session,
-                "token": config.token,
-                "client": {"kind":"mcp", "tty":false}
-            }),
-        )?;
+        client.attach = client.call("session.attach", params)?;
+        validate_attach_security(config, &client.attach)?;
         Ok(client)
     }
 
-    /// Subscribe on this (dedicated) connection and forward every pushed
-    /// `event` notification to MCP stdout as `notifications/resources/updated`
-    /// (site/content/internals/kernel-protocol.md). Runs until the connection closes.
-    pub(crate) fn run_event_forwarder(mut self, channel: String, uri: String) {
-        if self
-            .call("events.subscribe", json!({"channel": channel}))
-            .is_err()
-        {
-            return;
-        }
-        while let Ok(Some(frame)) = read_json_line(&mut self.reader) {
-            if frame.get("method").and_then(Value::as_str) == Some("event") {
-                let p = frame.get("params").cloned().unwrap_or(Value::Null);
-                let note = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/resources/updated",
-                    "params": {
-                        "uri": uri,
-                        "seq": p.get("seq"),
-                        "payload": p.get("payload"),
-                    }
-                });
-                let _ = write_stdout_frame(&note);
-            }
-        }
+    pub(crate) fn shutdown_handle(&self) -> io::Result<UnixStream> {
+        self.writer.try_clone()
+    }
+
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.reader.get_ref().set_read_timeout(timeout)
+    }
+
+    pub(crate) fn read_frame(&mut self) -> Result<Option<Value>, BridgeError> {
+        read_json_line(&mut self.reader)
+    }
+
+    pub(crate) fn read_fd(&self) -> RawFd {
+        self.reader.get_ref().as_raw_fd()
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, BridgeError> {
+        self.call_with_notifications(method, params, |_| {})
+    }
+
+    /// Make one request while preserving interleaved push notifications.
+    /// The multiplexed subscription owner uses this so adding/removing one
+    /// channel cannot drop an event already queued for another channel.
+    pub(crate) fn call_with_notifications(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut notification: impl FnMut(&Value),
+    ) -> Result<Value, BridgeError> {
         let id = self.next_id;
         self.next_id += 1;
         write_json_line(
@@ -142,6 +119,7 @@ impl KernelClient {
             let frame = read_json_line(&mut self.reader)?.ok_or(BridgeError::Disconnected)?;
             // Kernel notifications can be interleaved with the response.
             if frame.get("id") != Some(&json!(id)) {
+                notification(&frame);
                 continue;
             }
             if let Some(error) = frame.get("error") {
@@ -150,6 +128,73 @@ impl KernelClient {
             return frame.get("result").cloned().ok_or_else(|| {
                 BridgeError::Protocol("kernel response has neither result nor error".into())
             });
+        }
+    }
+}
+
+#[cfg(test)]
+fn attach_params(config: &Config) -> Result<Value, BridgeError> {
+    attach_params_for(config, "mcp", false)
+}
+
+fn attach_params_for(config: &Config, client_kind: &str, tty: bool) -> Result<Value, BridgeError> {
+    if config.token.is_some() && config.local_auth == LocalAuthMode::LocalHuman {
+        return Err(BridgeError::Protocol(
+            "--token and --local-human are mutually exclusive authentication modes".into(),
+        ));
+    }
+    let mut params = json!({
+        "session": config.session,
+        "token": config.token,
+        "client": {"kind":client_kind, "tty":tty}
+    });
+    if config.token.is_none() {
+        params["local_auth"] = serde_json::to_value(config.local_auth)?;
+    }
+    Ok(params)
+}
+
+/// Refuse a silent security downgrade when a zero-token MCP asks for the
+/// restricted local-agent boundary but reaches a kernel that ignores the new
+/// attach field and grants the historical unrestricted local-human identity.
+///
+/// Explicit local-human mode intentionally accepts the legacy response: the
+/// user already opted into exactly that permissive boundary. Bearer auth keeps
+/// its existing compatibility until the kernel's principal-session migration
+/// is complete; the token still selects its configured principal.
+fn validate_attach_security(config: &Config, attach: &Value) -> Result<(), BridgeError> {
+    if config.token.is_some() {
+        return Ok(());
+    }
+    match config.local_auth {
+        LocalAuthMode::LocalHuman => {
+            if let Some(mode) = attach.get("auth_mode").and_then(Value::as_str)
+                && mode != "local-human"
+            {
+                return Err(BridgeError::Protocol(format!(
+                    "kernel attached with auth_mode {mode:?}, not requested local-human"
+                )));
+            }
+            Ok(())
+        }
+        LocalAuthMode::RestrictedAgent => {
+            let mode = attach.get("auth_mode").and_then(Value::as_str);
+            let isolation = attach.get("session_isolation").and_then(Value::as_str);
+            let epoch = attach.get("security_epoch").and_then(Value::as_u64);
+            let principal = attach.get("principal").and_then(Value::as_str);
+            if mode != Some("restricted-agent")
+                || isolation != Some(PRINCIPAL_SESSION_ISOLATION)
+                || epoch.is_none_or(|v| v < u64::from(ATTACH_SECURITY_EPOCH))
+                || !principal.is_some_and(|p| p.starts_with("agent:"))
+            {
+                return Err(BridgeError::Protocol(
+                    "kernel cannot prove restricted MCP attach and principal-isolated sessions; \
+                     upgrade shoal-kernel, provide a bearer token, or explicitly opt into \
+                     --local-human"
+                        .into(),
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -189,35 +234,62 @@ impl std::error::Error for BridgeError {}
 mod tests {
     use super::*;
 
-    /// macOS-first-class socket discovery: with no `XDG_RUNTIME_DIR` (the macOS
-    /// default), the path must fall through exactly as shoal-kernel does — to
-    /// `$TMPDIR/shoal-{uid}` when `TMPDIR` is set, else `/tmp/shoal-{uid}`.
+    fn config(local_auth: LocalAuthMode, token: Option<&str>) -> Config {
+        Config {
+            socket: PathBuf::from("/tmp/not-used.sock"),
+            session: Some("test".into()),
+            token: token.map(str::to_owned),
+            local_auth,
+        }
+    }
+
     #[test]
-    fn socket_discovery_falls_back_without_xdg() {
-        use std::ffi::OsString;
-        // No XDG, no TMPDIR → hard /tmp fallback.
-        assert_eq!(
-            runtime_dir_from(None, None, 501),
-            PathBuf::from("/tmp/shoal-501")
+    fn restricted_attach_requires_hardened_kernel_metadata() {
+        let config = config(LocalAuthMode::RestrictedAgent, None);
+        let legacy = json!({"principal":"uid:1000"});
+        let error = validate_attach_security(&config, &legacy).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot prove restricted MCP attach")
         );
-        // No XDG, TMPDIR set (the macOS shape) → $TMPDIR/shoal-{uid}.
-        assert_eq!(
-            runtime_dir_from(None, Some(OsString::from("/var/folders/xy")), 501),
-            PathBuf::from("/var/folders/xy/shoal-501")
+
+        let hardened = json!({
+            "principal":"agent:mcp",
+            "auth_mode":"restricted-agent",
+            "session_isolation":"principal",
+            "security_epoch": ATTACH_SECURITY_EPOCH,
+        });
+        validate_attach_security(&config, &hardened).unwrap();
+    }
+
+    #[test]
+    fn explicit_local_human_and_bearer_keep_deliberate_compatibility() {
+        let legacy = json!({"principal":"uid:1000"});
+        validate_attach_security(&config(LocalAuthMode::LocalHuman, None), &legacy).unwrap();
+        validate_attach_security(
+            &config(LocalAuthMode::RestrictedAgent, Some("bearer")),
+            &legacy,
+        )
+        .unwrap();
+
+        let wrong = json!({"auth_mode":"restricted-agent"});
+        assert!(
+            validate_attach_security(&config(LocalAuthMode::LocalHuman, None), &wrong).is_err()
         );
-        // XDG present → used verbatim (Linux).
-        assert_eq!(
-            runtime_dir_from(
-                Some(OsString::from("/run/user/1000")),
-                Some(OsString::from("/tmp")),
-                1000
-            ),
-            PathBuf::from("/run/user/1000")
-        );
-        // Empty XDG is treated as unset (a common shell footgun).
-        assert_eq!(
-            runtime_dir_from(Some(OsString::new()), None, 7),
-            PathBuf::from("/tmp/shoal-7")
-        );
+    }
+
+    #[test]
+    fn attach_request_is_explicitly_restricted_without_a_token() {
+        let restricted = attach_params(&config(LocalAuthMode::RestrictedAgent, None)).unwrap();
+        assert_eq!(restricted["local_auth"], json!("restricted-agent"));
+        assert!(restricted["token"].is_null());
+
+        let bearer =
+            attach_params(&config(LocalAuthMode::RestrictedAgent, Some("secret"))).unwrap();
+        assert!(bearer.get("local_auth").is_none());
+        assert_eq!(bearer["token"], json!("secret"));
+
+        assert!(attach_params(&config(LocalAuthMode::LocalHuman, Some("secret"))).is_err());
     }
 }

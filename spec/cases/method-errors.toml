@@ -215,9 +215,6 @@ src = "{n: 5}.feed(cat).feed(cat).out.n"
 value = "5"
 
 [[case]]
-name = "feed-stream-is-unimplemented-with-collect-hint"
-# site/content/internals/language-conformance-contract.md promises incremental stream feeding; that needs exec support, so the
-# honest state is an error that names the workaround.
-src = "[1, 2].stream().feed(cat)"
-error = "type_error"
-error_contains = "collect"
+name = "feed-stream-is-incremental-and-line-framed"
+src = "[1, 2].stream().feed(cat).stdout.len()"
+value = "4"

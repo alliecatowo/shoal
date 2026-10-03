@@ -1,3 +1,19 @@
 #![no_main]
+
 use libfuzzer_sys::fuzz_target;
-fuzz_target!(|data:&[u8]|{if let Ok(s)=std::str::from_utf8(data){let l=shoal_syntax::Lexer::new(s);let mut p=0;while p<s.len(){match l.token(p,shoal_syntax::Mode::Expr){Ok((_,sp))if sp.end as usize>p=>p=sp.end as usize,_=>break}}}});
+
+fuzz_target!(|data: &[u8]| {
+    let Ok(source) = std::str::from_utf8(data) else {
+        return;
+    };
+    let lexer = shoal_syntax::Lexer::new(source);
+    for mode in [shoal_syntax::Mode::Expr, shoal_syntax::Mode::Cmd] {
+        let mut offset = 0;
+        while offset < source.len() {
+            match lexer.token(offset, mode) {
+                Ok((_, span)) if span.end as usize > offset => offset = span.end as usize,
+                _ => break,
+            }
+        }
+    }
+});

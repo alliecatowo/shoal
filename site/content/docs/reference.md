@@ -25,7 +25,7 @@ Use this page to find the authoritative chapter for a symbol or subsystem. It al
 | How does the interactive editor/session behave? | [Interactive shell](@/docs/repl.md) |
 | What does every `shoal` CLI form do? | [Command-line interface](@/docs/cli.md) |
 | How do I translate Bash/zsh/fish/Nushell habits? | [Migrating from traditional shells](@/docs/migration-from-shells.md) |
-| Show practical patterns. | [Recipes](@/docs/recipes.md) |
+| Show practical patterns. | [Recipes](@/docs/recipes.md) and the repository's executable `scripts/*.shl` operations programs |
 
 ### Language
 
@@ -109,7 +109,7 @@ The packages are separate. See [install commands](@/docs/companion-cli-reference
 | Secret directory | XDG data `shoal/secrets` (or evaluator override) | `master.key` + authenticated encrypted envelope. |
 | Kernel socket | XDG runtime or UID-qualified temp fallback | Local IPC boundary. |
 
-Do not assume all companion defaults agree: `shoal-history`/doctor use XDG data in places where shell/kernel use XDG state. The [path matrix](@/docs/companion-cli-reference.md#xdg-path-matrix) is authoritative.
+Shell, history, and doctor share the XDG state fallback and layered `journal.state_dir`; a durable kernel's explicit CLI root can still differ. The [path matrix](@/docs/companion-cli-reference.md#xdg-path-matrix) is authoritative.
 
 ## Environment-variable inventory
 
@@ -134,7 +134,7 @@ Do not assume all companion defaults agree: `shoal-history`/doctor use XDG data 
 | `SHOAL_SESSION` | MCP attachment session. |
 | `SHOAL_TOKEN` | MCP bearer token—secret, never log. |
 | `SHOAL_NO_AUTOSTART` | Nonempty disables MCP's detached kernel startup. |
-| `SHOAL_TOKEN_STORE` | `shoal-token` CLI store override; kernel ignores it. |
+| `SHOAL_TOKEN_STORE` | Shared `shoal-token`/kernel credential-store override; kernel `--token-store` wins. |
 | `SHOAL_KERNEL` | Main config/env compatibility setting for kernel enablement. |
 | `SHOAL_KERNEL_SESSION` | Main config/env compatibility setting for kernel session. |
 | `SHOAL_LEASH_POLICY` | Main configuration override for policy path where supported. |
@@ -147,7 +147,7 @@ Do not assume all companion defaults agree: `shoal-history`/doctor use XDG data 
 | `SHOAL_CAPTURE_CAP_BYTES` | Resident process-output capture cap (default 64 MiB). |
 | `SHOAL_CAPTURE_SPILL_CAP_BYTES` | CAS spill cap (default 1 GiB). |
 | `SHOAL_ADAPTER_PATH` | Replacement custom adapter search path; not simple append. |
-| `SHOAL_SECRET_DIR` | Evaluator secret-store override; `shoal-secret` CLI ignores it. |
+| `SHOAL_SECRET_DIR` | Shared evaluator and `shoal-secret` store override; empty values are ignored. |
 
 ### Configuration overrides
 
@@ -310,7 +310,9 @@ events.read     events.publish
 events.subscribe events.unsubscribe
 ```
 
-`journal.query` and `cap.request` currently lack the required attachment gate; treat that as a security defect, not a pre-auth API. See [Kernel method index](@/docs/kernel-protocol.md#method-index).
+`journal.query` and `cap.request` require attachment. Journal query additionally requires the
+attached principal's `JournalRead` policy grant before filter decoding; capability approval requires
+an authorized approver. See [Kernel method index](@/docs/kernel-protocol.md#method-index).
 
 ## Short-reference inventory
 
@@ -319,7 +321,7 @@ events.subscribe events.unsubscribe
 | `out:N` | Transcript value/error | Named session, live kernel/evaluator. |
 | `task:N` | Background/timed task | Named session, live kernel. |
 | `pty:N` | Interactive PTY | Named session, live kernel. |
-| `plan:HEX` | Stored plan | Live kernel; metadata caller-scoped but current ID collision-prone. |
+| `plan:FULL_DIGEST:OBJECT_ID` | Stored plan | Live kernel; immutable caller/content-bound object, lost on restart. |
 | `val:blake3:HASH` | Content-addressed value/blob | State-store/CAS retention. |
 
 Equivalent resource URIs use `shoal://out/N`, `shoal://task/N`, etc. Never persist the first four as durable business IDs.
@@ -429,7 +431,9 @@ Top-level command/control context where a non-ok outcome normally raises `cmd_fa
 
 ### Stream
 
-Lazy/single-consumption sequence, potentially live. Live sources have bounded/coalescing behavior; streams currently do not chunk over the kernel wire or feed a process incrementally.
+Lazy/single-consumption sequence, potentially live. Live sources have bounded/coalescing behavior;
+streams can feed captured process stdin incrementally and can be pulled over the kernel wire in
+bounded, addressable batches.
 
 ### Task
 

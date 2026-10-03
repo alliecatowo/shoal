@@ -106,7 +106,8 @@ if !result.ok { exit (result.status) }
 
 ## Format source
 
-`shoal fmt` parses and formats Shoal source. With file arguments it rewrites them atomically:
+`shoal fmt` parses and formats Shoal source. With file arguments it preflights every input before
+making changes, then replaces each changed file atomically:
 
 ```bash
 shoal fmt src/main.shl scripts/release.shl
@@ -123,6 +124,24 @@ Use check mode in CI. It makes no edits and exits `1` if any input would change:
 ```bash
 shoal fmt --check scripts/*.shl
 ```
+
+The current AST does not retain free comments or shebangs. The formatter therefore leaves a parsed
+source unchanged when its token-aware safety pass finds either one; it never silently deletes them.
+A semantic `#` inside a quoted value, record key, `use` path, or raw command word is not mistaken for
+a comment and does not block formatting.
+
+File rewrites refuse symbolic links instead of replacing the link itself. On Unix they preserve the
+complete permission mode and refuse files owned by another user or carrying extended metadata that
+atomic replacement would discard (including Linux ACL xattrs and macOS ACLs). Linux security labels
+are accepted only when a replacement created in the same directory receives an identical label.
+Shoal also refuses duplicate input aliases and, on Unix, any multiply-linked inode: replacing one
+hard-link name would silently detach it from the other names. Identity is established for every
+input before the first rewrite. Shoal syncs both the replacement contents and its parent directory.
+These checks are intentionally stricter than script execution; pass a singly-linked regular target
+path explicitly when a link should be formatted. A failure during a later write can still leave
+already committed earlier files changed, because there is no portable transaction spanning multiple
+directory entries. Filesystem replacement races after identity preflight are detected where the
+platform exposes stable metadata, but this formatter is not a general hostile-directory transaction.
 
 ## Run diagnostics
 
@@ -145,7 +164,12 @@ shoal completions zsh > ~/.zfunc/_shoal
 shoal completions fish > ~/.config/fish/completions/shoal.fish
 ```
 
-These completions are for invoking the `shoal` executable from another shell. Shoal's own REPL completion engine is configured under `[completion]` and understands language names, builtins, adapters, methods, variables, and `PATH` programs.
+These generated scripts share one checked vocabulary with the CLI help surfaces, including every
+top-level command, root option, kernel/prompt action, and command-specific option. Bash, Zsh, and
+Fish syntax is smoke-tested when the corresponding shell is installed. These completions invoke the
+`shoal` executable from another shell; Shoal's own REPL completion engine is configured under
+`[completion]` and understands language names, builtins, adapters, methods, variables, and `PATH`
+programs.
 
 ## Inspect the prompt
 

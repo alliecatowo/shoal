@@ -1,0 +1,31 @@
+#!/usr/bin/env shoal
+# Inventory direct workspace dependency edges and requirements from Cargo metadata.
+
+let show_all = args.map(.str()).contains("--all")
+let metadata_result = run("cargo", "metadata", "--format-version", "1", "--no-deps")
+assert(metadata_result.ok, "cargo metadata failed: {metadata_result.stderr}")
+let packages = metadata_result.out.packages
+
+let edges = packages.flat_map(package => package.dependencies.map(dependency => ({
+  package: package.name,
+  dependency: dependency.name,
+  requirement: dependency.req,
+  kind: dependency.kind ?? "normal",
+  optional: dependency.optional,
+}))).sort_by(row => "{row.dependency}:{row.package}:{row.kind}")
+
+let by_dependency = edges.group_by(.dependency).map(group => ({
+  dependency: group.key,
+  consumers: group.values.len(),
+  requirements: group.values.map(.requirement).uniq().sort(),
+  packages: group.values.map(.package).uniq().sort(),
+})).sort_by(row => -row.consumers)
+
+{
+  workspace_packages: packages.len(),
+  direct_edges: edges.len(),
+  unique_dependencies: by_dependency.len(),
+  optional_edges: edges.where(.optional).len(),
+  most_shared: by_dependency.first(15),
+  edges: if show_all { edges } else { [] },
+}
