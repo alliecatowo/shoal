@@ -1,5 +1,6 @@
 use super::*;
 
+mod pty_leash;
 mod task_control;
 mod token_admin;
 mod transport;
@@ -560,7 +561,12 @@ fn task_refs_are_hidden_from_another_principal_with_the_same_session_name() {
 
 #[test]
 fn pty_refs_are_hidden_from_another_principal_with_the_same_session_name() {
-    let kernel = Kernel::new();
+    let policy = Policy::from_toml(
+        "[principal.\"agent:alpha\"]\nopaque='allow'\nauto_apply='in-grant'\n\
+         [principal.\"agent:beta\"]\nopaque='allow'\nauto_apply='in-grant'\n",
+    )
+    .unwrap();
+    let kernel = Kernel::with_policy(policy);
     let alpha = kernel.session("shared-pty", "agent:alpha").unwrap();
     let beta = kernel.session("shared-pty", "agent:beta").unwrap();
     let mut alpha_attached = Some(Attachment {
