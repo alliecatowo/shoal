@@ -27,7 +27,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag matches workspace version
         shell: bash
         run: |
@@ -64,7 +64,7 @@ jobs:
           echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
           echo "ASSET_SUM=$dist.tar.gz.sha256" >> "$GITHUB_ENV"
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ env.ASSET }}
@@ -79,7 +79,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Render formula from the published checksums
         run: |

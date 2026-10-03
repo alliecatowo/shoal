@@ -6,6 +6,6 @@ edition="2024"
 serde={version="1",features=["derive"]}
 toml="1"
 thiserror="2"
-wasmtime={version="42.0.2",default-features=false,features=["component-model","cranelift","runtime","wat"]}
+wasmtime={version="49",default-features=false,features=["component-model","cranelift","runtime","wat"]}
 [dev-dependencies]
 tempfile="3"

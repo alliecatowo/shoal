@@ -1,6 +1,6 @@
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use base64::Engine as _;
-use rand::{TryRngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -32,7 +32,7 @@ impl SecretStore {
         secure_dir(&s.dir)?;
         if !s.key_path().exists() {
             let mut k = Zeroizing::new([0u8; 32]);
-            OsRng.try_fill_bytes(&mut *k).map_err(invalid)?;
+            SysRng.try_fill_bytes(&mut *k).map_err(invalid)?;
             atomic(&s.key_path(), &*k)?
         }
         check_mode(&s.key_path())?;
@@ -115,7 +115,7 @@ impl SecretStore {
         let key = self.key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(invalid)?;
         let mut nonce = [0u8; 12];
-        OsRng.try_fill_bytes(&mut nonce).map_err(invalid)?;
+        SysRng.try_fill_bytes(&mut nonce).map_err(invalid)?;
         let ct = cipher
             .encrypt((&nonce).into(), plain.as_ref())
             .map_err(invalid)?;

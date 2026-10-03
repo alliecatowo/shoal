@@ -13,6 +13,7 @@ use reedline::{
     HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent,
     ReedlineMenu, SearchDirection, SearchQuery, Signal, ValidationResult, Validator, Vi,
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    default_vi_visual_keybindings,
 };
 use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_eval::Evaluator;
@@ -412,12 +413,14 @@ fn build_edit_mode(
     if config.editor.mode == "vi" {
         let mut insert = default_vi_insert_keybindings();
         let mut normal = default_vi_normal_keybindings();
+        let mut visual = default_vi_visual_keybindings();
         insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab_event);
         for b in custom {
             insert.add_binding(b.modifiers, b.code, b.event.clone());
             normal.add_binding(b.modifiers, b.code, b.event.clone());
+            visual.add_binding(b.modifiers, b.code, b.event.clone());
         }
-        Box::new(Vi::new(insert, normal))
+        Box::new(Vi::new(insert, normal, visual))
     } else {
         let mut kb = default_emacs_keybindings();
         kb.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab_event);
