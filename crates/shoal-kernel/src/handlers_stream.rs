@@ -62,6 +62,14 @@ impl Kernel {
         });
         let lease = acquire_pull_worker()?;
         let entry = session.stream_cursor(&params.cursor)?;
+        // Fail closed deterministically: if the cursor lock is already poisoned,
+        // don't race the worker's quarantine against the poll loop's
+        // "stream_closed" fallback.
+        if entry.inner.is_poisoned() {
+            entry.quarantine();
+            session.quarantine_stream_cursor(&params.cursor, &entry);
+            return Err(cursor_quarantined());
+        }
         let worker_session = session.clone();
         let worker_entry = entry.clone();
         let (tx, rx) = sync_channel(1);
