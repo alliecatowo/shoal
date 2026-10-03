@@ -11,10 +11,10 @@
 //! the cursor position and a `changed` bit — never a wall of escape bytes, and
 //! naturally bounded by the grid size. `pty.close` terminates and reaps.
 //!
-//! Spawning is a [`Effect::ProcSpawn`] gated through the same leash path every
-//! other spawn uses (`spawn_pinning_active` guard + `evaluate_effect`, plus
-//! `sandbox_for` for OS confinement), so a scoped principal's `bin_hash`/policy
-//! applies; the default-permissive human spawns unconfined exactly as before.
+//! Opening a pty is judged like `exec` of opaque code: an `Opaque` + `ProcSpawn`
+//! plan goes through `evaluate_plan`, then `sandbox_for` supplies OS
+//! confinement, so an unscoped or denied principal cannot get a free shell.
+//! The default-permissive human spawns unconfined exactly as before.
 use super::*;
 
 use std::ffi::OsString;
@@ -65,36 +65,43 @@ impl Kernel {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Leash gate (site/content/internals/language-conformance-contract.md), mirroring the evaluator's `spawn_gate`: only
-        // consult `evaluate_effect` once the principal has actually opted into
-        // spawn pinning (a non-empty `proc_spawn` allowlist) — otherwise an
-        // empty allowlist would default-deny every spawn. `sandbox_for` returns
-        // `None` for the permissive human, so the child runs unconfined.
-        if self.policy.spawn_pinning_active(&actor) {
-            let bin_hash = shoal_exec::resolve_and_hash_in(&argv, &env, &cwd).unwrap_or_default();
-            let effect = Effect::ProcSpawn {
-                bin_hash,
-                argv0: p.cmd.clone(),
-            };
-            match self.policy.evaluate_effect(&actor, &effect) {
-                Verdict::Allow => {}
-                Verdict::ApprovalRequired => {
-                    return Err(RpcError {
-                        code: APPROVAL_REQUIRED,
-                        message: "approval required to spawn this program on a pty".into(),
-                        data: Some(json!({"cmd": p.cmd})),
-                    });
-                }
-                Verdict::Deny => {
-                    return Err(RpcError {
-                        code: LEASH_DENIED,
-                        message: format!(
-                            "leash: spawn of `{}` on a pty denied — not in principal `{actor}`'s proc_spawn allowlist",
-                            p.cmd
-                        ),
-                        data: Some(json!({"cmd": p.cmd})),
-                    });
-                }
+        // Leash gate: a pty is an interactive program with arbitrary behaviour,
+        // so it is judged exactly like an `exec` of opaque code. Build the same
+        // kind of plan `exec` derives (an `Opaque` effect plus the concrete
+        // `ProcSpawn`) and run it through `evaluate_plan`. An unknown principal,
+        // or one without `opaque = "allow"`, is denied here; the default
+        // permissive human is unchanged. `sandbox_for` then applies the same OS
+        // confinement `exec` children get.
+        let bin_hash = shoal_exec::resolve_and_hash_in(&argv, &env, &cwd).unwrap_or_default();
+        let pty_plan = Plan::new(
+            vec![
+                Effect::Opaque,
+                Effect::ProcSpawn {
+                    bin_hash,
+                    argv0: p.cmd.clone(),
+                },
+            ],
+            Reversibility::Irreversible,
+            Estimates::default(),
+        );
+        match self.policy.evaluate_plan(&actor, &pty_plan) {
+            Verdict::Allow => {}
+            Verdict::ApprovalRequired => {
+                return Err(RpcError {
+                    code: APPROVAL_REQUIRED,
+                    message: "approval required to open a pty; plan first".into(),
+                    data: Some(json!({"cmd": p.cmd, "effects": pty_plan.effects})),
+                });
+            }
+            Verdict::Deny => {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: format!(
+                        "leash denied pty.open of `{}` for principal `{actor}`",
+                        p.cmd
+                    ),
+                    data: Some(json!({"cmd": p.cmd, "effects": pty_plan.effects})),
+                });
             }
         }
         let sandbox = self.policy.sandbox_for(&actor);
