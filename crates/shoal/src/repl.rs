@@ -118,7 +118,16 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let catalogs = bootstrap_report.adapter_catalogs;
     let adapter_names = completer::adapter_names_from(&catalogs);
     if !protocol_backed {
-        bootstrap.run_init(&mut evaluator, shoal_host::Surface::Interactive)?;
+        // A broken init file must not lock the user out of their shell
+        // (bash/zsh warn and continue).
+        if let Err(error) = bootstrap.run_init(&mut evaluator, shoal_host::Surface::Interactive) {
+            eprintln!(
+                "{}",
+                maybe_strip(format!(
+                    "\x1b[33;1mwarning:\x1b[0m init failed, continuing without it: {error}"
+                ))
+            );
+        }
     }
 
     let interrupts = InterruptState::install(&evaluator, protocol.interrupt_handle())?;
