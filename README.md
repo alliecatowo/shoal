@@ -61,6 +61,11 @@ Shoal is pre-release and is not ready to replace a login shell. The language eng
 runner, Reef resolver, journal/CAS, Leash policy path, streams/channels, kernel protocol, and MCP
 facade are implemented and tested on Linux and macOS.
 
+Prebuilt Linux and macOS (x86_64 and arm64) binaries are attached to each
+[GitHub release](https://github.com/alliecatowo/shoal/releases) with SHA-256 checksums. Shoal is
+not on crates.io yet (the `shoal` crate name is taken by an unrelated project). To build from source:
+`cargo install --git https://github.com/alliecatowo/shoal shoal`.
+
 ```bash
 # Interactive shell
 cargo run -p shoal

@@ -28,6 +28,11 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+      - name: Tag matches workspace version
+        shell: bash
+        run: |
+          pkg="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          [ "v$pkg" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml v$pkg" >&2; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -54,9 +59,14 @@ jobs:
             -exec cp {} "$dist/" \;
           cp README.md LICENSE* "$dist/" 2>/dev/null || true
           tar czf "$dist.tar.gz" "$dist"
+          # sha256sum on Linux, shasum on macOS
+          (sha256sum "$dist.tar.gz" 2>/dev/null || shasum -a 256 "$dist.tar.gz") > "$dist.tar.gz.sha256"
           echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
+          echo "ASSET_SUM=$dist.tar.gz.sha256" >> "$GITHUB_ENV"
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET_SUM }}
           generate_release_notes: true
