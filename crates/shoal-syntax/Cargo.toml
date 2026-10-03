@@ -1,13 +1,13 @@
 [package]
 name = "shoal-syntax"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [lints]
 workspace = true
 
 [dependencies]
-shoal-ast = { version = "0.1.1", path = "../shoal-ast" }
+shoal-ast = { version = "0.1.2", path = "../shoal-ast" }
 serde_json = "1"
 
 [dev-dependencies]
