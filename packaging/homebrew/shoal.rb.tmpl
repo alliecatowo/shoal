@@ -1,0 +1,38 @@
+class Shoal < Formula
+  desc "Structured, typed, sandbox-aware shell"
+  homepage "https://github.com/alliecatowo/shoal"
+  version "SHOAL_VERSION_PLAIN"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  on_macos do
+    on_arm do
+      url "https://github.com/alliecatowo/shoal/releases/download/vSHOAL_VERSION_PLAIN/shoal-vSHOAL_VERSION_PLAIN-aarch64-apple-darwin.tar.gz"
+      sha256 "SHOAL_SHA256_AARCH64_DARWIN"
+    end
+    on_intel do
+      url "https://github.com/alliecatowo/shoal/releases/download/vSHOAL_VERSION_PLAIN/shoal-vSHOAL_VERSION_PLAIN-x86_64-apple-darwin.tar.gz"
+      sha256 "SHOAL_SHA256_X86_64_DARWIN"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/alliecatowo/shoal/releases/download/vSHOAL_VERSION_PLAIN/shoal-vSHOAL_VERSION_PLAIN-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "SHOAL_SHA256_AARCH64_LINUX"
+    end
+    on_intel do
+      url "https://github.com/alliecatowo/shoal/releases/download/vSHOAL_VERSION_PLAIN/shoal-vSHOAL_VERSION_PLAIN-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "SHOAL_SHA256_X86_64_LINUX"
+    end
+  end
+
+  def install
+    # The archive holds one directory of prebuilt executables plus docs.
+    bin.install Dir["shoal*"].select { |f| File.file?(f) && File.executable?(f) }
+    doc.install "README.md"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/shoal --version")
+  end
+end

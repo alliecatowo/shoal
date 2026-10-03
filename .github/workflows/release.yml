@@ -70,3 +70,65 @@ jobs:
             ${{ env.ASSET }}
             ${{ env.ASSET_SUM }}
           generate_release_notes: true
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true  # a formula-bump hiccup must not fail the release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render formula from the published checksums
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/shoal-${TAG}"
+          sum() { curl -fsSL "${base}-$1.tar.gz.sha256" | awk '{print $1}'; }
+          A_DARWIN="$(sum aarch64-apple-darwin)"
+          X_DARWIN="$(sum x86_64-apple-darwin)"
+          A_LINUX="$(sum aarch64-unknown-linux-gnu)"
+          X_LINUX="$(sum x86_64-unknown-linux-gnu)"
+          mkdir -p tap-out/Formula
+          sed \
+            -e "s|SHOAL_VERSION_PLAIN|${VERSION}|g" \
+            -e "s|SHOAL_SHA256_AARCH64_DARWIN|${A_DARWIN}|g" \
+            -e "s|SHOAL_SHA256_X86_64_DARWIN|${X_DARWIN}|g" \
+            -e "s|SHOAL_SHA256_AARCH64_LINUX|${A_LINUX}|g" \
+            -e "s|SHOAL_SHA256_X86_64_LINUX|${X_LINUX}|g" \
+            packaging/homebrew/shoal.rb.tmpl > tap-out/Formula/shoal.rb
+          grep -q SHOAL_ tap-out/Formula/shoal.rb && { echo "unrendered placeholder" >&2; exit 1; }
+          cat tap-out/Formula/shoal.rb
+
+      - name: Push formula to alliecatowo/homebrew-tap
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_DEPLOY_KEY:-}" ]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY secret is not set; cannot update the tap"
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$keyfile"
+          chmod 600 "$keyfile"
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git clone --depth 1 git@github.com:alliecatowo/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cp tap-out/Formula/shoal.rb tap/Formula/shoal.rb
+          cd tap
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Tap already up to date; nothing to push."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/shoal.rb
+          git commit -m "shoal ${GITHUB_REF_NAME#v}"
+          git push origin HEAD:main
