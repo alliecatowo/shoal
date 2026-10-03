@@ -33,9 +33,12 @@ jobs:
         run: |
           pkg="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
           [ "v$pkg" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml v$pkg" >&2; exit 1; }
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins the channel, so install the target for that
+      # toolchain (dtolnay@stable would add it to `stable`, which isn't used).
+      - name: Install pinned toolchain and target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
