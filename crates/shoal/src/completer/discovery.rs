@@ -160,13 +160,10 @@ impl PathDiscovery {
     }
 }
 
-/// Enumerate adapter command names through the same bounded, validated loader
-/// used by execution. Completion is advisory, so malformed files simply
-/// contribute no candidates; startup reports the loader's warnings.
-pub(super) fn adapter_names(dirs: &[PathBuf]) -> Vec<String> {
+/// Enumerate adapter command names from the catalogs execution already loaded.
+pub(super) fn adapter_names(catalogs: &[shoal_adapters::AdapterCatalog]) -> Vec<String> {
     let mut names = BTreeSet::new();
-    for dir in dirs {
-        let (catalog, _warnings) = shoal_adapters::AdapterCatalog::load_dir(dir);
+    for catalog in catalogs {
         names.extend(catalog.names().map(str::to_owned));
     }
     names.into_iter().collect()

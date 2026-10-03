@@ -1161,3 +1161,17 @@ fn ip_link_json_parses_interface_table() {
     assert_eq!(rows[0]["mtu"], Value::Int(65536));
     assert_eq!(parse(spec, b"[{\"ifindex\": "), None);
 }
+
+#[test]
+fn bundled_catalog_is_embedded_and_matches_the_adapters_directory() {
+    let (bundled, warnings) = shoal_adapters::AdapterCatalog::load_bundled();
+    assert!(warnings.is_empty(), "bundled adapters warn: {warnings:?}");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+    let (from_dir, _) = shoal_adapters::AdapterCatalog::load_dir(&root);
+    let mut a: Vec<_> = bundled.names().collect();
+    let mut b: Vec<_> = from_dir.names().collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert!(!a.is_empty());
+    assert_eq!(a, b);
+}

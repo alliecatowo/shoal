@@ -116,7 +116,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     );
 
     let catalogs = bootstrap_report.adapter_catalogs;
-    let adapter_names = completer::scan_adapter_names(&bootstrap_report.adapter_dirs);
+    let adapter_names = completer::adapter_names_from(&catalogs);
     if !protocol_backed {
         bootstrap.run_init(&mut evaluator, shoal_host::Surface::Interactive)?;
     }

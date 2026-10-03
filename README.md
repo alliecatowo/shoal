@@ -70,6 +70,16 @@ Prebuilt Linux and macOS (x86_64 and arm64) binaries are attached to each
 not on crates.io yet (the `shoal` crate name is taken by an unrelated project). To build from source:
 `cargo install --git https://github.com/alliecatowo/shoal shoal`.
 
+Install a release with Homebrew (macOS and Linux), or download a tarball for your platform from the
+[releases page](https://github.com/alliecatowo/shoal/releases/latest):
+
+```bash
+brew install alliecatowo/tap/shoal
+shoal --version
+```
+
+Or build from source:
+
 ```bash
 # Install the pinned tools, then all binaries, man pages, and host-shell completions
 mise install
