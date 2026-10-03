@@ -370,17 +370,8 @@ impl Kernel {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Bind under a restrictive umask so the socket is never reachable with
-        // looser permissions, even briefly before the chmod below.
-        let listener = {
-            // SAFETY: umask only swaps the process file-mode mask.
-            let previous = unsafe { libc::umask(0o177) };
-            let bound = UnixListener::bind(path);
-            unsafe { libc::umask(previous) };
-            bound?
-        };
+        let listener = bind_private_socket(path)?;
         let _socket_guard = BoundSocket(path.to_path_buf());
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         while !stop.load(Ordering::SeqCst) && !self.shutdown_requested.load(Ordering::SeqCst) {
             let kernel = self.clone();
