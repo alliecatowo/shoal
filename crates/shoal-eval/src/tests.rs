@@ -2277,3 +2277,38 @@ fn run_capturing_in(src: &str, cwd: &Path) -> (VResult<Value>, Vec<Value>) {
     let captured = Arc::try_unwrap(sink).unwrap().into_inner().unwrap();
     (out, captured)
 }
+
+/// Regression (audit H1): `env.X` was gated by `env_read`, but a spawned child
+/// inherited the whole daemon environment.
+#[test]
+fn child_env_is_filtered_by_env_read_for_scoped_principals() {
+    let probe = r#"run("sh", "-c", "env | grep -E '^(TERM=h1|SHOAL_H1_SECRET=)'; exit 0").out"#;
+    let program = shoal_syntax::parse(probe).unwrap();
+    let eval_with = |policy: Option<&str>| {
+        let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+        ev.exec.shell.process_env.push((
+            std::ffi::OsString::from("TERM"),
+            std::ffi::OsString::from("h1-safe-base"),
+        ));
+        ev.exec.shell.process_env.push((
+            std::ffi::OsString::from("SHOAL_H1_SECRET"),
+            std::ffi::OsString::from("sk-demo-123"),
+        ));
+        if let Some(toml) = policy {
+            ev.set_leash_policy(LeashPolicy::from_toml(toml).unwrap(), "agent");
+        }
+        format!("{:?}", ev.eval_program(&program).unwrap())
+    };
+    let unfiltered = eval_with(None);
+    assert!(unfiltered.contains("sk-demo-123"), "{unfiltered}");
+    assert!(
+        eval_with(Some("[principal.agent]\nopaque='allow'\n")).contains("TERM=h1-safe-base")
+            && !eval_with(Some("[principal.agent]\nopaque='allow'\n")).contains("SHOAL_H1_SECRET")
+    );
+    assert!(
+        eval_with(Some(
+            "[principal.agent]\nopaque='allow'\nenv_read=['SHOAL_H1_SECRET']\n"
+        ))
+        .contains("sk-demo-123")
+    );
+}

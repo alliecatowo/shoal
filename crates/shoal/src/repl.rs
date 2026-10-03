@@ -86,7 +86,19 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     }
     let config = bootstrap.config().clone();
     let state_dir = effective_journal_state_dir(config.journal.state_dir.as_deref(), &cwd);
-    let protocol_backed = protocol_requested(standalone, config.kernel.enabled);
+    let mut protocol_backed = protocol_requested(standalone, config.kernel.enabled);
+    if protocol_backed && !crate::embedded_kernel::kernel_available() {
+        // `cargo install shoal` alone does not install `shoal-kernel`.
+        eprintln!(
+            "{}",
+            maybe_strip(
+                "\x1b[33;1mwarning:\x1b[0m shoal-kernel not found; running standalone \
+                 (install it with `cargo install --git https://github.com/alliecatowo/shoal shoal-kernel`)"
+                    .to_string()
+            )
+        );
+        protocol_backed = false;
+    }
     let mut protocol =
         ProtocolState::connect(protocol_backed, &config, state_dir.clone(), cwd.clone())?;
     let mut evaluator = Evaluator::new(cwd.clone());
@@ -118,7 +130,16 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let catalogs = bootstrap_report.adapter_catalogs;
     let adapter_names = completer::adapter_names_from(&catalogs);
     if !protocol_backed {
-        bootstrap.run_init(&mut evaluator, shoal_host::Surface::Interactive)?;
+        // A broken init file must not lock the user out of their shell
+        // (bash/zsh warn and continue).
+        if let Err(error) = bootstrap.run_init(&mut evaluator, shoal_host::Surface::Interactive) {
+            eprintln!(
+                "{}",
+                maybe_strip(format!(
+                    "\x1b[33;1mwarning:\x1b[0m init failed, continuing without it: {error}"
+                ))
+            );
+        }
     }
 
     let interrupts = InterruptState::install(&evaluator, protocol.interrupt_handle())?;

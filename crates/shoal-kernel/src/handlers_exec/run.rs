@@ -57,7 +57,10 @@ impl Kernel {
                     return Err(RpcError {
                         code: LEASH_DENIED,
                         message: "leash denied execution".into(),
-                        data: Some(json!({"effects":run_plan.effects})),
+                        data: Some(json!({
+                            "effects":run_plan.effects,
+                            "hint": deny_hint(&self.policy, &actor),
+                        })),
                     });
                 }
                 Verdict::ApprovalRequired => {
@@ -505,5 +508,16 @@ impl Kernel {
             None
         };
         Ok(claimed_approval)
+    }
+}
+
+/// Why a plan was denied, in one line a human or agent can act on.
+fn deny_hint(policy: &Policy, actor: &str) -> String {
+    if policy.principal(actor).is_none() {
+        format!(
+            "no leash policy for principal `{actor}`; add a [principal.\"{actor}\"] block to the policy passed with --policy (see plugin/README.md)"
+        )
+    } else {
+        format!("principal `{actor}` lacks a grant for these effects; see its leash policy")
     }
 }

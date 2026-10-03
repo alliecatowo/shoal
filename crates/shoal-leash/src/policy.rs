@@ -174,6 +174,35 @@ impl Policy {
                 .is_some_and(|p| !p.proc_spawn.is_empty())
     }
 
+    /// Whether a child process spawned for `principal` may inherit the
+    /// environment variable `name`. The `env_read` grant governs `env.X`
+    /// reads, so it must also govern what a spawned child can read: a fixed set
+    /// of harmless base variables is always inherited, everything else needs an
+    /// `env_read` grant (or `*`). Unknown principals and a quarantined policy
+    /// get only the base set.
+    pub fn child_env_allows(&self, principal: &str, name: &str) -> bool {
+        if SAFE_CHILD_ENV.contains(&name) || name.starts_with("LC_") {
+            return true;
+        }
+        if self.fail_closed {
+            return false;
+        }
+        self.principal(principal)
+            .is_some_and(|p| p.env_read.iter().any(|g| g == "*" || g == name))
+    }
+
+    /// Drop every variable from `env` that [`Policy::child_env_allows`] refuses.
+    pub fn filter_child_env(
+        &self,
+        principal: &str,
+        env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) {
+        env.retain(|(k, _)| {
+            k.to_str()
+                .is_some_and(|name| self.child_env_allows(principal, name))
+        });
+    }
+
     /// Whether this principal asks Leash to restrict filesystem access.
     /// This intentionally remains true when every configured root is missing:
     /// a hermetic typo must be distinguishable from an unrestricted policy so
@@ -293,6 +322,22 @@ impl Policy {
              [principal.\"{principal}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n"
         ))
         .expect("built-in permissive policy")
+    }
+
+    /// The out-of-the-box policy a fresh kernel runs with: [`Policy::permissive`]
+    /// for the human `principal`, plus a conservative [`DEFAULT_AGENT_POLICY`]
+    /// for `agent:mcp` (what the MCP facade and the Claude Code plugin attach
+    /// as). Without the agent block a fresh kernel denied every MCP call,
+    /// including `1 + 2`. An explicit `--policy` file replaces this entirely.
+    pub fn default_with_agents(principal: &str) -> Policy {
+        let human = format!(
+            "[principal.\"{principal}\"]\nopaque='allow'\nauto_apply='in-grant'\n\
+             journal_read=true\nenv_read=[\"*\"]\nenv_write=[\"*\"]\nsession_write=true\n\
+             time=true\n\n\
+             [principal.\"{principal}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n\n"
+        );
+        Policy::from_toml(&format!("{human}{DEFAULT_AGENT_POLICY}"))
+            .expect("built-in default policy")
     }
 
     /// A quarantined policy used when an authority-bearing policy exists but
@@ -710,6 +755,36 @@ fn validate_policy_string(kind: &str, value: &str) -> Result<(), PolicyParseErro
 fn bool_verdict(ok: bool) -> Verdict {
     if ok { Verdict::Allow } else { Verdict::Deny }
 }
+/// Conservative built-in grants for the MCP agent principal: pure evaluation,
+/// time, session state and journal reads run unattended; anything opaque
+/// (external commands, `sh {}`) needs approval; no filesystem, environment,
+/// network or secret access until a user policy grants it. Copy this block
+/// into `leash.toml` and widen it deliberately.
+pub const DEFAULT_AGENT_POLICY: &str = "[principal.\"agent:mcp\"]\n\
+opaque = 'ask'\n\
+auto_apply = 'in-grant'\n\
+time = true\n\
+session_write = true\n\
+journal_read = true\n";
+
+/// Variables every child may inherit regardless of `env_read`: process
+/// plumbing and locale, never credentials.
+const SAFE_CHILD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "COLORTERM",
+    "TZ",
+    "TMPDIR",
+    "PWD",
+    "NO_COLOR",
+];
+
 fn names_verdict(names: &[String], grants: &[String]) -> Verdict {
     bool_verdict(
         names
