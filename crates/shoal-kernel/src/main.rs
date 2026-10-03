@@ -66,6 +66,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         validate_embedded_socket(fd).map_err(|error| {
             format!("--embedded-fd {fd} is not a connected Unix stream socket: {error}")
         })?;
+        // The transport is for this process only. The parent had to clear
+        // CLOEXEC so the fd survives into us; set it again so no command the
+        // kernel runs (or any pty it opens) inherits the REPL channel.
+        // SAFETY: fcntl above proved `fd` is open.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(format!(
+                "--embedded-fd {fd}: cannot set CLOEXEC: {}",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
         // Keep the private kernel alive when the terminal delivers Ctrl-C to
         // the foreground process group. This is a caught handler (not
         // SIG_IGN), so exec restores SIG_DFL in command children.
