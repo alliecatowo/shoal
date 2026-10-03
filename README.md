@@ -65,6 +65,11 @@ facade are implemented and tested on Linux and macOS.
 (where available) Landlock/Seatbelt sandboxing; Windows is out of scope for now and would need a
 deliberate port (see [Current status and limits](https://alliecatowo.github.io/shoal/docs/status-limits/)).
 
+Prebuilt Linux and macOS (x86_64 and arm64) binaries are attached to each
+[GitHub release](https://github.com/alliecatowo/shoal/releases) with SHA-256 checksums. Shoal is
+not on crates.io yet (the `shoal` crate name is taken by an unrelated project). To build from source:
+`cargo install --git https://github.com/alliecatowo/shoal shoal`.
+
 ```bash
 # Install the pinned tools, then all binaries, man pages, and host-shell completions
 mise install

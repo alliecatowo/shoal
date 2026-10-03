@@ -4,18 +4,16 @@ on:
   push:
     tags: ["v*"]
 
-permissions: {}
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  MISE_JOBS: 1
 
 jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -29,25 +27,108 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: actions/checkout@v7
+      - name: Tag matches workspace version
+        shell: bash
+        run: |
+          pkg="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          [ "v$pkg" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml v$pkg" >&2; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Bootstrap Shoal
-        run: cargo build -p shoal --locked
-      - name: Build and package through Shoal
-        env:
-          SHOAL_RELEASE_TAG: ${{ github.ref_name }}
-          SHOAL_RELEASE_TARGET: ${{ matrix.target }}
-        run: target/debug/shoal scripts/release-package.shl
+      - name: Install cross linker (aarch64 linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Build binaries
+        run: cargo build --release --locked --workspace --bins --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="shoal-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$dist"
+          # Copy every non-example executable produced for this target.
+          find "target/${{ matrix.target }}/release" -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.d' ! -name '*.rlib' ! -name '*.so' ! -name '*.dylib' \
+            -exec cp {} "$dist/" \;
+          cp README.md LICENSE* "$dist/" 2>/dev/null || true
+          tar czf "$dist.tar.gz" "$dist"
+          # sha256sum on Linux, shasum on macOS
+          (sha256sum "$dist.tar.gz" 2>/dev/null || shasum -a 256 "$dist.tar.gz") > "$dist.tar.gz.sha256"
+          echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
+          echo "ASSET_SUM=$dist.tar.gz.sha256" >> "$GITHUB_ENV"
       - name: Upload to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
-            shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            shoal-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            ${{ env.ASSET }}
+            ${{ env.ASSET_SUM }}
           generate_release_notes: true
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true  # a formula-bump hiccup must not fail the release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Render formula from the published checksums
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/shoal-${TAG}"
+          sum() { curl -fsSL "${base}-$1.tar.gz.sha256" | awk '{print $1}'; }
+          A_DARWIN="$(sum aarch64-apple-darwin)"
+          X_DARWIN="$(sum x86_64-apple-darwin)"
+          A_LINUX="$(sum aarch64-unknown-linux-gnu)"
+          X_LINUX="$(sum x86_64-unknown-linux-gnu)"
+          mkdir -p tap-out/Formula
+          sed \
+            -e "s|SHOAL_VERSION_PLAIN|${VERSION}|g" \
+            -e "s|SHOAL_SHA256_AARCH64_DARWIN|${A_DARWIN}|g" \
+            -e "s|SHOAL_SHA256_X86_64_DARWIN|${X_DARWIN}|g" \
+            -e "s|SHOAL_SHA256_AARCH64_LINUX|${A_LINUX}|g" \
+            -e "s|SHOAL_SHA256_X86_64_LINUX|${X_LINUX}|g" \
+            packaging/homebrew/shoal.rb.tmpl > tap-out/Formula/shoal.rb
+          grep -q SHOAL_ tap-out/Formula/shoal.rb && { echo "unrendered placeholder" >&2; exit 1; }
+          cat tap-out/Formula/shoal.rb
+
+      - name: Push formula to alliecatowo/homebrew-tap
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_DEPLOY_KEY:-}" ]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY secret is not set; cannot update the tap"
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$keyfile"
+          chmod 600 "$keyfile"
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git clone --depth 1 git@github.com:alliecatowo/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cp tap-out/Formula/shoal.rb tap/Formula/shoal.rb
+          cd tap
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Tap already up to date; nothing to push."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/shoal.rb
+          git commit -m "shoal ${GITHUB_REF_NAME#v}"
+          git push origin HEAD:main

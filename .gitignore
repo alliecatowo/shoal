@@ -6,3 +6,11 @@
 scratch/
 # Reef locks bind absolute executable paths and byte hashes for one host.
 reef.lock
+
+.env
+.env.*
+!.env.example
+/.mcp.json
+*.log
+.DS_Store
+.claude/worktrees/

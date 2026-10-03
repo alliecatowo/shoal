@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1.8"
 fd-lock = "4"
 getrandom = "0.4"

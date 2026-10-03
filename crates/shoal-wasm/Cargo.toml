@@ -1,6 +1,6 @@
 [package]
 name="shoal-wasm"
-version="0.1.0"
+version = "0.1.1"
 edition="2024"
 
 [lints]
@@ -13,7 +13,7 @@ toml="1"
 thiserror="2"
 blake3="1"
 shoal-leash={path="../shoal-leash"}
-wasmtime={version="46",default-features=false,features=["component-model","cranelift","runtime","wat"]}
+wasmtime={version="49",default-features=false,features=["component-model","cranelift","runtime","wat"]}
 [dev-dependencies]
 tempfile="3"
 wit-component={version="0.251",features=["dummy-module"]}

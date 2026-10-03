@@ -115,7 +115,7 @@ let large = (ls .)
   .sort_by(.size)
   .reverse()
 
-large.map({ name: .name, megabytes: .size / 1mb })
+large.map(f => { name: f.name, megabytes: f.size / 1mb })
 ```
 
 The next line may begin with `.` after an incomplete chain, so long transformations remain readable. There is no command-pipeline `|`. Use:

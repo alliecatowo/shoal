@@ -1061,11 +1061,11 @@ fn env_kv_parses_key_value_dump_including_embedded_equals_in_value() {
     let spec = top(&c, "env");
     assert_eq!(spec.parse, "kv");
 
-    let good = b"HOME=/home/allie\nSHELL=/usr/bin/zsh\nDEBUGINFOD_URLS=ima:enforcing https://x=y\n";
+    let good = b"HOME=/home/user\nSHELL=/usr/bin/zsh\nDEBUGINFOD_URLS=ima:enforcing https://x=y\n";
     let Value::Record(r) = parse(spec, good).expect("realistic env dump must parse") else {
         panic!("expected record")
     };
-    assert_eq!(r["HOME"], Value::Str("/home/allie".into()));
+    assert_eq!(r["HOME"], Value::Str("/home/user".into()));
     assert_eq!(r.len(), 3);
     // The value's own embedded `=` must not truncate it -- `kv` splits on
     // only the *first* `=`, which is exactly right since a POSIX env var
