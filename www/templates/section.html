@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}{{ section.title }} — {{ config.title }}{% endblock title %}
+{% block description %}{{ section.description | default(value=config.description) }}{% endblock description %}
+{% block content %}
+<article class="prose">
+  <h1>{{ section.title }}</h1>
+  {{ section.content | safe }}
+  <ul class="page-list">
+    {% for p in section.pages %}
+    <li>
+      <a href="{{ p.permalink | safe }}">{{ p.title }}</a>
+      {% if p.description %}<span class="page-desc">{{ p.description }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</article>
+{% endblock content %}

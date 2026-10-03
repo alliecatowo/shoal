@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ config.title }} — {{ config.description }}{% endblock title %}</title>
+  <meta name="description" content="{% block description %}{{ config.description }}{% endblock description %}">
+  <link rel="stylesheet" href="{{ get_url(path='style.css') | safe }}">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐟</text></svg>">
+</head>
+<body>
+{% set cur = current_url | default(value="") %}
+{% set language = get_section(path="language/_index.md") %}
+{% set guide = get_section(path="guide/_index.md") %}
+<div class="layout">
+  <input type="checkbox" id="nav-toggle" class="nav-toggle" aria-hidden="true">
+  <header class="topbar">
+    <label for="nav-toggle" class="nav-burger" aria-label="Toggle navigation">☰</label>
+    <a class="brand" href="{{ get_url(path='@/_index.md') | safe }}">shoal</a>
+    <span class="tagline">an agent-first structured shell</span>
+    <a class="gh" href="{{ config.extra.github }}">GitHub</a>
+  </header>
+  <nav class="sidebar">
+    <div class="nav-group">
+      <a href="{{ get_url(path='@/_index.md') | safe }}" {% if cur == config.base_url ~ "/" %}class="active"{% endif %}>Home</a>
+    </div>
+    <div class="nav-group">
+      <a class="nav-head" href="{{ language.permalink | safe }}" {% if cur == language.permalink %}aria-current="page"{% endif %}>Language Reference</a>
+      <ul>
+        {% for p in language.pages %}
+        <li><a href="{{ p.permalink | safe }}" {% if cur == p.permalink %}class="active" aria-current="page"{% endif %}>{{ p.title }}</a></li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div class="nav-group">
+      <a class="nav-head" href="{{ guide.permalink | safe }}" {% if cur == guide.permalink %}aria-current="page"{% endif %}>Shell Usage Guide</a>
+      <ul>
+        {% for p in guide.pages %}
+        <li><a href="{{ p.permalink | safe }}" {% if cur == p.permalink %}class="active" aria-current="page"{% endif %}>{{ p.title }}</a></li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div class="nav-group">
+      <a class="nav-head" href="{{ config.base_url | safe }}/architecture/">Architecture</a>
+    </div>
+    <div class="nav-group nav-external">
+      <a href="{{ config.extra.github }}/tree/main/docs">Design docs</a>
+      <a href="{{ config.extra.github }}/tree/main/spec/cases">Conformance corpus</a>
+    </div>
+  </nav>
+  <main class="content">
+    {% block content %}{% endblock content %}
+  </main>
+</div>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  document.querySelectorAll('pre code.language-mermaid, code.language-mermaid').forEach(el => {
+    const host = el.closest('pre') || el;
+    const div = document.createElement('div'); div.className = 'mermaid';
+    div.textContent = el.textContent; host.replaceWith(div);
+  });
+  mermaid.initialize({ startOnLoad: false, theme: 'dark' });
+  await mermaid.run();
+</script>
+</body>
+</html>

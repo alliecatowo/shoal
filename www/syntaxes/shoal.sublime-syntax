@@ -1,0 +1,78 @@
+%YAML 1.2
+---
+# Minimal highlighting for shoal source in the docs site. Not a full grammar —
+# just enough to make fenced ```shoal blocks readable: comments, strings,
+# numbers with unit suffixes, keywords, and flags.
+name: shoal
+file_extensions:
+  - shl
+  - shoal
+scope: source.shoal
+
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.shoal
+    - match: '"""'
+      scope: punctuation.definition.string.begin.shoal
+      push: triple_dstring
+    - match: "'''"
+      scope: punctuation.definition.string.begin.shoal
+      push: triple_sstring
+    - match: '(re|t)?"'
+      scope: punctuation.definition.string.begin.shoal
+      push: dstring
+    - match: "'"
+      scope: punctuation.definition.string.begin.shoal
+      push: sstring
+    - match: '\b(let|var|fn|alias|use|export|return|break|continue|if|else|match|for|in|while|try|catch|with|spawn)\b'
+      scope: keyword.control.shoal
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.shoal
+    - match: '\b\d[\d_]*(\.\d+)?(ns|us|ms|kib|mib|gib|tib|kb|mb|gb|tb|b|s|m|h|d|w)\b'
+      scope: constant.numeric.unit.shoal
+    - match: '\b0x[0-9A-Fa-f_]+\b|\b0o[0-7_]+\b|\b0b[01_]+\b'
+      scope: constant.numeric.shoal
+    - match: '\b\d[\d_]*(\.\d+)?([eE]\d+)?\b'
+      scope: constant.numeric.shoal
+    - match: '--[A-Za-z0-9_-]+'
+      scope: variable.parameter.flag.shoal
+    - match: '=>'
+      scope: keyword.operator.arrow.shoal
+    - match: '(\?\?|\?\.|&&|\|\||==|!=|<=|>=|\.\.=?)'
+      scope: keyword.operator.shoal
+    - match: '\.([a-z_][A-Za-z0-9_]*)'
+      captures:
+        1: entity.name.function.method.shoal
+
+  dstring:
+    - match: '\\.'
+      scope: constant.character.escape.shoal
+    - match: '\{[^}]*\}'
+      scope: string.interpolated.shoal
+    - match: '"'
+      scope: punctuation.definition.string.end.shoal
+      pop: true
+    - match: '.'
+      scope: string.quoted.double.shoal
+
+  sstring:
+    - match: "'"
+      scope: punctuation.definition.string.end.shoal
+      pop: true
+    - match: '.'
+      scope: string.quoted.single.shoal
+
+  triple_dstring:
+    - match: '"""'
+      scope: punctuation.definition.string.end.shoal
+      pop: true
+    - match: '.'
+      scope: string.quoted.double.shoal
+
+  triple_sstring:
+    - match: "'''"
+      scope: punctuation.definition.string.end.shoal
+      pop: true
+    - match: '.'
+      scope: string.quoted.single.shoal

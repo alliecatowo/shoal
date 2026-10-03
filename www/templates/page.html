@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ page.title }} — {{ config.title }}{% endblock title %}
+{% block description %}{{ page.description | default(value=config.description) }}{% endblock description %}
+{% block content %}
+<article class="prose">
+  <h1>{{ page.title }}</h1>
+  {{ page.content | safe }}
+  <nav class="pagenav">
+    {% if page.lower %}<a class="prev" href="{{ page.lower.permalink | safe }}">← {{ page.lower.title }}</a>{% else %}<span></span>{% endif %}
+    {% if page.higher %}<a class="next" href="{{ page.higher.permalink | safe }}">{{ page.higher.title }} →</a>{% endif %}
+  </nav>
+</article>
+{% endblock content %}

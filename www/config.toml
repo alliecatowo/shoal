@@ -1,0 +1,14 @@
+base_url = "https://alliecatowo.github.io/shoal"
+title = "shoal"
+description = "An agent-first structured shell"
+compile_sass = true
+build_search_index = true
+generate_feeds = false
+
+[markdown]
+highlight_code = true
+highlight_theme = "ayu-dark"
+extra_syntaxes_and_themes = ["syntaxes"]
+
+[extra]
+github = "https://github.com/alliecatowo/shoal"
