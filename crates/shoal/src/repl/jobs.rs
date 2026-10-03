@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use reedline::ExternalPrinter;
 use shoal_eval::Evaluator;
 use shoal_value::Value;
 
@@ -17,11 +16,11 @@ pub(super) struct BackgroundJobs {
     receiver: Receiver<BackgroundJobEvent>,
     watched: BTreeSet<u64>,
     suppressed: Arc<Mutex<BTreeSet<u64>>>,
-    printer: ExternalPrinter<String>,
+    printer: SyncSender<String>,
 }
 
 impl BackgroundJobs {
-    pub(super) fn new(evaluator: &Evaluator, printer: ExternalPrinter<String>) -> Self {
+    pub(super) fn new(evaluator: &Evaluator, printer: SyncSender<String>) -> Self {
         let (events, receiver) = std::sync::mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
         let mut state = Self {
             events,
@@ -235,13 +234,13 @@ pub(super) const MAX_PENDING_BACKGROUND_EVENTS: usize = 256;
 
 pub(super) struct BackgroundOutputState {
     id: u64,
-    printer: ExternalPrinter<String>,
+    printer: SyncSender<String>,
     pending: Vec<u8>,
     omitted: usize,
 }
 
 impl BackgroundOutputState {
-    pub(super) fn new(id: u64, printer: ExternalPrinter<String>) -> Self {
+    pub(super) fn new(id: u64, printer: SyncSender<String>) -> Self {
         Self {
             id,
             printer,
@@ -285,7 +284,7 @@ impl BackgroundOutputState {
             String::new()
         };
         let message = format!("{prefix}[{}] {safe}", self.id);
-        if self.printer.sender().try_send(message).is_ok() {
+        if self.printer.try_send(message).is_ok() {
             self.omitted = 0;
         } else {
             self.omitted = self
@@ -314,10 +313,10 @@ fn sanitize_background_output(bytes: &[u8]) -> String {
 /// bounded Reedline queue is full, the event remains unmarked and the REPL
 /// thread prints it when it next drains state transitions.
 pub(super) fn enqueue_background_notice(
-    printer: &ExternalPrinter<String>,
+    printer: &SyncSender<String>,
     event: &mut BackgroundJobEvent,
 ) {
-    if printer.sender().try_send(event.notice()).is_ok() {
+    if printer.try_send(event.notice()).is_ok() {
         event.set_notified();
     }
 }
@@ -328,7 +327,7 @@ pub(super) fn watch_new_tasks(
     watched: &mut BTreeSet<u64>,
     suppressed: &Arc<Mutex<BTreeSet<u64>>>,
     events: &SyncSender<BackgroundJobEvent>,
-    printer: &ExternalPrinter<String>,
+    printer: &SyncSender<String>,
 ) {
     let tasks = evaluator.tasks_snapshot();
     let current_ids = tasks.iter().map(|task| task.id).collect::<BTreeSet<_>>();
@@ -384,13 +383,13 @@ pub(super) fn handle_task_watcher_launch(
     launch: std::io::Result<std::thread::JoinHandle<()>>,
     id: u64,
     watched: &mut BTreeSet<u64>,
-    printer: &ExternalPrinter<String>,
+    printer: &SyncSender<String>,
 ) {
     if let Err(error) = launch {
         // The task itself remains owned by the evaluator. Retire only the host
         // mirror so the next prompt can retry installing its observer.
         watched.remove(&id);
-        let _ = printer.sender().try_send(maybe_strip(format!(
+        let _ = printer.try_send(maybe_strip(format!(
             "\x1b[33;1mwarning:\x1b[0m cannot watch task [{id}]: {error}"
         )));
     }
@@ -508,7 +507,7 @@ pub(super) fn handle_job_control(
     evaluator: &mut shoal_eval::Evaluator,
     jc: JobControl,
     background_events: &SyncSender<BackgroundJobEvent>,
-    background_printer: &ExternalPrinter<String>,
+    background_printer: &SyncSender<String>,
 ) {
     let warn = |msg: &str| {
         eprintln!(

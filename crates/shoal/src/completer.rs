@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use reedline::{Completer, Suggestion};
+use reedline::{Completer, CompletionResult, Suggestion};
 use shoal_adapters::AdapterCatalog;
 use shoal_value::Env;
 
@@ -107,7 +107,14 @@ impl ShoalCompleter {
 }
 
 impl Completer for ShoalCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+        CompletionResult::fresh(self.suggestions(line, pos))
+    }
+}
+
+impl ShoalCompleter {
+    /// Every candidate for `line` at `pos`, synchronously.
+    pub(crate) fn suggestions(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let max_results = self.max_results;
         match classify(&self.env, line, pos) {
             Ctx::Head { start, word } => {
@@ -319,14 +326,14 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let method = c.complete("tbl.wh", 6);
+        let method = c.suggestions("tbl.wh", 6);
         assert!(
             method.iter().any(|s| s.value == "where"),
             "method position must offer `.where`, got {:?}",
             method.iter().map(|s| &s.value).collect::<Vec<_>>()
         );
 
-        let expr = c.complete("let x = wh", 10);
+        let expr = c.suggestions("let x = wh", 10);
         assert!(
             !expr.iter().any(|s| s.value == "where"),
             "plain expr position must NOT offer method names, got {:?}",
@@ -347,7 +354,7 @@ mod tests {
 
     /// Complete `line` at its end and collect the candidate strings.
     fn cands(c: &mut ShoalCompleter, line: &str) -> Vec<String> {
-        c.complete(line, line.len())
+        c.suggestions(line, line.len())
             .into_iter()
             .map(|s| s.value)
             .collect()
@@ -665,7 +672,7 @@ mod tests {
         let mut completer = completer_at(dir.path());
         let line = "ls exampel";
         let suggestion = completer
-            .complete(line, line.len())
+            .suggestions(line, line.len())
             .into_iter()
             .find(|suggestion| suggestion.value == "example/")
             .expect("adjacent transposition should find the directory");
