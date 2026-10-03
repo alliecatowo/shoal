@@ -86,7 +86,19 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     }
     let config = bootstrap.config().clone();
     let state_dir = effective_journal_state_dir(config.journal.state_dir.as_deref(), &cwd);
-    let protocol_backed = protocol_requested(standalone, config.kernel.enabled);
+    let mut protocol_backed = protocol_requested(standalone, config.kernel.enabled);
+    if protocol_backed && !crate::embedded_kernel::kernel_available() {
+        // `cargo install shoal` alone does not install `shoal-kernel`.
+        eprintln!(
+            "{}",
+            maybe_strip(
+                "\x1b[33;1mwarning:\x1b[0m shoal-kernel not found; running standalone \
+                 (install it with `cargo install --git https://github.com/alliecatowo/shoal shoal-kernel`)"
+                    .to_string()
+            )
+        );
+        protocol_backed = false;
+    }
     let mut protocol =
         ProtocolState::connect(protocol_backed, &config, state_dir.clone(), cwd.clone())?;
     let mut evaluator = Evaluator::new(cwd.clone());

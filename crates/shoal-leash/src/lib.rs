@@ -17,9 +17,9 @@ pub use enforce::{
     landlock_abi, preflight_spawn,
 };
 pub use policy::{
-    AutoApply, OpaqueMode, POLICY_MAX_ASSIGNMENTS, POLICY_MAX_BYTES, POLICY_MAX_GRANT_BYTES,
-    POLICY_MAX_GRANTS_PER_KIND, POLICY_MAX_NESTING, POLICY_MAX_PRINCIPALS, Policy, PolicyLoadError,
-    PolicyParseError, PrincipalPolicy, Verdict,
+    AutoApply, DEFAULT_AGENT_POLICY, OpaqueMode, POLICY_MAX_ASSIGNMENTS, POLICY_MAX_BYTES,
+    POLICY_MAX_GRANT_BYTES, POLICY_MAX_GRANTS_PER_KIND, POLICY_MAX_NESTING, POLICY_MAX_PRINCIPALS,
+    Policy, PolicyLoadError, PolicyParseError, PrincipalPolicy, Verdict,
 };
 pub use seatbelt::{seatbelt_profile, seatbelt_profile_with_net};
 

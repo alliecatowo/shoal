@@ -324,6 +324,22 @@ impl Policy {
         .expect("built-in permissive policy")
     }
 
+    /// The out-of-the-box policy a fresh kernel runs with: [`Policy::permissive`]
+    /// for the human `principal`, plus a conservative [`DEFAULT_AGENT_POLICY`]
+    /// for `agent:mcp` (what the MCP facade and the Claude Code plugin attach
+    /// as). Without the agent block a fresh kernel denied every MCP call,
+    /// including `1 + 2`. An explicit `--policy` file replaces this entirely.
+    pub fn default_with_agents(principal: &str) -> Policy {
+        let human = format!(
+            "[principal.\"{principal}\"]\nopaque='allow'\nauto_apply='in-grant'\n\
+             journal_read=true\nenv_read=[\"*\"]\nenv_write=[\"*\"]\nsession_write=true\n\
+             time=true\n\n\
+             [principal.\"{principal}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n\n"
+        );
+        Policy::from_toml(&format!("{human}{DEFAULT_AGENT_POLICY}"))
+            .expect("built-in default policy")
+    }
+
     /// A quarantined policy used when an authority-bearing policy exists but
     /// cannot be trusted. It denies every effect and reports spawn pinning as
     /// active so callers cannot take the empty-allowlist bypass.
@@ -739,6 +755,18 @@ fn validate_policy_string(kind: &str, value: &str) -> Result<(), PolicyParseErro
 fn bool_verdict(ok: bool) -> Verdict {
     if ok { Verdict::Allow } else { Verdict::Deny }
 }
+/// Conservative built-in grants for the MCP agent principal: pure evaluation,
+/// time, session state and journal reads run unattended; anything opaque
+/// (external commands, `sh {}`) needs approval; no filesystem, environment,
+/// network or secret access until a user policy grants it. Copy this block
+/// into `leash.toml` and widen it deliberately.
+pub const DEFAULT_AGENT_POLICY: &str = "[principal.\"agent:mcp\"]\n\
+opaque = 'ask'\n\
+auto_apply = 'in-grant'\n\
+time = true\n\
+session_write = true\n\
+journal_read = true\n";
+
 /// Variables every child may inherit regardless of `env_read`: process
 /// plumbing and locale, never credentials.
 const SAFE_CHILD_ENV: &[&str] = &[

@@ -5,7 +5,7 @@ This plugin gives Claude Code a structured way to share a live shoal session. It
 `shoal-kernel` session. Results stay typed, large payloads become drillable references, and live
 changes arrive through subscriptions instead of text scraping or polling.
 
-The implementation is exercised alongside shoal's 1,310-case, 77-suite conformance corpus on
+The implementation is exercised alongside shoal's 1,355-case, 79-suite conformance corpus on
 Linux and macOS. Shoal is still pre-release; read the [current status][status] before relying on it
 as a login shell.
 
@@ -45,16 +45,22 @@ aliases, undo, elision, resources, and PTY workflows.
 
 ## Install
 
-Install the three binaries from this checkout:
+Easiest: `brew install alliecatowo/tap/shoal`, or unpack a tarball from the
+[releases page](https://github.com/alliecatowo/shoal/releases/latest); both ship every binary.
+
+From source, install all the binaries the plugin needs (`shoal-sandbox-exec` and
+`shoal-landlock-helper` are used to confine scoped agents):
 
 ```sh
 cargo install --path crates/shoal
 cargo install --path crates/shoal-kernel
 cargo install --path crates/shoal-mcp
+cargo install --path crates/shoal-exec
+cargo install --path crates/shoal-leash
 ```
 
 `~/.cargo/bin` must be on the `PATH` inherited by Claude Code. The plugin configuration launches
-`shoal mcp`; that companion command execs `shoal-mcp`, which connects to the kernel.
+`shoal mcp`; that companion command starts `shoal-mcp`, which connects to the kernel.
 
 Add this repository as a Claude Code marketplace and install the plugin:
 
@@ -103,6 +109,30 @@ export SHOAL_NO_AUTOSTART=1
 
 Use a short path inside a directory you own. Unix-domain socket paths have a small platform limit,
 and the kernel intentionally refuses insecure parent directories.
+
+## Default policy
+
+The MCP bridge attaches as the restricted principal `agent:mcp`. A fresh kernel with no policy
+file gives it a conservative built-in grant: pure evaluation, time, session state and journal
+reads run unattended, and anything opaque (external commands, `sh { ... }`) needs approval.
+Filesystem, environment, network and secret access are not granted. To widen it, write a
+`leash.toml` and start the kernel with `--policy` (this replaces the built-in policy entirely, so
+keep the `agent:mcp` block):
+
+```toml
+[principal."agent:mcp"]
+opaque = "ask"
+auto_apply = "in-grant"
+time = true
+session_write = true
+journal_read = true
+# env_read = ["HOME"]
+
+[principal."agent:mcp".fs]
+read = ["/home/you/project/**"]
+```
+
+A denial includes a `hint` naming the principal that lacked a grant.
 
 ## Verify the connection
 

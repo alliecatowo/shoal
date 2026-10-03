@@ -661,7 +661,7 @@ fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
 }
 fn permissive_policy() -> Policy {
-    Policy::permissive(&principal())
+    Policy::default_with_agents(&principal())
 }
 
 /// Whether self-acknowledgement (a plan's requester approving its own plan via
