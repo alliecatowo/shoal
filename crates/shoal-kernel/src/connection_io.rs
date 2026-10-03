@@ -40,3 +40,18 @@ pub(crate) fn normalize_attached_disconnect(
         other => other,
     }
 }
+
+/// Accept failures the listener survives: aborted handshakes, signals, and
+/// fd/memory pressure that clears on its own.
+pub(crate) fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::OutOfMemory
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EPROTO)
+    )
+}

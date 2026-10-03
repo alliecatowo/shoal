@@ -682,21 +682,6 @@ fn now_ns() -> i64 {
 fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
 }
-/// Accept failures the listener survives: aborted handshakes, signals, and
-/// fd/memory pressure that clears on its own.
-fn is_transient_accept_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::Interrupted
-            | io::ErrorKind::OutOfMemory
-    ) || matches!(
-        error.raw_os_error(),
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EPROTO)
-    )
-}
-
 fn permissive_policy() -> Policy {
     Policy::permissive(&principal())
 }
