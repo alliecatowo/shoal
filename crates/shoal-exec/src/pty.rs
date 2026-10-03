@@ -806,10 +806,19 @@ mod tests {
             .expect("ownership request")
             .expect("live background job");
         assert_eq!(job.pid(), res.pid);
-        assert!(
-            matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
-            "ownership transfer is not a terminal completion notification"
-        );
+        // The pump thread drops the notifier right after handing the job over,
+        // which can lag this thread; the channel must close without ever
+        // delivering a completion.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                _ => panic!("ownership transfer is not a terminal completion notification"),
+            }
+        }
 
         let foreground_cancel = CancelToken::new();
         foreground_cancel.cancel();

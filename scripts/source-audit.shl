@@ -20,6 +20,9 @@ let shell_files = run("git", "ls-files", "*.sh").out.str().lines()
 assert(shell_files.is_empty(), "repository-owned shell scripts remain: {shell_files}")
 
 let workflows = glob(".github/workflows/*.yml", hidden: true).expand()
+# release.yml (checksums, tag check, Homebrew formula update) and
+# dependabot-automerge.yml are inherently shell-driven GitHub glue.
+let workflows = workflows.where(file => file.name != "release.yml" && file.name != "dependabot-automerge.yml")
 let workflow_lines = workflows.flat_map(file => file.read.lines().map(line => "{file}:{line.trim()}"))
 let shell_blocks = workflow_lines.where(line => line.contains("run: |") || line.contains("run: >") || line.contains("shell: bash") || line.contains("shell: sh"))
 assert(shell_blocks.is_empty(), "workflow shell blocks remain: {shell_blocks}")
