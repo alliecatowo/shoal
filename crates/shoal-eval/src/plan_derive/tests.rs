@@ -1084,3 +1084,38 @@ fn session_mutations_are_never_planned_as_pure() {
         "ordinary collection take was confused with channel subscription"
     );
 }
+
+/// Regression (audit M2): `glob(..).expand()` enumerated arbitrary directories
+/// with no derived effect, so a narrow `fs.read` grant never applied.
+#[test]
+fn glob_expansion_derives_an_fs_read_of_its_concrete_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret");
+    let effects = effects_at(
+        dir.path(),
+        &format!("glob(\"{}/*\").expand()", secret.display()),
+    );
+    assert!(
+        effects.contains(&Effect::FsRead {
+            paths: vec![secret.clone()]
+        }),
+        "{effects:?}"
+    );
+    let relative = effects_at(dir.path(), "glob(\"sub/*.txt\").expand()");
+    assert!(relative.contains(&Effect::FsRead {
+        paths: vec![dir.path().join("sub")]
+    }));
+    let dynamic = effects_at(dir.path(), "let p = \"/\"\nglob(p).expand()");
+    assert!(dynamic.contains(&Effect::Opaque), "{dynamic:?}");
+
+    let policy = LeashPolicy::from_toml(&format!(
+        "[principal.agent]\nauto_apply='in-grant'\n[principal.agent.fs]\nread=[\"{}/work/**\"]\n",
+        dir.path().display()
+    ))
+    .unwrap();
+    let plan = Plan::new(effects, Reversibility::Reversible, Estimates::default());
+    assert_eq!(
+        policy.evaluate_plan("agent", &plan),
+        shoal_leash::Verdict::Deny
+    );
+}

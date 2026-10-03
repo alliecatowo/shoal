@@ -104,8 +104,8 @@ impl Evaluator {
                     None => push_effect(out, Effect::Opaque),
                 }
             }
+            crate::constructors::Constructor::Glob => self.plan_glob_effect(args, out),
             crate::constructors::Constructor::Path
-            | crate::constructors::Constructor::Glob
             | crate::constructors::Constructor::Regex
             | crate::constructors::Constructor::Channel => {}
         }

@@ -8,6 +8,7 @@ use crate::plan_effects::push_effect;
 
 mod attribution;
 mod commands;
+mod glob;
 mod inputs;
 mod statements;
 mod value_effects;
