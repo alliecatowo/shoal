@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub use error::ConfigError;
+pub mod trust;
 pub use load::{CONFIG_FILE_MAX_BYTES, LoadOptions, Loaded, find_project_config, load};
 
 /// The full, typed shoal configuration — the merged result of every layer.

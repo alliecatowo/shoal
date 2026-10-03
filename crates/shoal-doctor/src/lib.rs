@@ -412,6 +412,7 @@ fn probe_config_file(path: &Path) -> Result<ProbeFile, String> {
         system: None,
         user: Some(path.to_path_buf()),
         project: None,
+        untrusted_project: None,
         env: Vec::new(),
     })
     .map_err(|error| error.to_string())?;

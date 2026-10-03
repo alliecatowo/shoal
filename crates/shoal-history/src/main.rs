@@ -294,6 +294,7 @@ mod tests {
             system: None,
             user: None,
             project: Some(config),
+            untrusted_project: None,
             env: vec![],
         };
         assert_eq!(
@@ -311,6 +312,7 @@ mod tests {
             system: None,
             user: None,
             project: Some(config),
+            untrusted_project: None,
             env: vec![],
         };
         let error =

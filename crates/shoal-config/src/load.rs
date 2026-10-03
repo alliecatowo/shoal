@@ -39,6 +39,10 @@ pub struct LoadOptions {
     pub system: Option<PathBuf>,
     pub user: Option<PathBuf>,
     pub project: Option<PathBuf>,
+    /// A discovered project config that was skipped because it is not (or no
+    /// longer) trusted; `load` turns it into a one-line warning. See
+    /// [`crate::trust`].
+    pub untrusted_project: Option<(PathBuf, crate::trust::TrustState)>,
     /// The complete set of `(name, value)` pairs consulted for env overrides
     /// (site/content/internals/configuration-reference.md). Callers normally pass `std::env::vars_os()`
     /// verbatim; tests pass a small synthetic set.
@@ -52,7 +56,7 @@ impl LoadOptions {
     /// 1. **system** — `/etc/shoal/shoal.toml`.
     /// 2. **user** — `$XDG_CONFIG_HOME/shoal/shoal.toml`, falling back to
     ///    `~/.config/shoal/shoal.toml` when `XDG_CONFIG_HOME` is unset.
-    /// 3. **project** — the nearest `.shoal.toml` walking up from `cwd` to
+    /// 3. **project** — (only if trusted via `shoal trust`) the nearest `.shoal.toml` walking up from `cwd` to
     ///    the filesystem root ([`find_project_config`]) — same "nearest
     ///    wins" rule `shoal-reef` uses for `.reef.toml` (site/content/internals/reef-resolution.md).
     /// 4. **env** — the live process environment, for `NO_COLOR`/`SHOAL_*`
@@ -65,10 +69,20 @@ impl LoadOptions {
             .map(PathBuf::from)
             .or_else(|| home.map(|h| h.join(".config")))
             .map(|p| p.join("shoal/shoal.toml"));
+        // Project config can execute code (init files, PATH, plugins, pager),
+        // so it only applies once the user ran `shoal trust` on this exact file.
+        let (project, untrusted_project) = match find_project_config(cwd) {
+            Some(path) => match crate::trust::trust_state(&path) {
+                crate::trust::TrustState::Trusted => (Some(path), None),
+                state => (None, Some((path, state))),
+            },
+            None => (None, None),
+        };
         Self {
             system: Some(PathBuf::from("/etc/shoal/shoal.toml")),
             user,
-            project: find_project_config(cwd),
+            project,
+            untrusted_project,
             env: std::env::vars_os().collect(),
         }
     }
@@ -103,6 +117,9 @@ pub fn load(o: &LoadOptions) -> Result<Loaded, ConfigError> {
     })?;
     let mut warnings = Vec::new();
     let mut sources = Vec::new();
+    if let Some((path, state)) = &o.untrusted_project {
+        warnings.push(crate::trust::untrusted_notice(path, *state));
+    }
 
     for path in [&o.system, &o.user, &o.project].into_iter().flatten() {
         if let Some(text) = read_config_file(path)? {
