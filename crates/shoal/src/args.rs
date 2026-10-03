@@ -154,8 +154,11 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
         }
         Some("prompt") => {
             let args = iter
-                .filter_map(|a| a.into_string().ok())
-                .collect::<Vec<_>>();
+                .map(|a| {
+                    a.into_string()
+                        .map_err(|_| "prompt arguments must be UTF-8".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
                 Ok(Action::Help(PROMPT_USAGE))
             } else {
@@ -254,10 +257,25 @@ pub(crate) fn read_source_stream(reader: impl Read, label: &str) -> Result<Strin
 }
 
 pub(crate) fn run_companion(name: &str) -> Result<i32, String> {
-    let status = std::process::Command::new(name).status().map_err(|e| {
-        format!("cannot launch `{name}`: {e}; install the companion binary or add it to PATH")
-    })?;
-    Ok(status.code().unwrap_or(1))
+    use std::os::unix::process::CommandExt;
+    let program = companion_program(name, std::env::current_exe().ok().as_deref());
+    // Replace this process so signals reach the companion directly and its
+    // exit status (including death by signal) is the caller's.
+    let error = std::process::Command::new(&program).exec();
+    Err(format!(
+        "cannot launch `{}`: {error}; install the companion binary or add it to PATH",
+        program.display()
+    ))
+}
+
+/// Prefer the companion installed beside this executable, so a workspace-leading
+/// `PATH` entry cannot substitute a different binary; fall back to a PATH lookup.
+fn companion_program(name: &str, current_exe: Option<&Path>) -> PathBuf {
+    current_exe
+        .and_then(Path::parent)
+        .map(|dir| dir.join(name))
+        .filter(|sibling| sibling.is_file())
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 pub(crate) fn completion_script(shell: &str) -> Result<String, String> {
     completions::generate(shell)
@@ -302,6 +320,21 @@ pub(crate) fn trust_command(action: TrustAction) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn companion_prefers_the_sibling_binary_over_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("shoal");
+        assert_eq!(
+            companion_program("shoal-mcp", Some(&exe)),
+            PathBuf::from("shoal-mcp")
+        );
+        fs::write(dir.path().join("shoal-mcp"), "").unwrap();
+        assert_eq!(
+            companion_program("shoal-mcp", Some(&exe)),
+            dir.path().join("shoal-mcp")
+        );
+    }
+
     use super::*;
     use std::io;
 
