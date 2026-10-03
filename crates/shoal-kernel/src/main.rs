@@ -140,10 +140,10 @@ impl Args {
         while let Some(k) = it.next() {
             let missing = || format!("{} requires a value", k.to_string_lossy());
             match k.to_str() {
-                Some("--session") => a.session = it.next().ok_or_else(&missing)?.into_string().map_err(|_| "invalid session")?,
-                Some("--socket") => a.socket = Some(it.next().ok_or_else(&missing)?.into()),
-                Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
-                Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
+                Some("--session") => a.session = it.next().ok_or_else(missing)?.into_string().map_err(|_| "invalid session")?,
+                Some("--socket") => a.socket = Some(it.next().ok_or_else(missing)?.into()),
+                Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(missing)?.into()),
+                Some("--policy") => a.policy = Some(it.next().ok_or_else(missing)?.into()),
                 Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
