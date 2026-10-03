@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use reedline::{Completer, Span as RlSpan, Suggestion};
+use reedline::{Completer, CompletionResult, Span as RlSpan, Suggestion};
 use shoal_adapters::{AdapterCatalog, CmdAdapter};
 use shoal_syntax::commands::builtin_names;
 use shoal_syntax::lexer::RESERVED;
@@ -298,7 +298,13 @@ impl ShoalCompleter {
 }
 
 impl Completer for ShoalCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+        CompletionResult::fresh(self.suggest(line, pos))
+    }
+}
+
+impl ShoalCompleter {
+    fn suggest(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let max_results = self.max_results;
         match classify(&self.env, line, pos) {
             Ctx::Head { start, word } => {
@@ -853,14 +859,14 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let method = c.complete("tbl.wh", 6);
+        let method = c.suggest("tbl.wh", 6);
         assert!(
             method.iter().any(|s| s.value == "where"),
             "method position must offer `.where`, got {:?}",
             method.iter().map(|s| &s.value).collect::<Vec<_>>()
         );
 
-        let expr = c.complete("let x = wh", 10);
+        let expr = c.suggest("let x = wh", 10);
         assert!(
             !expr.iter().any(|s| s.value == "where"),
             "plain expr position must NOT offer method names, got {:?}",
@@ -881,7 +887,7 @@ mod tests {
 
     /// Complete `line` at its end and collect the candidate strings.
     fn cands(c: &mut ShoalCompleter, line: &str) -> Vec<String> {
-        c.complete(line, line.len())
+        c.suggest(line, line.len())
             .into_iter()
             .map(|s| s.value)
             .collect()
