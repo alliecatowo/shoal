@@ -1,23 +1,27 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+Shoal is pre-release software that executes untrusted input (scripts, agent requests over MCP, WASM
+plugins) and enforces a capability model (Leash) with OS sandboxing. Security reports are welcome.
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+Only the latest `0.1.x` release receives security fixes. Please reproduce on the latest release or
+on `main` before reporting.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-Use this section to tell people how to report a vulnerability.
+Please do not open a public issue. Use GitHub's private vulnerability reporting:
+<https://github.com/alliecatowo/shoal/security/advisories/new>
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+Include the affected version or commit, a minimal reproduction, and the impact you observed. You can
+expect an acknowledgement within a few days. Fixes ship in a patch release, and reporters are
+credited unless they prefer otherwise.
 
-This is a placeholder - assume shoal is insecure and not appropriate for business usage or daily driving! Use at oyur own peril, open an issue if you have an issue, and don't get pwned!
+## Scope and threat model
+
+What Leash, the kernel, the sandbox, and the MCP facade do and do not promise is documented in the
+[security threat model](site/content/internals/security-threat-model.md). In particular, a
+vulnerability is a way for a principal to exceed its policy (for example running a command, reading
+a file, or reading an environment variable its grants forbid), for untrusted project files to
+execute code without `shoal trust`, or for a secret to leak. Known limitations listed in the threat
+model are not vulnerabilities by themselves.
