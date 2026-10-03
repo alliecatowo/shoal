@@ -40,7 +40,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 toml = "0.9"
 wit-component = { version = "0.251", features = ["dummy-module"] }
 wit-parser = "0.251"
-wasmprinter = "0.251"
+wasmprinter = "0.258"
 wat = "1"
 
 [[bench]]
