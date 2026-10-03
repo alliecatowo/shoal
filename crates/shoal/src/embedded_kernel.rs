@@ -183,9 +183,37 @@ fn kernel_program() -> PathBuf {
     Path::new("shoal-kernel").to_path_buf()
 }
 
+/// Whether the kernel program [`connect`] would launch exists. A bare name is
+/// looked up on `PATH`. Used to fall back to the in-process shell instead of
+/// dying when only the `shoal` binary was installed.
+pub(crate) fn kernel_available() -> bool {
+    program_exists(&kernel_program(), std::env::var_os("PATH").as_deref())
+}
+
+fn program_exists(program: &Path, path_var: Option<&std::ffi::OsStr>) -> bool {
+    if program.components().count() > 1 {
+        return program.is_file();
+    }
+    path_var
+        .is_some_and(|paths| std::env::split_paths(paths).any(|dir| dir.join(program).is_file()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_kernel_binary_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert!(!program_exists(Path::new("shoal-kernel"), Some(&path)));
+        std::fs::write(dir.path().join("shoal-kernel"), "").unwrap();
+        assert!(program_exists(Path::new("shoal-kernel"), Some(&path)));
+        assert!(!program_exists(
+            Path::new("/nonexistent/shoal-kernel"),
+            None
+        ));
+    }
 
     #[test]
     fn early_child_exit_is_reported_before_rpc_client_construction() {

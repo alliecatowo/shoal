@@ -2349,8 +2349,18 @@ fn zero_token_attach_defaults_restricted_and_reports_security_metadata() {
     assert_eq!(attached["session_isolation"], PRINCIPAL_SESSION_ISOLATION);
     assert_eq!(attached["security_epoch"], ATTACH_SECURITY_EPOCH);
 
-    let denied = call(&mut client, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
-    assert_eq!(denied.error.unwrap().code, LEASH_DENIED);
+    // Regression (audit H4): the stock agent policy lets pure evaluation run
+    // (the plugin's "verify" step) but still gates opaque commands.
+    let sum = call(&mut client, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
+    assert!(sum.error.is_none(), "{:?}", sum.error);
+    let opaque = call(
+        &mut client,
+        &mut reader,
+        5,
+        "exec",
+        json!({"src":"sh { id }"}),
+    );
+    assert_eq!(opaque.error.unwrap().code, APPROVAL_REQUIRED);
     let status = call(&mut client, &mut reader, 3, "kernel.status", json!({}));
     assert!(status.error.is_none());
     let shutdown = call(&mut client, &mut reader, 4, "kernel.shutdown", json!({}));

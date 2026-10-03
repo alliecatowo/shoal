@@ -68,7 +68,8 @@ deliberate port (see [Current status and limits](https://alliecatowo.github.io/s
 Prebuilt Linux and macOS (x86_64 and arm64) binaries are attached to each
 [GitHub release](https://github.com/alliecatowo/shoal/releases) with SHA-256 checksums. Shoal is
 not on crates.io yet (the `shoal` crate name is taken by an unrelated project). To build from source:
-`cargo install --git https://github.com/alliecatowo/shoal shoal`.
+`cargo install --git https://github.com/alliecatowo/shoal shoal shoal-kernel shoal-mcp shoal-exec shoal-leash`
+(`shoal` alone runs standalone with a warning; the kernel, MCP bridge, and sandbox helpers are separate binaries).
 
 Install a release with Homebrew (macOS and Linux), or download a tarball for your platform from the
 [releases page](https://github.com/alliecatowo/shoal/releases/latest):
