@@ -280,13 +280,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    fn poison<T>(mutex: &Mutex<T>) {
-        poison_unchecked(mutex);
-        assert!(mutex.is_poisoned());
-    }
-
-    /// Poison without asserting the flag afterwards. Use when another thread
-    /// may already be racing to observe and repair the poison.
+    /// Poison without asserting the flag afterwards: a live waiter thread may
+    /// already be racing to observe and repair the poison.
     fn poison_unchecked<T>(mutex: &Mutex<T>) {
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let _guard = mutex.lock().expect("test mutex starts healthy");
