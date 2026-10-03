@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 /// Regression (audit L2): any accept error used to terminate the daemon.
 #[test]
