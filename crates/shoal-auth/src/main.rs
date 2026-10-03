@@ -42,6 +42,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "--ttl" => {
                         i += 1;
                         let secs: i64 = rest.get(i).ok_or("--ttl requires seconds")?.parse()?;
+                        if secs <= 0 {
+                            return Err("--ttl must be a positive number of seconds".into());
+                        }
                         ttl = Some(secs.saturating_mul(1_000_000_000))
                     }
                     x => return Err(format!("unknown create option {x}").into()),

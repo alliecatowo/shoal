@@ -37,3 +37,21 @@ fn empty_override_uses_the_xdg_state_store() {
     assert!(output.status.success());
     assert!(state.join("shoal/tokens.json").is_file());
 }
+
+/// Regression (audit L5): `--ttl 0` / negative minted an already-expired token.
+#[test]
+fn non_positive_ttl_is_rejected() {
+    for ttl in ["0", "-5"] {
+        let temp = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_shoal-token"))
+            .args(["create", "agent:ttl", "default", "--ttl", ttl])
+            .env("SHOAL_TOKEN_STORE", temp.path().join("t.json"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "--ttl {ttl} must fail");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--ttl must be positive")
+                || String::from_utf8_lossy(&output.stderr).contains("--ttl must be a positive")
+        );
+    }
+}

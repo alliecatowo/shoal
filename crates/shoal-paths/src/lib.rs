@@ -20,7 +20,11 @@ pub struct Inputs {
 impl Inputs {
     pub fn from_env() -> Self {
         Self {
-            home: std::env::var_os("HOME"),
+            // An unset/empty HOME (cron, `env -i`, some containers) must not
+            // put secrets and the journal under the current directory.
+            home: std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .or_else(passwd_home),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
             xdg_data_home: std::env::var_os("XDG_DATA_HOME"),
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
@@ -157,6 +161,37 @@ impl ShoalPaths {
     }
 }
 
+/// The invoking user's home directory from the passwd database.
+#[cfg(unix)]
+fn passwd_home() -> Option<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0u8; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `pwd`, `buf` and `result` outlive the call; getpwuid_r writes
+    // only within `buf`'s length.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            effective_uid(),
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: pw_dir is a NUL-terminated string inside `buf`.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+    (!dir.is_empty()).then(|| OsString::from_vec(dir.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn passwd_home() -> Option<OsString> {
+    None
+}
+
 #[cfg(unix)]
 fn effective_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and returns a value.
@@ -171,6 +206,23 @@ fn effective_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (audit M11): with HOME unset, state must not land in `.`.
+    #[cfg(unix)]
+    #[test]
+    fn unset_home_resolves_through_passwd_not_the_cwd() {
+        let inputs = Inputs {
+            home: None,
+            ..Inputs::default()
+        };
+        // `from_env` is the only place that consults passwd; emulate it.
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(passwd_home);
+        assert!(home.is_some(), "passwd lookup should find a home");
+        let paths = ShoalPaths::resolve(Inputs { home, ..inputs }, effective_uid());
+        assert!(paths.state_dir().is_absolute(), "{:?}", paths.state_dir());
+    }
 
     #[test]
     fn xdg_roots_are_canonical() {
