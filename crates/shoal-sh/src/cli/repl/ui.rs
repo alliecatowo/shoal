@@ -175,3 +175,35 @@ fn warn_each(warnings: &[String]) {
         );
     }
 }
+
+impl ReplUi {
+    /// Read one line. If the line editor fails (e.g. a terminal that never
+    /// answers the cursor-position query over a slow ssh link) drop to plain
+    /// stdin for the rest of the session instead of ending the user's shell.
+    pub(super) fn read(&mut self, plain: &mut bool) -> std::io::Result<reedline::Signal> {
+        if !*plain {
+            match self.editor.read_line(&self.prompt) {
+                Ok(signal) => return Ok(signal),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        maybe_strip(format!(
+                            "\x1b[33;1mwarning:\x1b[0m line editor failed ({error}); continuing with plain input (no history or completion)"
+                        ))
+                    );
+                    *plain = true;
+                }
+            }
+        }
+        use std::io::{BufRead, Write};
+        print!("shoal> ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line)? == 0 {
+            return Ok(reedline::Signal::CtrlD);
+        }
+        Ok(reedline::Signal::Success(
+            line.trim_end_matches(['\r', '\n']).to_string(),
+        ))
+    }
+}

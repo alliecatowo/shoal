@@ -440,3 +440,28 @@ fn concurrent_process_writers_preserve_every_secret() {
         assert_eq!(&*store.get(&name).unwrap().unwrap(), name.as_bytes());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn open_does_not_chmod_a_preexisting_directory_it_did_not_create() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let shared = d.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("unrelated.txt"), b"x").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = match SecretStore::open(&shared) {
+        Err(e) => e,
+        Ok(_) => panic!("loose shared dir must be refused"),
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "a directory we did not create must be left untouched"
+    );
+    let fresh = d.path().join("fresh");
+    SecretStore::open(&fresh).unwrap();
+    let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}

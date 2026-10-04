@@ -93,7 +93,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
             "{}",
             maybe_strip(
                 "\x1b[33;1mwarning:\x1b[0m shoal-kernel not found; running standalone \
-                 (install it with `cargo install --git https://github.com/alliecatowo/shoal shoal-kernel`)"
+                 (reinstall the full package with `cargo install shoal-sh --locked`)"
                     .to_string()
             )
         );
@@ -158,14 +158,20 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     );
     let mut background_jobs = BackgroundJobs::new(&evaluator, background_printer);
 
-    run_repl_loop(
+    let result = run_repl_loop(
         &mut evaluator,
         &mut protocol,
         &mut transcript,
         &mut background_jobs,
         &mut ui,
         &interrupts,
-    )
+    );
+    if result.is_err() {
+        // Teardown must run on every exit path, not just a clean `exit`/Ctrl-D.
+        crate::eval::shutdown_stopped_jobs();
+        protocol.shutdown();
+    }
+    result
 }
 
 /// The two cancellation sinks driven by SIGINT: evaluator epochs rotate per
@@ -215,6 +221,7 @@ fn run_repl_loop(
     ui: &mut ReplUi,
     interrupts: &InterruptState,
 ) -> Result<i32, String> {
+    let mut plain_input = false;
     loop {
         background.reconcile(evaluator);
         if let Err(error) = protocol.refresh(evaluator) {
@@ -225,7 +232,7 @@ fn run_repl_loop(
         evaluator.reset_cancel();
         interrupts.refresh(evaluator);
         ui.refresh_prompt(evaluator, protocol.snapshot());
-        match ui.editor.read_line(&ui.prompt) {
+        match ui.read(&mut plain_input) {
             Ok(Signal::Success(src)) => {
                 background.reconcile(evaluator);
                 if let Some(code) = handle_submitted_line(
@@ -245,7 +252,7 @@ fn run_repl_loop(
                 return Ok(0);
             }
             Ok(_) => {}
-            Err(error) => return Err(format!("line editor failed: {error}")),
+            Err(error) => return Err(format!("input failed: {error}")),
         }
     }
 }

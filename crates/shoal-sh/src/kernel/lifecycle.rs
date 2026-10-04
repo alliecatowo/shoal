@@ -8,12 +8,14 @@ impl Kernel {
         attached: &Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        // pid and state_dir are host details restricted agents have no need for.
+        let privileged = attachment.can_approve;
         Ok(json!({
-            "pid": std::process::id(),
+            "pid": privileged.then(std::process::id),
             "principal": attachment.principal,
             "uptime_ms": self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
             "durable": self.state_dir.is_some(),
-            "state_dir": self.state_dir.as_ref().map(|path| path.display().to_string()),
+            "state_dir": self.state_dir.as_ref().filter(|_| privileged).map(|path| path.display().to_string()),
             "connections": {
                 "active": self.connections.active(),
                 "max": self.connections.max(),

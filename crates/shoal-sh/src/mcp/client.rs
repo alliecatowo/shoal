@@ -57,6 +57,11 @@ pub struct KernelClient {
 impl KernelClient {
     pub fn connect(config: &Config) -> Result<Self, BridgeError> {
         let stream = UnixStream::connect(&config.socket)?;
+        // Never hand SHOAL_TOKEN to a listener another user pre-created at a
+        // predictable path (e.g. the /tmp/shoal-<uid> fallback).
+        if crate::kernel::peer::supported() {
+            crate::kernel::peer::require_matching_effective_uid(&stream)?;
+        }
         Self::from_stream(stream, config, "mcp", false)
     }
 

@@ -195,6 +195,11 @@ pub fn apply_landlock_policy(
         .add_rules(path_beneath_rules(grants.delete.iter(), delete))
         .map_err(|e| e.to_string())?;
     let status = ruleset.restrict_self().map_err(|e| e.to_string())?;
+    if net == NetPolicy::Deny {
+        // Landlock's TCP rights do not cover UDP/DNS or AF_UNIX connects (to the
+        // kernel socket, for one), so also refuse creating those sockets.
+        deny_network_sockets()?;
+    }
     let active = matches!(status.landlock, LandlockStatus::Available { .. })
         && matches!(status.ruleset, RulesetStatus::FullyEnforced);
     if !active {
@@ -207,7 +212,7 @@ pub fn apply_landlock_policy(
         active_tier: Some(EnforcementTier::A),
         enforced: true,
         detail: format!(
-            "Landlock active ({:?}); TCP deny {}; spawn hash preflight is TOCTOU-prone",
+            "Landlock active ({:?}); network deny {} (TCP via Landlock; socket(AF_INET/AF_INET6/AF_UNIX/AF_PACKET) via seccomp); spawn hash preflight is TOCTOU-prone",
             status.landlock,
             if net == NetPolicy::Deny {
                 "active"
@@ -222,6 +227,86 @@ pub fn apply_landlock_policy(
         cpu_limit_enforced: false,
         memory_limit_enforced: false,
     })
+}
+/// Install a seccomp filter making `socket()` fail with EACCES for the
+/// internet, unix and raw-packet families. Needs no extra privileges
+/// (`PR_SET_NO_NEW_PRIVS`). Non-native syscall ABIs are killed so a compat
+/// `socketcall` cannot bypass the filter. Only x86_64/aarch64 are supported;
+/// elsewhere this fails closed so a hermetic request is refused, not faked.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn deny_network_sockets() -> Result<(), String> {
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xC000_003E;
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xC000_00B7;
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_KILL: u32 = 0x8000_0000;
+    let ret_deny: u32 = 0x0005_0000 | libc::EACCES as u32;
+    let families = [
+        libc::AF_UNIX as u32,
+        libc::AF_INET as u32,
+        libc::AF_INET6 as u32,
+        libc::AF_PACKET as u32,
+    ];
+    let n = families.len() as u8;
+    let stmt = |code: u16, k: u32| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |jt: u8, jf: u8, k: u32| libc::sock_filter {
+        code: JEQ_K,
+        jt,
+        jf,
+        k,
+    };
+    let mut prog = vec![
+        stmt(LD_W_ABS, 4), // seccomp_data.arch
+        jump(1, 0, AUDIT_ARCH),
+        stmt(RET_K, RET_KILL),
+        stmt(LD_W_ABS, 0), // seccomp_data.nr
+        jump(0, n + 1, libc::SYS_socket as u32),
+        stmt(LD_W_ABS, 16), // args[0] (domain), low word
+    ];
+    for (i, family) in families.iter().enumerate() {
+        prog.push(jump(n - i as u8, 0, *family));
+    }
+    prog.push(stmt(RET_K, RET_ALLOW));
+    prog.push(stmt(RET_K, ret_deny));
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_mut_ptr(),
+    };
+    // SAFETY: plain prctl calls with a valid, live sock_fprog.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(format!(
+                "PR_SET_NO_NEW_PRIVS: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if libc::prctl(libc::PR_SET_SECCOMP, 2, &fprog as *const _, 0, 0) != 0 {
+            return Err(format!(
+                "seccomp filter: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn deny_network_sockets() -> Result<(), String> {
+    Err("seccomp socket filter is unsupported on this architecture".into())
 }
 #[cfg(not(target_os = "linux"))]
 pub fn apply_landlock(_: &FsSandbox) -> Result<EnforcementStatus, String> {
