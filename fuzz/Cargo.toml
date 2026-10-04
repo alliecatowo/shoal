@@ -10,11 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-shoal-eval = { path = "../crates/shoal-eval" }
-shoal-leash = { path = "../crates/shoal-leash" }
-shoal-proto = { path = "../crates/shoal-proto" }
-shoal-syntax = { path = "../crates/shoal-syntax" }
-shoal-value = { path = "../crates/shoal-value" }
+shoal-sh = { path = "../crates/shoal-sh" }
 
 [[bin]]
 name = "lexer"

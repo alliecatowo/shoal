@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shoal_value::{CallCtx, ErrorVal, Fs, StdFs, StreamVal, VResult, Value, collect_stream};
+use shoal_sh::value::{CallCtx, ErrorVal, Fs, StdFs, StreamVal, VResult, Value, collect_stream};
 use std::path::PathBuf;
 
 struct Context;

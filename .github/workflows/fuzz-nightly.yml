@@ -51,7 +51,7 @@ jobs:
           key: fuzz-nightly
           workspaces: fuzz -> target
       - name: Bootstrap Shoal
-        run: cargo build -p shoal --locked
+        run: cargo build -p shoal-sh --locked
       - name: Run bounded campaigns through Shoal
         env:
           RUSTUP_TOOLCHAIN: nightly

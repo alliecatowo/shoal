@@ -2465,368 +2465,58 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "shoal"
-version = "0.1.4"
-dependencies = [
- "crossterm",
- "libc",
- "nu-ansi-term",
- "portable-pty",
- "reedline",
- "serde",
- "serde_json",
- "shell-words",
- "shoal-adapters",
- "shoal-ast",
- "shoal-config",
- "shoal-doctor",
- "shoal-eval",
- "shoal-exec",
- "shoal-host",
- "shoal-journal",
- "shoal-leash",
- "shoal-mcp",
- "shoal-paths",
- "shoal-prompt",
- "shoal-proto",
- "shoal-syntax",
- "shoal-value",
- "signal-hook 0.4.4",
- "tempfile",
- "toml",
- "unicode-width",
-]
-
-[[package]]
-name = "shoal-adapters"
-version = "0.1.4"
-dependencies = [
- "serde",
- "serde_json",
- "shoal-ast",
- "shoal-syntax",
- "shoal-value",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "shoal-ast"
-version = "0.1.4"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "shoal-auth"
-version = "0.1.4"
-dependencies = [
- "base64",
- "blake3",
- "fd-lock",
- "getrandom 0.4.3",
- "serde",
- "serde_json",
- "shoal-paths",
- "subtle",
- "tempfile",
- "zeroize",
-]
-
-[[package]]
-name = "shoal-config"
-version = "0.1.4"
-dependencies = [
- "blake3",
- "serde",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "shoal-doctor"
-version = "0.1.4"
-dependencies = [
- "libc",
- "portable-pty",
- "serde",
- "serde_json",
- "shoal-adapters",
- "shoal-config",
- "shoal-journal",
- "shoal-leash",
- "shoal-paths",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "shoal-eval"
-version = "0.1.4"
-dependencies = [
- "blake3",
- "criterion",
- "csv",
- "fd-lock",
- "glob",
- "http",
- "jiff",
- "libc",
- "notify",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_norway",
- "shoal-adapters",
- "shoal-ast",
- "shoal-exec",
- "shoal-journal",
- "shoal-leash",
- "shoal-paths",
- "shoal-picker",
- "shoal-reef",
- "shoal-secret",
- "shoal-syntax",
- "shoal-value",
- "shoal-wasm",
- "tempfile",
- "toml",
- "ureq",
- "wasmprinter",
- "wat",
- "wit-component",
- "wit-parser",
-]
-
-[[package]]
-name = "shoal-exec"
-version = "0.1.4"
-dependencies = [
- "anyhow",
- "blake3",
- "criterion",
- "libc",
- "portable-pty",
- "shoal-leash",
- "tempfile",
- "vt100",
-]
-
-[[package]]
-name = "shoal-history"
-version = "0.1.4"
-dependencies = [
- "rusqlite",
- "serde_json",
- "shoal-config",
- "shoal-journal",
- "shoal-paths",
- "tempfile",
-]
-
-[[package]]
-name = "shoal-host"
-version = "0.1.4"
-dependencies = [
- "serde_json",
- "shoal-adapters",
- "shoal-ast",
- "shoal-config",
- "shoal-eval",
- "shoal-leash",
- "shoal-paths",
- "shoal-syntax",
- "shoal-value",
- "tempfile",
-]
-
-[[package]]
-name = "shoal-journal"
-version = "0.1.4"
-dependencies = [
- "blake3",
- "criterion",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "zstd",
-]
-
-[[package]]
-name = "shoal-kernel"
-version = "0.1.4"
-dependencies = [
- "base64",
- "blake3",
- "criterion",
- "ctrlc",
- "libc",
- "serde",
- "serde_json",
- "shoal-ast",
- "shoal-auth",
- "shoal-eval",
- "shoal-exec",
- "shoal-host",
- "shoal-journal",
- "shoal-leash",
- "shoal-paths",
- "shoal-proto",
- "shoal-syntax",
- "shoal-value",
- "strip-ansi-escapes",
- "tempfile",
-]
-
-[[package]]
-name = "shoal-leash"
-version = "0.1.4"
-dependencies = [
- "blake3",
- "glob",
- "landlock",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "shoal-lsp"
-version = "0.1.4"
-dependencies = [
- "serde_json",
- "shoal-ast",
- "shoal-eval",
- "shoal-leash",
- "shoal-syntax",
- "tokio",
- "tower-lsp",
-]
-
-[[package]]
-name = "shoal-mcp"
-version = "0.1.4"
-dependencies = [
- "libc",
- "serde_json",
- "shoal-kernel",
- "shoal-leash",
- "shoal-paths",
- "shoal-proto",
- "tempfile",
-]
-
-[[package]]
-name = "shoal-paths"
-version = "0.1.4"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "shoal-picker"
-version = "0.1.4"
-dependencies = [
- "crossterm",
- "shoal-value",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "shoal-prompt"
-version = "0.1.4"
-dependencies = [
- "criterion",
- "serde",
- "shoal-value",
- "toml",
-]
-
-[[package]]
-name = "shoal-proto"
-version = "0.1.4"
-dependencies = [
- "base64",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "shoal-reef"
-version = "0.1.4"
-dependencies = [
- "blake3",
- "libc",
- "serde",
- "shoal-exec",
- "shoal-value",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "shoal-secret"
+name = "shoal-sh"
 version = "0.1.4"
 dependencies = [
  "aes",
  "aes-gcm",
+ "anyhow",
  "base64",
+ "blake3",
+ "criterion",
+ "crossterm",
+ "csv",
+ "ctrlc",
  "fd-lock",
- "rand 0.10.3",
- "serde",
- "serde_json",
- "shoal-paths",
- "tempfile",
- "zeroize",
-]
-
-[[package]]
-name = "shoal-syntax"
-version = "0.1.4"
-dependencies = [
- "criterion",
- "pretty_assertions",
- "proptest",
- "serde_json",
- "shoal-ast",
-]
-
-[[package]]
-name = "shoal-value"
-version = "0.1.4"
-dependencies = [
- "criterion",
+ "getrandom 0.4.3",
  "glob",
+ "http",
  "indexmap",
  "jiff",
+ "landlock",
  "libc",
+ "notify",
+ "nu-ansi-term",
+ "portable-pty",
+ "pretty_assertions",
+ "proptest",
+ "rand 0.10.3",
+ "reedline",
  "regex",
- "serde_json",
- "shoal-ast",
- "unicode-width",
-]
-
-[[package]]
-name = "shoal-wasm"
-version = "0.1.4"
-dependencies = [
- "blake3",
+ "rusqlite",
  "serde",
  "serde_json",
- "shoal-leash",
+ "serde_norway",
+ "shell-words",
+ "signal-hook 0.4.4",
+ "strip-ansi-escapes",
+ "subtle",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "toml",
+ "tower-lsp",
+ "unicode-segmentation",
+ "unicode-width",
+ "ureq",
+ "vt100",
  "wasmprinter",
  "wasmtime",
  "wat",
  "wit-component",
  "wit-parser",
+ "zeroize",
+ "zstd",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 #!/usr/bin/env shoal
 # Guard architectural invariants that are awkward to express as Rust tests.
 
-let kernel_sources = glob("crates/shoal-kernel/src/**/*.rs").expand()
+let kernel_sources = glob("crates/shoal-sh/src/kernel/**/*.rs").expand()
 let raw_lock_pattern = re"(?s)\\\\.(lock|read|write)\\\\(\\\\)\\\\s*\\\\.unwrap\\\\(\\\\)"
 let raw_lock_violations = kernel_sources.where((file) => (file.read.match(raw_lock_pattern) != null))
 assert(raw_lock_violations.is_empty(), "raw kernel lock unwraps bypass poison policy: {raw_lock_violations}")
@@ -27,11 +27,11 @@ let workflow_lines = workflows.flat_map(file => file.read.lines().map(line => "{
 let shell_blocks = workflow_lines.where(line => line.contains("run: |") || line.contains("run: >") || line.contains("shell: bash") || line.contains("shell: sh"))
 assert(shell_blocks.is_empty(), "workflow shell blocks remain: {shell_blocks}")
 let raw_runs = workflow_lines.where(.contains(":run: "))
-let foreign_runs = raw_runs.where(line => !line.contains("run: cargo build -p shoal --locked") && !line.contains("run: target/debug/shoal "))
+let foreign_runs = raw_runs.where(line => !line.contains("run: cargo build -p shoal-sh --locked") && !line.contains("run: target/debug/shoal "))
 assert(foreign_runs.is_empty(), "workflow logic bypasses Shoal: {foreign_runs}")
 
 let mise = path("mise.toml").read
 assert(mise.contains('run = "cargo build --workspace --release --locked"'), "release bootstrap must build the same workspace artifact set the installer copies")
-assert(!mise.contains("cargo build -p shoal --release"), "package-only release bootstrap can swap target/release artifacts after installation")
+assert(!mise.contains("cargo build -p shoal-sh --release"), "package-only release bootstrap can swap target/release artifacts after installation")
 
 echo "source audit: {kernel_sources.len()} kernel files, {rust_sources.len()} Rust files, {workflows.len()} Shoal-driven workflows"

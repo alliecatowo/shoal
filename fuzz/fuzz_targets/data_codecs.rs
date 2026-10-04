@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use shoal_value::Value;
+use shoal_sh::value::Value;
 
 const FUZZ_INPUT_CAP: usize = 64 * 1024;
 const CODEC_OUTPUT_CAP: usize = 16 * 1024 * 1024;
@@ -14,19 +14,19 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let literal = serde_json::to_string(source).unwrap();
-    let mut evaluator = shoal_eval::Evaluator::new(std::env::temp_dir());
+    let mut evaluator = shoal_sh::eval::Evaluator::new(std::env::temp_dir());
 
     for namespace in ["json", "yaml", "toml", "csv"] {
         let program =
             format!("let parsed = {namespace}.parse({literal})\n{namespace}.stringify(parsed)");
-        if let Ok(program) = shoal_syntax::parse(&program)
+        if let Ok(program) = shoal_sh::syntax::parse(&program)
             && let Ok(Value::Str(output)) = evaluator.eval_program(&program)
         {
             assert!(output.len() <= CODEC_OUTPUT_CAP);
         }
         assert_eq!(
             evaluator
-                .eval_program(&shoal_syntax::parse("40 + 2").unwrap())
+                .eval_program(&shoal_sh::syntax::parse("40 + 2").unwrap())
                 .unwrap(),
             Value::Int(42)
         );

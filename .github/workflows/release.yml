@@ -135,3 +135,30 @@ jobs:
           git add Formula/shoal.rb
           git commit -m "shoal ${GITHUB_REF_NAME#v}"
           git push origin HEAD:main
+
+  # crates.io trusted publishing (OIDC, no long-lived token). Requires a trusted publisher
+  # configured on the crate (owner alliecatowo, repo shoal, workflow release.yml, environment
+  # crates-io). crates.io cannot create a NEW crate via trusted publishing, so the very first
+  # `cargo publish -p shoal-sh` must be done once by hand with a short-lived token.
+  # continue-on-error: a missing/unconfigured publisher fails this job loudly but never blocks
+  # the GitHub release binaries or the Homebrew update.
+  publish-crate:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Authenticate to crates.io (OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish shoal-sh
+        run: cargo publish -p shoal-sh --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

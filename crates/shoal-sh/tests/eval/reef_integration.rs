@@ -1,0 +1,867 @@
+//! reef integration tests (site/content/internals/reef-resolution.md).
+//!
+//! Every test builds a self-contained tempdir project — a `.reef.toml` plus
+//! fixture "binaries" (shell scripts with a `--version`) — and points the reef
+//! resolver at those fixtures. Nothing touches real `~/.config` or the network.
+//! The zero-regression tests prove a NO-manifest tempdir spawns exactly as
+//! before.
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use shoal_sh::eval::Evaluator;
+use shoal_sh::leash::Policy as LeashPolicy;
+use shoal_sh::reef::provider::{
+    Candidate, CandidateDiscovery, MiseProvider, Provider, ProviderCtx, ProviderError,
+    SystemProvider,
+};
+use shoal_sh::reef::{Constraint, Resolver, Version};
+use shoal_sh::value::Value;
+
+/// Write an executable fixture "binary": a shell script that answers
+/// `--version` and otherwise prints a fixed marker line.
+fn fixture_bin(dir: &Path, name: &str, version: &str) -> PathBuf {
+    let p = dir.join(name);
+    let body = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"{name} {version}\"; exit 0; fi\necho \"{name}-ran\"\n"
+    );
+    std::fs::write(&p, body).unwrap();
+    let mut perm = std::fs::metadata(&p).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&p, perm).unwrap();
+    p
+}
+
+/// A resolver whose only provider is a system provider rooted at `bindir`, so
+/// fixture tools resolve without touching the real system PATH.
+fn fixture_resolver(bindir: &Path) -> Arc<Resolver> {
+    Arc::new(Resolver::new(vec![Box::new(SystemProvider::new(
+        vec![bindir.to_path_buf()],
+        vec![],
+    ))]))
+}
+
+fn parse(src: &str) -> shoal_sh::ast::Program {
+    shoal_sh::syntax::parse(src).expect("fixture source parses")
+}
+
+fn ensure_sandbox_helper() {
+    let executable = std::env::current_exe().unwrap();
+    let deps = executable.parent().unwrap();
+    let debug = deps.parent().unwrap();
+    if debug.join("shoal-sandbox-exec").is_file() || deps.join("shoal-sandbox-exec").is_file() {
+        return;
+    }
+    let target = debug.parent().unwrap();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "-p", "shoal-exec", "--bin", "shoal-sandbox-exec"])
+        .env("CARGO_TARGET_DIR", target)
+        .status()
+        .expect("build sandbox helper");
+    assert!(status.success(), "sandbox helper build failed");
+}
+
+fn scoped_provider_policy(read: &[&Path], write: &[&Path]) -> LeashPolicy {
+    let mut read_grants: Vec<String> = read
+        .iter()
+        .map(|path| format!("{}/**", path.display()))
+        .collect();
+    for system in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+        if Path::new(system).exists() {
+            read_grants.push(format!("{system}/**"));
+        }
+    }
+    let render = |grants: &[String]| {
+        grants
+            .iter()
+            .map(|grant| format!("\"{grant}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let write_grants: Vec<String> = write
+        .iter()
+        .map(|path| format!("{}/**", path.display()))
+        .collect();
+    LeashPolicy::from_toml(&format!(
+        "[principal.agent]\nopaque='allow'\n\n[principal.agent.fs]\nread=[{}]\nwrite=[{}]\n",
+        render(&read_grants),
+        render(&write_grants),
+    ))
+    .expect("provider sandbox policy")
+}
+
+/// The manifest filenames `ScopeChain::discover` (site/content/internals/reef-resolution.md) looks for
+/// at every directory on its walk from `cwd` up to the filesystem root.
+const REEF_MANIFEST_NAMES: &[&str] = &[".reef.toml", "mise.toml", ".mise.toml", ".tool-versions"];
+
+/// Some tests assert the "genuinely nothing constrains anything anywhere"
+/// invariant (site/content/internals/kernel-protocol.md) — but `ScopeChain::discover`
+/// walks from `dir` all the way to the real filesystem root, including the
+/// shared OS temp dir every `tempfile::tempdir()` nests under. That walk is
+/// only actually empty when no ancestor directory happens to contain a
+/// `.reef.toml`/`mise.toml`/`.mise.toml`/`.tool-versions` — true on a clean
+/// host, but not something a unit test can force from Rust alone (fully
+/// bounding the walk needs a root/boundary knob on `ScopeChain::discover`
+/// itself, a `shoal-reef` source change). Rather than let ambient
+/// contamination surface as a confusing generic `assertion failed`
+/// elsewhere in the test, fail loudly here with a precise pointer at the
+/// offending file, so it reads as "environmental contamination" (fix your
+/// host / clean the shared tempdir) rather than "reef regressed".
+fn panic_if_ancestor_reef_pollution(dir: &Path) {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        for name in REEF_MANIFEST_NAMES {
+            let candidate = d.join(name);
+            if candidate.exists() {
+                panic!(
+                    "ambient reef-manifest pollution detected above this test's own tempdir: \
+                     {candidate:?} exists and was NOT created by this test. \
+                     ScopeChain::discover (site/content/internals/reef-resolution.md) walks from cwd to the filesystem \
+                     root, so this file makes the scope chain non-empty and breaks this test's \
+                     \"nothing constrains anything\" premise. This is environmental \
+                     contamination (e.g. a stray manifest left in a shared /tmp by an unrelated \
+                     manual `reef`/`mise` repro), not a product regression — remove the file \
+                     and re-run."
+                );
+            }
+        }
+        cur = d.parent();
+    }
+}
+
+/// Build a project dir with a `.reef.toml` and a `bin/` of fixtures.
+fn project(reef_toml: &str, fixtures: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".reef.toml"), reef_toml).unwrap();
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    for (name, ver) in fixtures {
+        fixture_bin(&bindir, name, ver);
+    }
+    (dir, bindir)
+}
+
+#[test]
+fn constrained_tool_resolves_to_fixture_and_spawns() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true); // interactive → auto-lock, no reef_unlocked
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let out = ev.eval_program(&parse("faketool")).expect("faketool runs");
+    let Value::Outcome(o) = out else {
+        panic!("expected an outcome, got {out:?}");
+    };
+    assert!(o.ok, "fixture exits 0");
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("faketool-ran"), "stdout was {stdout:?}");
+    // argv[0] was rewritten to the resolved absolute fixture path.
+    assert!(
+        o.cmd
+            .contains(bindir.join("faketool").to_string_lossy().as_ref()),
+        "resolved cmd was {:?}",
+        o.cmd
+    );
+    // Interactive auto-lock wrote reef.lock next to the manifest.
+    assert!(dir.path().join("reef.lock").exists(), "auto-lock persisted");
+}
+
+#[test]
+fn restricted_principal_denies_automatic_version_probe_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    std::fs::write(
+        dir.path().join(".reef.toml"),
+        "[tools]\nguarded = \"1.2.3\"\n",
+    )
+    .unwrap();
+    let marker = dir.path().join("probe-ran");
+    let binary = bindir.join("guarded");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then touch '{}'; echo 'guarded 1.2.3'; exit 0; fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).unwrap();
+
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+    evaluator.set_interactive(true);
+    evaluator.set_reef_resolver(fixture_resolver(&bindir));
+    evaluator.set_leash_policy(
+        LeashPolicy::from_toml("[principal.agent]\nopaque = 'deny'\n").unwrap(),
+        "agent",
+    );
+    let error = evaluator
+        .eval_program(&parse("guarded"))
+        .expect_err("opaque-denying principal must reject the implicit probe");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("version probe"), "{error:?}");
+    assert!(!marker.exists(), "denied candidate must never execute");
+    assert!(!dir.path().join("reef.lock").exists());
+}
+
+#[test]
+fn restricted_principal_denies_provider_fetch_before_installer_hook() {
+    struct FetchProvider {
+        marker: PathBuf,
+    }
+    impl Provider for FetchProvider {
+        fn name(&self) -> &'static str {
+            "fetch-fixture"
+        }
+
+        fn discover(
+            &self,
+            _tool: &str,
+            _ctx: &ProviderCtx,
+        ) -> Result<CandidateDiscovery, ProviderError> {
+            Ok(CandidateDiscovery::new(self.name()))
+        }
+
+        fn fetch(
+            &self,
+            _tool: &str,
+            _requirement: &Constraint,
+            _ctx: &ProviderCtx,
+        ) -> Option<Result<Candidate, ProviderError>> {
+            std::fs::write(&self.marker, b"installer hook ran").unwrap();
+            Some(Err(ProviderError::new("fetch-fixture", "injected")))
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = \"1.2.3\"\n",
+    )
+    .unwrap();
+    let marker = directory.path().join("fetch-ran");
+    let resolver = Arc::new(Resolver::new(vec![Box::new(FetchProvider {
+        marker: marker.clone(),
+    })]));
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_reef_resolver(resolver);
+    evaluator.set_leash_policy(
+        LeashPolicy::from_toml("[principal.agent]\nopaque = 'deny'\n").unwrap(),
+        "agent",
+    );
+    let error = evaluator
+        .eval_program(&parse("reef fetch guarded"))
+        .expect_err("opaque-denying principal must reject provider fetch");
+    assert_eq!(error.code, "spawn_denied");
+    assert!(!marker.exists(), "denied provider hook must never run");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scoped_principal_runs_version_probe_inside_filesystem_sandbox() {
+    if shoal_sh::leash::landlock_abi().is_none() {
+        eprintln!("Landlock unavailable; skipping provider sandbox assertion");
+        return;
+    }
+    ensure_sandbox_helper();
+    let directory = tempfile::tempdir().unwrap();
+    let binaries = directory.path().join("bin");
+    std::fs::create_dir(&binaries).unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = '1.2.3'\n",
+    )
+    .unwrap();
+    let forbidden = directory.path().join("probe-escaped");
+    let binary = binaries.join("guarded");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nif touch '{}'; then exit 91; fi\necho 'guarded 1.2.3'\n",
+            forbidden.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).unwrap();
+
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_interactive(true);
+    evaluator.set_reef_resolver(fixture_resolver(&binaries));
+    evaluator.set_leash_policy(scoped_provider_policy(&[&binaries], &[]), "agent");
+    let Value::Outcome(outcome) = evaluator
+        .eval_program(&parse("which guarded"))
+        .expect("sandboxed probe resolves")
+    else {
+        panic!("which must return an outcome");
+    };
+    let Some(Value::Record(result)) = outcome.parsed.as_ref() else {
+        panic!("which must carry a record");
+    };
+    assert_eq!(result.get("version"), Some(&Value::Str("1.2.3".into())));
+    assert!(!forbidden.exists(), "probe escaped its filesystem sandbox");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scoped_principal_runs_mise_installer_inside_filesystem_sandbox() {
+    if shoal_sh::leash::landlock_abi().is_none() {
+        eprintln!("Landlock unavailable; skipping provider sandbox assertion");
+        return;
+    }
+    ensure_sandbox_helper();
+    let directory = tempfile::tempdir().unwrap();
+    let helpers = directory.path().join("helpers");
+    let data = directory.path().join("mise-data");
+    std::fs::create_dir(&helpers).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = { version = '1.2.3', provider = 'mise' }\n",
+    )
+    .unwrap();
+    let forbidden = directory.path().join("installer-escaped");
+    let installed = data.join("installs/guarded/1.2.3/bin/guarded");
+    let mise = helpers.join("mise");
+    std::fs::write(
+        &mise,
+        format!(
+            "#!/bin/sh\n\
+             if touch '{}'; then exit 91; fi\n\
+             mkdir -p '{}'\n\
+             printf '#!/bin/sh\\necho guarded\\n' > '{}'\n\
+             chmod 755 '{}'\n",
+            forbidden.display(),
+            installed.parent().unwrap().display(),
+            installed.display(),
+            installed.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&mise).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&mise, permissions).unwrap();
+
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_reef_resolver(Arc::new(Resolver::new(vec![Box::new(MiseProvider::new(
+        data.clone(),
+    ))])));
+    evaluator.set_leash_policy(
+        scoped_provider_policy(&[&helpers, &data], &[&data]),
+        "agent",
+    );
+    evaluator
+        .eval_program(&parse(&format!(
+            "env.PATH = \"{}:/usr/bin:/bin\"",
+            helpers.display()
+        )))
+        .expect("set session PATH");
+    let Value::Outcome(outcome) = evaluator
+        .eval_program(&parse("reef fetch guarded"))
+        .expect("sandboxed installer succeeds")
+    else {
+        panic!("reef fetch must return an outcome");
+    };
+    let Some(Value::Record(result)) = outcome.parsed.as_ref() else {
+        panic!("reef fetch must carry a record");
+    };
+    assert_eq!(result.get("fetched"), Some(&Value::Bool(true)));
+    assert!(installed.is_file());
+    assert!(
+        !forbidden.exists(),
+        "installer escaped its filesystem sandbox"
+    );
+}
+
+#[test]
+fn provider_pinned_fetch_never_invokes_other_installers() {
+    struct PinProvider {
+        name: &'static str,
+        marker: PathBuf,
+        binary: PathBuf,
+    }
+    impl Provider for PinProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn discover(
+            &self,
+            _tool: &str,
+            _ctx: &ProviderCtx,
+        ) -> Result<CandidateDiscovery, ProviderError> {
+            Ok(CandidateDiscovery::new(self.name()))
+        }
+
+        fn fetch(
+            &self,
+            tool: &str,
+            _requirement: &Constraint,
+            _ctx: &ProviderCtx,
+        ) -> Option<Result<Candidate, ProviderError>> {
+            std::fs::write(&self.marker, self.name.as_bytes()).unwrap();
+            Some(Ok(Candidate::new(
+                tool,
+                Version::parse("1.2.3"),
+                self.binary.clone(),
+                self.name,
+            )))
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = { version = \"1.2.3\", provider = \"chosen\" }\n",
+    )
+    .unwrap();
+    let skipped_marker = directory.path().join("skipped-ran");
+    let chosen_marker = directory.path().join("chosen-ran");
+    let binary = directory.path().join("guarded");
+    std::fs::write(&binary, b"fixture").unwrap();
+    let resolver = Arc::new(Resolver::new(vec![
+        Box::new(PinProvider {
+            name: "skipped",
+            marker: skipped_marker.clone(),
+            binary: binary.clone(),
+        }),
+        Box::new(PinProvider {
+            name: "chosen",
+            marker: chosen_marker.clone(),
+            binary,
+        }),
+    ]));
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_reef_resolver(resolver);
+    evaluator
+        .eval_program(&parse("reef fetch guarded"))
+        .expect("pinned provider fetch succeeds");
+    assert!(!skipped_marker.exists(), "unpinned provider must not run");
+    assert!(chosen_marker.exists(), "pinned provider must run");
+}
+
+#[test]
+fn interactive_auto_lock_refuses_to_spawn_when_persistence_fails() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o555);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let passthrough = ev
+        .eval_program(&parse("^sh -c 'exit 0'"))
+        .expect("an unmentioned ambient tool does not consume Reef lock state");
+    assert!(matches!(passthrough, Value::Outcome(outcome) if outcome.ok));
+
+    let result = ev.eval_program(&parse("faketool"));
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o755);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
+    let error = result.expect_err("a non-durable auto-lock must stop before process spawn");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("persisting Reef lock"), "{error:?}");
+    assert!(error.span.is_some());
+}
+
+#[test]
+fn explicit_lock_reports_persistence_failure_instead_of_locked_rows() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o555);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let result = ev.eval_program(&parse("reef lock"));
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o755);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
+    let error = result.expect_err("reef lock must not claim success when its file was not written");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("persisting Reef lock"), "{error:?}");
+}
+
+#[test]
+fn malformed_lock_is_not_treated_as_an_unlocked_file_or_overwritten() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let lock_path = dir.path().join("reef.lock");
+    let malformed = b"[tool.faketool\nthis is not toml\n";
+    std::fs::write(&lock_path, malformed).unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let passthrough = ev
+        .eval_program(&parse("^sh -c 'exit 0'"))
+        .expect("an unmentioned ambient tool does not consume malformed lock state");
+    assert!(matches!(passthrough, Value::Outcome(outcome) if outcome.ok));
+
+    let error = ev
+        .eval_program(&parse("faketool"))
+        .expect_err("malformed protection state must fail closed before spawn");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("malformed Reef lock"), "{error:?}");
+    assert_eq!(std::fs::read(&lock_path).unwrap(), malformed);
+}
+
+#[test]
+fn reef_doctor_reports_a_malformed_lockfile() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    std::fs::write(dir.path().join("reef.lock"), "not = [valid").unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let out = ev
+        .eval_program(&parse("reef doctor"))
+        .expect("doctor reports health instead of raising");
+    let Value::Outcome(outcome) = out else {
+        panic!("expected outcome")
+    };
+    let Some(Value::Table(rows)) = outcome.parsed.as_ref() else {
+        panic!("doctor should return a table")
+    };
+    assert!(matches!(rows.as_slice(), [row]
+        if row.get("check") == Some(&Value::Str("lockfile".into()))
+            && row.get("status") == Some(&Value::Str("invalid".into()))));
+}
+
+#[test]
+fn which_shows_the_resolution_chain() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let out = ev
+        .eval_program(&parse("which faketool"))
+        .expect("which runs");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome");
+    };
+    let Some(Value::Record(r)) = o.parsed.as_ref().cloned() else {
+        panic!("which should carry a record report, got {:?}", o.parsed);
+    };
+    assert_eq!(r.get("name"), Some(&Value::Str("faketool".into())));
+    assert_eq!(r.get("scope"), Some(&Value::Str("reef".into())));
+    match r.get("path") {
+        Some(Value::Path(p)) => assert_eq!(p, &bindir.join("faketool")),
+        other => panic!("path field was {other:?}"),
+    }
+    // The chain records the reef scope's decision.
+    match r.get("chain") {
+        Some(Value::Table(rows)) => {
+            assert!(!rows.is_empty(), "chain should list the scope decisions");
+            assert!(
+                rows.iter()
+                    .any(|row| row.get("outcome") == Some(&Value::Str("selected".into()))),
+                "the winning scope is marked selected"
+            );
+        }
+        other => panic!("chain field was {other:?}"),
+    }
+}
+
+#[test]
+fn script_mode_unlocked_constraint_errors() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(false); // script/CI policy → hard error on unlocked constraint
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let err = ev
+        .eval_program(&parse("faketool"))
+        .expect_err("script mode must not guess an unlocked tool");
+    assert_eq!(err.code, "reef_unlocked", "got {} / {}", err.code, err.msg);
+    assert!(err.span.is_some(), "error carries the head's span");
+}
+
+#[test]
+fn constrained_but_missing_tool_reports_did_you_mean() {
+    // Manifest constrains `ghosttool`, but no fixture provides it.
+    let (dir, bindir) = project("[tools]\nghosttool = \"9\"\n", &[]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let err = ev
+        .eval_program(&parse("ghosttool"))
+        .expect_err("missing constrained tool errors");
+    assert_eq!(err.code, "reef_not_found");
+    assert!(
+        err.msg.contains("constrained") && err.msg.contains("reef fetch ghosttool"),
+        "did-you-mean phrasing, got {:?}",
+        err.msg
+    );
+}
+
+#[test]
+fn reef_builtin_lists_bindings() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let out = ev.eval_program(&parse("reef")).expect("reef runs");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome");
+    };
+    let Some(Value::Table(rows)) = o.parsed.as_ref().cloned() else {
+        panic!("reef should carry a table, got {:?}", o.parsed);
+    };
+    // Find `faketool`'s own row rather than asserting `rows.len() == 1`:
+    // `ScopeChain::discover` (site/content/internals/reef-resolution.md) walks from `dir` all the way
+    // to the filesystem root, so on a host whose ancestor tree happens to
+    // constrain some OTHER tool too (an ambient `~/mise.toml`, a stray
+    // manifest left in a shared `/tmp` by unrelated reef testing, ...) the
+    // binding table can legitimately grow extra rows. Naming the row this
+    // test actually cares about keeps the assertion deterministic without
+    // weakening what it checks: that this project's own `.reef.toml`
+    // constraint on `faketool` resolves with scope "reef".
+    let row = rows
+        .iter()
+        .find(|r| r.get("name") == Some(&Value::Str("faketool".into())))
+        .expect("faketool's own row is present");
+    assert_eq!(row.get("scope"), Some(&Value::Str("reef".into())));
+}
+
+#[test]
+fn reef_add_writes_manifest_and_locks() {
+    // Start with a project that has a manifest for one tool; add a second.
+    let (dir, bindir) = project(
+        "[tools]\nfaketool = \"*\"\n",
+        &[("faketool", "1"), ("other", "2")],
+    );
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let out = ev
+        .eval_program(&parse("reef add other@2"))
+        .expect("reef add runs");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome");
+    };
+    let Some(Value::Record(r)) = o.parsed.as_ref().cloned() else {
+        panic!("reef add should carry a record, got {:?}", o.parsed);
+    };
+    assert_eq!(r.get("locked"), Some(&Value::Bool(true)));
+    // The manifest now mentions `other`.
+    let manifest = std::fs::read_to_string(dir.path().join(".reef.toml")).unwrap();
+    assert!(manifest.contains("other"), "manifest was {manifest:?}");
+    // And the lock has an entry for it.
+    let lock = std::fs::read_to_string(dir.path().join("reef.lock")).unwrap();
+    assert!(lock.contains("other"), "lock was {lock:?}");
+}
+
+#[test]
+fn reef_add_rejects_oversized_manifest_before_rewriting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join(".reef.toml");
+    let file = std::fs::File::create(&manifest).unwrap();
+    file.set_len((shoal_sh::reef::REEF_MANIFEST_MAX_BYTES + 1) as u64)
+        .unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+
+    let error = ev
+        .eval_program(&parse("reef add faketool@1.2.3"))
+        .expect_err("oversized manifest must fail before TOML allocation or rewrite");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("exceeds the"), "{error:?}");
+    assert_eq!(
+        std::fs::metadata(&manifest).unwrap().len(),
+        (shoal_sh::reef::REEF_MANIFEST_MAX_BYTES + 1) as u64
+    );
+}
+
+#[test]
+fn evaluator_reef_storage_uses_the_injected_filesystem_forms() {
+    let source = include_str!("../../src/eval/reef_resolve.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production source prefix");
+    assert!(production.contains("ScopeChain::discover_with("));
+    assert!(production.contains("Lockfile::load_with("));
+    assert!(production.contains("lock.save_with("));
+    assert!(!production.contains("ScopeChain::discover("));
+    assert!(!production.contains("Lockfile::load("));
+    assert!(!production.contains("lock.save("));
+}
+
+// --- zero-regression: NO manifest behaves exactly as before ----------------
+
+#[test]
+fn no_manifest_spawns_via_path_exactly_as_before() {
+    // A tempdir with NO .reef.toml, NO user config. The reef path must fast-bail
+    // to today's PATH resolution — a plain command runs via `PATH` and succeeds,
+    // no lock is written.
+    let dir = tempfile::tempdir().unwrap();
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    fixture_bin(&bindir, "mytool", "1");
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+
+    let src = format!("PATH={} mytool", bindir.display());
+    let out = ev.eval_program(&parse(&src)).expect("mytool runs via PATH");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome, got {out:?}");
+    };
+    assert!(o.ok, "the command exits 0 exactly as today");
+    assert!(o.pid != 0, "a real child was spawned");
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("mytool-ran"),
+        "ran the PATH-resolved binary"
+    );
+    // No reef side effects anywhere.
+    assert!(!dir.path().join("reef.lock").exists());
+}
+
+#[test]
+fn no_manifest_which_returns_ambient_path_entry() {
+    // `which sh` with no manifest must still find the ambient binary (a minimal
+    // report), never Null — no regression from today's PATH lookup.
+    let dir = tempfile::tempdir().unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    let out = ev.eval_program(&parse("which sh")).expect("which sh runs");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome");
+    };
+    match o.parsed.as_ref() {
+        Some(Value::Record(r)) => match r.get("path") {
+            Some(Value::Path(p)) => assert!(
+                p.file_name().is_some_and(|n| n == "sh"),
+                "resolved a real sh, got {p:?}"
+            ),
+            other => panic!("path field was {other:?}"),
+        },
+        other => panic!("which should return a record, got {other:?}"),
+    }
+}
+
+#[test]
+fn unmentioned_tool_is_passthrough_even_under_script_policy() {
+    // Manifest constrains `faketool`, but a spawn of the UNMENTIONED `othertool`
+    // must be pure passthrough: no reef_unlocked error under script policy, and
+    // it resolves via ambient PATH exactly as today.
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1")]);
+    fixture_bin(&bindir, "othertool", "9"); // present, but NOT in the manifest
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(false); // script policy — a constrained miss would error
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let src = format!("PATH={} othertool", bindir.display());
+    let out = ev
+        .eval_program(&parse(&src))
+        .expect("unmentioned tool is passthrough, not a reef error");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome, got {out:?}");
+    };
+    assert!(o.ok, "unmentioned `othertool` runs via ambient PATH");
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("othertool-ran"),
+        "ran the PATH-resolved binary, not a reef-locked one"
+    );
+    // The reef resolver was never engaged for it, so no lock entry was written.
+    let lock = std::fs::read_to_string(dir.path().join("reef.lock")).unwrap_or_default();
+    assert!(
+        !lock.contains("othertool"),
+        "unmentioned tool must not be locked"
+    );
+}
+
+#[test]
+fn prompt_reef_snapshot_empty_with_no_manifest() {
+    // No `.reef.toml`/`mise.toml`/etc anywhere above cwd ⇒ empty snapshot, no
+    // panics, no filesystem surprises (site/content/internals/kernel-protocol.md).
+    let dir = tempfile::tempdir().unwrap();
+    panic_if_ancestor_reef_pollution(dir.path());
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    let snap = ev.prompt_reef_snapshot();
+    assert!(snap.active_scope.is_none());
+    assert!(snap.bindings.is_empty());
+}
+
+#[test]
+fn same_cwd_manifest_edit_invalidates_the_evaluator_scope_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join(".reef.toml");
+    std::fs::write(&manifest, "[tools]\nfirst = \"1\"\n").unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    let first = ev.prompt_reef_snapshot();
+    assert_eq!(first.bindings.len(), 1);
+    assert_eq!(first.bindings[0].tool, "first");
+
+    // Different length is part of the metadata fingerprint too, so this is
+    // deterministic even on filesystems with coarse mtime resolution.
+    std::fs::write(&manifest, "[tools]\nsecond_longer_name = \"2\"\n").unwrap();
+    let second = ev.prompt_reef_snapshot();
+    assert_eq!(second.bindings.len(), 1);
+    assert_eq!(second.bindings[0].tool, "second_longer_name");
+}
+
+#[test]
+fn same_cwd_lock_edit_invalidates_the_evaluator_lock_cache() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+    let initial = ev.prompt_reef_snapshot();
+    assert_eq!(initial.bindings.len(), 1);
+
+    std::fs::write(dir.path().join("reef.lock"), "not = [valid").unwrap();
+    let error = ev
+        .eval_program(&parse("faketool"))
+        .expect_err("same-cwd invalid lock replacement must be observed before spawn");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("malformed Reef lock"), "{error:?}");
+}
+
+#[test]
+fn prompt_reef_snapshot_unlocked_then_locked() {
+    // A concrete constraint (not `*`/`latest`) forces the system provider to
+    // probe `--version`, so the locked entry carries a real version string.
+    let (dir, bindir) = project("[tools]\nfaketool = \"1.2.3\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true); // interactive → auto-lock on the spawn below
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    // Before anything has spawned: constrained (a manifest mentions it) but
+    // not yet resolved — an honest gap, not a guess.
+    let snap = ev.prompt_reef_snapshot();
+    assert_eq!(
+        snap.active_scope.as_deref(),
+        Some("reef"),
+        "the nearest scope is the native .reef.toml"
+    );
+    let before = snap
+        .bindings
+        .iter()
+        .find(|b| b.tool == "faketool")
+        .expect("faketool is constrained by the manifest");
+    assert!(before.constrained);
+    assert!(before.version.is_none(), "not resolved yet");
+    assert!(before.provider.is_none());
+    assert_eq!(before.scope.as_deref(), Some("reef"));
+
+    // Spawning it auto-locks (interactive policy); the accessor then reads
+    // that lock straight off the cache — no resolver call of its own.
+    ev.eval_program(&parse("faketool")).expect("faketool runs");
+    let snap2 = ev.prompt_reef_snapshot();
+    let after = snap2
+        .bindings
+        .iter()
+        .find(|b| b.tool == "faketool")
+        .expect("still present");
+    assert_eq!(after.version.as_deref(), Some("1.2.3"));
+    assert!(after.provider.is_some());
+    assert!(after.constrained);
+}
