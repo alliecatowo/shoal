@@ -20,28 +20,28 @@ because that is where a symptom appears.
 
 | Crate | Owns | Internal Shoal dependencies | Change it when… |
 |---|---|---|---|
-| [`shoal-ast`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-ast) | spans and the serializable language tree | — | the language can represent a new form |
-| [`shoal-syntax`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-syntax) | mode-aware lexer, parser, parse status, canonical formatter, builtin registry | ast | source maps to a different AST or formatting rule |
-| [`shoal-value`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-value) | runtime value algebra, environments, methods, streams, tasks, rendering, stdin conversion | ast | a value or generic value operation changes |
-| [`shoal-eval`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-eval) | tree-walk semantics, command dispatch, builtins, plans, ports, modules, Reef integration | adapters, ast, exec, journal, leash, picker, reef, secret, syntax, value | AST meaning or language-owned runtime behavior changes |
-| [`shoal-exec`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-exec) | process spawning, capture, process groups, PTY modes, cancellation, OS sandbox application | leash | the child-process/terminal boundary changes |
-| [`shoal-leash`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-leash) | effects, content-addressed plans, policy verdicts, sandbox lowering | — | authority, approval, or containment semantics change |
-| [`shoal-journal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-journal) | SQLite schema/query, transcript rows, CAS, spill, undo, GC | — | durable execution history or bytes change |
-| [`shoal-reef`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-reef) | scoped manifests, constraints, providers, locks, hash cache, executable views, runner selection | — | reproducible tool/script resolution changes |
-| [`shoal-adapters`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-adapters) | declarative command specifications, typed binding, output parsers, bundled adapter loading | ast, value | an external CLI gains a structured Shoal surface |
-| [`shoal-config`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-config) | layered core config schema and provenance | — | CLI configuration loading or validation changes |
-| [`shoal-prompt`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-prompt) | pure prompt context and formatting, prompt-specific config/themes/modules | — | prompt display or prompt config changes |
-| [`shoal-auth`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-auth) | bearer-token hashing, expiry, revocation, and persisted token store | — | kernel identity proof changes |
-| [`shoal-secret`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-secret) | encrypted local secret map and permissions | — | secret-at-rest storage changes |
-| [`shoal-proto`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-proto) | newline-framed JSON-RPC, wire values/refs, RPC error codes, request/response types | — | the kernel wire contract changes |
-| [`shoal-kernel`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-kernel) | Unix-socket server, sessions, RPC routing, tasks, PTYs, plans, events, transcript refs | ast, auth, eval, exec, journal, leash, proto, syntax, value | remote/session semantics change |
-| [`shoal-mcp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-mcp) | MCP stdio facade, kernel client, tools, resources, resource subscriptions | none normally | the agent-facing MCP projection changes |
-| [`shoal-lsp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-lsp) | lexical editor service: diagnostics, formatting, completion, hover | syntax | editor protocol behavior changes |
-| [`shoal-history`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-history) | small journal inspection CLI/library | journal | non-interactive journal inspection changes |
-| [`shoal-doctor`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-doctor) | installation/state diagnostics | adapters, journal, leash | a user-visible health check changes |
-| [`shoal-picker`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-picker) | alternate-screen fuzzy picker | value | interactive selection UI changes |
-| [`shoal-wasm`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-wasm) | component validation, manifest checks, resource limits, ambient-import rejection | — | the future WASM isolation boundary changes |
-| [`shoal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal) | CLI actions, REPL host, editor integration, configuration assembly, prompt snapshots | adapters, ast, config, doctor, eval, journal, leash, prompt, syntax, value | the human-facing composition root changes |
+| [`shoal-ast`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/ast) | spans and the serializable language tree | — | the language can represent a new form |
+| [`shoal-syntax`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/syntax) | mode-aware lexer, parser, parse status, canonical formatter, builtin registry | ast | source maps to a different AST or formatting rule |
+| [`shoal-value`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/value) | runtime value algebra, environments, methods, streams, tasks, rendering, stdin conversion | ast | a value or generic value operation changes |
+| [`shoal-eval`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/eval) | tree-walk semantics, command dispatch, builtins, plans, ports, modules, Reef integration | adapters, ast, exec, journal, leash, picker, reef, secret, syntax, value | AST meaning or language-owned runtime behavior changes |
+| [`shoal-exec`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/exec) | process spawning, capture, process groups, PTY modes, cancellation, OS sandbox application | leash | the child-process/terminal boundary changes |
+| [`shoal-leash`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/leash) | effects, content-addressed plans, policy verdicts, sandbox lowering | — | authority, approval, or containment semantics change |
+| [`shoal-journal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/journal) | SQLite schema/query, transcript rows, CAS, spill, undo, GC | — | durable execution history or bytes change |
+| [`shoal-reef`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/reef) | scoped manifests, constraints, providers, locks, hash cache, executable views, runner selection | — | reproducible tool/script resolution changes |
+| [`shoal-adapters`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/adapters) | declarative command specifications, typed binding, output parsers, bundled adapter loading | ast, value | an external CLI gains a structured Shoal surface |
+| [`shoal-config`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/config) | layered core config schema and provenance | — | CLI configuration loading or validation changes |
+| [`shoal-prompt`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/prompt) | pure prompt context and formatting, prompt-specific config/themes/modules | — | prompt display or prompt config changes |
+| [`shoal-auth`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/auth) | bearer-token hashing, expiry, revocation, and persisted token store | — | kernel identity proof changes |
+| [`shoal-secret`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/secret) | encrypted local secret map and permissions | — | secret-at-rest storage changes |
+| [`shoal-proto`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/proto) | newline-framed JSON-RPC, wire values/refs, RPC error codes, request/response types | — | the kernel wire contract changes |
+| [`shoal-kernel`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/kernel) | Unix-socket server, sessions, RPC routing, tasks, PTYs, plans, events, transcript refs | ast, auth, eval, exec, journal, leash, proto, syntax, value | remote/session semantics change |
+| [`shoal-mcp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/mcp) | MCP stdio facade, kernel client, tools, resources, resource subscriptions | none normally | the agent-facing MCP projection changes |
+| [`shoal-lsp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/lsp) | lexical editor service: diagnostics, formatting, completion, hover | syntax | editor protocol behavior changes |
+| [`shoal-history`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/history) | small journal inspection CLI/library | journal | non-interactive journal inspection changes |
+| [`shoal-doctor`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/doctor) | installation/state diagnostics | adapters, journal, leash | a user-visible health check changes |
+| [`shoal-picker`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/picker) | alternate-screen fuzzy picker | value | interactive selection UI changes |
+| [`shoal-wasm`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/wasm) | component validation, manifest checks, resource limits, ambient-import rejection | — | the future WASM isolation boundary changes |
+| [`shoal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/cli) | CLI actions, REPL host, editor integration, configuration assembly, prompt snapshots | adapters, ast, config, doctor, eval, journal, leash, prompt, syntax, value | the human-facing composition root changes |
 
 ## Module atlas
 

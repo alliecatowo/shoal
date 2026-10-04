@@ -22,10 +22,10 @@ The most important rule is therefore:
 > A field being accepted by `shoal-config` does not by itself prove that a running host consumes it.
 
 The source of truth for schema and merging is
-[`shoal-config`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-config/src). The source of
+[`shoal-config`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/config). The source of
 truth for local-shell wiring is
-[`shoal/src/main.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal/src/main.rs) and
-[`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal/src/repl.rs).
+[`shoal/src/main.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/main.rs) and
+[`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/cli/repl.rs).
 
 ## Configuration dataflow
 

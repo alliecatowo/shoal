@@ -17,9 +17,9 @@ mutable language state, asks effect ports to touch the outside world, and return
 typed errors. It is a tree-walk evaluator: there is no bytecode, VM instruction stream, optimizer,
 or separate compile phase hidden between parsing and execution.
 
-Primary sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/lib.rs),
-[`stmt.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/stmt.rs), and
-[`expr.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/expr.rs).
+Primary sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/mod.rs),
+[`stmt.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/stmt.rs), and
+[`expr.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/expr.rs).
 
 ## The interpreter boundary
 

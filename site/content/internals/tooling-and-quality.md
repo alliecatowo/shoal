@@ -56,7 +56,7 @@ It does not currently implement a workspace/project index, references, rename, s
 semantic tokens, code actions, file watching, or type-aware completion. Those features require a
 reusable cross-document semantic graph beyond the current direct-module lookup.
 
-Source: [`shoal-lsp/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-lsp/src/lib.rs).
+Source: [`shoal-lsp/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/lsp/mod.rs).
 
 ## Doctor
 

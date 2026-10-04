@@ -59,9 +59,9 @@ The CLI can also launch companion binaries (`shoal lsp`, `shoal mcp`). The defau
 normal commands through its private kernel, but it never binds or joins the durable public socket;
 standalone mode remains a separate embedded composition root.
 
-Sources: [`shoal` main and REPL](https://github.com/alliecatowo/shoal/tree/main/crates/shoal/src),
-[`shoal-kernel`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-kernel/src), and
-[`shoal-mcp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-mcp/src).
+Sources: [`shoal` main and REPL](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/cli),
+[`shoal-kernel`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/kernel), and
+[`shoal-mcp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/mcp).
 
 ## Dependency strata
 
@@ -238,9 +238,9 @@ Parser-context parity is shared: the evaluator constructs the live value/callabl
 both the local REPL and kernel `exec` plan/run handlers. Public context-free parse/completion RPCs do
 not claim session-bound classification.
 
-Sources: [`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal/src/repl.rs),
-[`shoal-kernel/src/session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/session.rs),
-and [`handlers_exec.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/handlers_exec.rs).
+Sources: [`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/cli/repl.rs),
+[`shoal-kernel/src/session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/kernel/session.rs),
+and [`handlers_exec.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/kernel/handlers_exec.rs).
 
 ## Architectural rules worth defending
 

@@ -16,6 +16,17 @@ Shoal is a structured shell: commands still launch programs, but successful work
 
 This project is an early preview. Build it from source, keep another shell available, and read [current limits](@/docs/status-limits.md) before treating it as your login shell.
 
+## Install
+
+```bash
+# Homebrew (macOS and Linux)
+brew install alliecatowo/tap/shoal
+
+# or from crates.io (the crate is `shoal-sh`; the command is `shoal`)
+cargo install shoal-sh --locked
+shoal --version
+```
+
 ## Build from source
 
 Shoal currently targets Linux and macOS. You need a current stable Rust toolchain, Git, and the native build dependencies required by your platform.

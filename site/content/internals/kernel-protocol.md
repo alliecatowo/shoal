@@ -49,8 +49,8 @@ After attachment, peer-close transport errors are normalized to an ordinary disc
 Darwin's `EINVAL` race when the peer closes while the server updates `SO_RCVTIMEO`. Pre-attachment
 framing/admission errors and permission/revocation failures remain observable errors.
 
-Sources: [`shoal-kernel/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/lib.rs)
-and [`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/session.rs).
+Sources: [`shoal-kernel/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/kernel/mod.rs)
+and [`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/kernel/session.rs).
 
 ## Session attachment
 
@@ -139,7 +139,7 @@ The router is a direct method-to-handler table:
 | journal | `journal.query` |
 | events | `events.read`, `events.publish`, `events.subscribe`, `events.unsubscribe` |
 
-Source: [`dispatch.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/dispatch.rs).
+Source: [`dispatch.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/kernel/dispatch.rs).
 
 ### Attachment gate audit
 
@@ -382,7 +382,7 @@ The protocol centralizes numeric codes in `shoal-proto`:
 | -32030 | auth failed | token attachment |
 
 Some codes intentionally cover related cases; preserve numbers and structured `data` compatibility.
-Source: [`shoal-proto`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-proto/src/lib.rs).
+Source: [`shoal-proto`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/proto/mod.rs).
 
 ## Concurrency model, quotas, and lifecycle
 

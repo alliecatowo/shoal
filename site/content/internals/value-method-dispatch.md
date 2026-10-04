@@ -16,9 +16,9 @@ Value methods form Shoal's standard library. Most live in `shoal-value`, where t
 the narrow `CallCtx` bridge. Methods needing evaluator capabilities—filesystem inspection, `.feed`,
 channels, or namespaces—are intercepted before this crate sees the call.
 
-Sources: [`methods/mod.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/methods/mod.rs)
+Sources: [`methods/mod.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/methods/mod.rs)
 and its receiver modules under
-[`methods/`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-value/src/methods).
+[`methods/`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/value/methods).
 
 ## Capability boundary
 

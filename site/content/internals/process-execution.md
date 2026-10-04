@@ -20,10 +20,10 @@ and actual sandbox enforcement.
 This chapter covers capture mode. The [PTY and job-control](../pty-job-control/) chapter covers
 interactive execution and long-lived terminal sessions.
 
-Sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-exec/src/lib.rs),
-[`capture.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-exec/src/capture.rs),
-[`watcher.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-exec/src/watcher.rs), and
-[`sandbox.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-exec/src/sandbox.rs).
+Sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/exec/mod.rs),
+[`capture.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/exec/capture.rs),
+[`watcher.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/exec/watcher.rs), and
+[`sandbox.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/exec/sandbox.rs).
 
 ## Execution request contract
 

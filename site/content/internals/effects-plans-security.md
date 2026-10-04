@@ -56,7 +56,7 @@ accDescr: Source structure, builtin effect knowledge, and current evaluator stat
   Reverse --> Plan
 ```
 
-Source: [`shoal-leash/src/effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-leash/src/effects.rs).
+Source: [`shoal-leash/src/effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/leash/effects.rs).
 
 ## Plan derivation
 
@@ -132,8 +132,8 @@ and closure body it can see, so effects from an untaken branch may appear. Value
 path, secret name, closure body, module body, or dynamic command cannot be proven statically remain
 `Opaque`; approval must narrow or accept that uncertainty rather than relying on a guessed target.
 
-Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
-and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
+Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/plan_derive.rs)
+and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/plan_effects.rs).
 
 ## Policy evaluation
 
@@ -289,7 +289,7 @@ an atomic backend exists. They also refuse configured hostname/port network scop
 current semantic allowlist cannot confine an opaque child; an empty network grant set instead lowers
 to enforceable coarse denial on supported hosts.
 
-Source: [`shoal-leash/src/enforce.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-leash/src/enforce.rs).
+Source: [`shoal-leash/src/enforce.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/leash/enforce.rs).
 
 ## Authentication, capabilities, and policy are distinct
 

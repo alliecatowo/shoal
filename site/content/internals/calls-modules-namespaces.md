@@ -16,10 +16,10 @@ Shoal has several callable surfaces that converge only after parsing: user closu
 references, evaluator-recognized functions, type-like constructors, namespace methods, value
 methods, and ordinary commands. Their precedence and argument conversions are language semantics.
 
-Sources: [`call.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/call.rs),
-[`modules.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/modules.rs),
-[`namespaces.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/namespaces.rs),
-and [`env.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/env.rs).
+Sources: [`call.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/call.rs),
+[`modules.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/modules.rs),
+[`namespaces.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/namespaces.rs),
+and [`env.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/env.rs).
 
 ## Call surface map
 

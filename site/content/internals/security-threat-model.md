@@ -26,11 +26,11 @@ Shoal security is a chain of distinct mechanisms, not one sandbox switch:
 Each step has different coverage. Authentication does not imply authorization, a semantic policy
 does not imply OS confinement, and an `enforced` filesystem flag does not imply network isolation.
 
-Sources: [`shoal-auth`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-auth/src),
-[`shoal-leash`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-leash/src),
-[`shoal-secret`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-secret/src),
-[`shoal-wasm`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-wasm/src), and kernel
-[`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/session.rs).
+Sources: [`shoal-auth`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/auth),
+[`shoal-leash`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/leash),
+[`shoal-secret`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/secret),
+[`shoal-wasm`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/wasm), and kernel
+[`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/kernel/session.rs).
 
 ## Trust-boundary map
 

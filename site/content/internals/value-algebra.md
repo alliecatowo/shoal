@@ -16,11 +16,11 @@ wide = true
 journaling, and the kernel wire. Its `Value` enum is a closed algebra: adding a variant requires an
 explicit decision at every serialization, equality, rendering, method, and protocol boundary.
 
-Sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/lib.rs),
-[`value_types.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/value_types.rs),
-[`outcome.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/outcome.rs),
-[`json.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/json.rs), and
-[`render.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/render.rs).
+Sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/mod.rs),
+[`value_types.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/value_types.rs),
+[`outcome.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/outcome.rs),
+[`json.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/json.rs), and
+[`render.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/render.rs).
 
 ## Complete variant inventory
 
