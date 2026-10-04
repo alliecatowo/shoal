@@ -14,7 +14,7 @@ toc = true
 
 Shoal is a substantial, working preview—not a production-hardened login shell or multi-tenant agent sandbox. The language, structured shell, adapters, Reef resolver, journal/undo, kernel, MCP tools/resources/events, PTYs, LSP, prompt, and configuration system all execute real code today. The current security model still requires a fully trusted local kernel socket, and several protocol/operational contracts need hardening before consequential unattended deployment.
 
-This page is dated because status prose goes stale. It was checked against the source tree and the 1,364-case conformance corpus on **2026-07-18**.
+This page is dated because status prose goes stale. It was checked against the source tree and the 1,374-case conformance corpus on **2026-07-18** (case count refreshed 2026-10-04).
 
 ## Readiness in one table
 
@@ -49,7 +49,7 @@ The documentation uses these labels:
 The language contract lives in `spec/cases/*.toml`:
 
 ```text
-1,364 cases
+1,374 cases
 1,360 passed
 0 failed
 4 skipped
@@ -58,7 +58,7 @@ The language contract lives in `spec/cases/*.toml`:
 Canonical command:
 
 ```bash
-cargo test -p shoal --test conformance --locked -- --nocapture
+cargo test -p shoal-sh --test eval_conformance --locked -- --nocapture
 ```
 
 The four skips are explicit host/harness dependencies:
@@ -403,7 +403,7 @@ Practical guidance:
 
 - pin a Git commit/release for scripts and integrations;
 - commit exact Reef constraints and custom adapters; materialize the host-local `reef.lock` after installing tools;
-- test `cargo test -p shoal --test conformance --locked` when contributing;
+- test `cargo test -p shoal-sh --test eval_conformance --locked` when contributing;
 - use tagged fields/numeric error codes rather than display prose;
 - ignore unknown additive JSON fields;
 - do not persist ephemeral `out:`, `task:`, `plan:`, or `pty:` refs as durable IDs;

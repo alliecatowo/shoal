@@ -60,7 +60,7 @@ kernel version, every third-party adapter executable, or performance targets on 
 |---|---|---|---|
 | lexical grammar and parser | Implemented | parser tests, format round trips, conformance corpus | host parse context differs for some statement heads |
 | AST and source spans | Implemented | typed AST, parser fixtures, wire span tests | optional outcome spans survive normal and elided wire paths; producers may honestly omit them |
-| evaluator and structured values | Implemented | evaluator tests and 1,364 corpus cases | dynamic/opaque values retain tag-level rather than static element schemas |
+| evaluator and structured values | Implemented | evaluator tests and 1,374 corpus cases | dynamic/opaque values retain tag-level rather than static element schemas |
 | builtins and namespaces | Implemented | canonical command precedence plus corpus | namespaces are not first-class callable values |
 | process capture | Implemented | real process-group and dual-pipe tests | hash preflight has an exec-time TOCTOU window |
 | interactive PTY execution | Implemented, host-limited | Unix PTY integration and REPL tests | Windows/ConPTY is deferred; kernel PTYs are poll-based |

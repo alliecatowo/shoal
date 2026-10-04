@@ -10,6 +10,7 @@ repository = "https://github.com/alliecatowo/shoal"
 
 [profile.release]
 lto = "thin"
+strip = "symbols"
 codegen-units = 1
 
 # Conservative, workspace-wide lint policy (site/content/internals/tooling-and-quality.md). Every

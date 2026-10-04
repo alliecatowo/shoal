@@ -65,7 +65,7 @@ Rules that matter:
 Run the harness and confirm your new cases pass and nothing else regressed:
 
 ```sh
-CARGO_TARGET_DIR=target-<yourname> cargo test -p shoal --test conformance --locked -- --nocapture
+CARGO_TARGET_DIR=target-<yourname> cargo test -p shoal-sh --test eval_conformance --locked -- --nocapture
 ```
 
 The tail line reports `conformance: N passed, M failed, K skipped (of TOTAL total cases)` — quote it

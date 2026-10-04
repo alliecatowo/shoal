@@ -1,12 +1,17 @@
-# Weekly version updates. Minor and patch bumps are grouped into one PR per ecosystem and
-# auto-merged by .github/workflows/dependabot-automerge.yml once the required checks are green;
-# major bumps arrive as separate PRs labelled `major-update` for a human.
+# Weekly version updates. Minor and patch bumps are grouped into one PR per ecosystem. Only
+# patch-level updates are auto-merged by .github/workflows/dependabot-automerge.yml (once the
+# required checks are green); minor and major bumps are left for a human.
 version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+    # Let a release age a week (a month for majors) before proposing it, so a
+    # yanked or hijacked version is caught upstream before it reaches this repo.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
@@ -14,6 +19,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Let a release age a week (a month for majors) before proposing it, so a
+    # yanked or hijacked version is caught upstream before it reaches this repo.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]

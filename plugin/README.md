@@ -5,7 +5,7 @@ This plugin gives Claude Code a structured way to share a live shoal session. It
 `shoal-kernel` session. Results stay typed, large payloads become drillable references, and live
 changes arrive through subscriptions instead of text scraping or polling.
 
-The implementation is exercised alongside shoal's 1,355-case, 79-suite conformance corpus on
+The implementation is exercised alongside shoal's 1,374-case, 79-suite conformance corpus on
 Linux and macOS. Shoal is still pre-release; read the [current status][status] before relying on it
 as a login shell.
 
@@ -48,15 +48,11 @@ aliases, undo, elision, resources, and PTY workflows.
 Easiest: `brew install alliecatowo/tap/shoal`, or unpack a tarball from the
 [releases page](https://github.com/alliecatowo/shoal/releases/latest); both ship every binary.
 
-From source, install all the binaries the plugin needs (`shoal-sandbox-exec` and
+From source, install the one package that provides every binary the plugin needs (`shoal-sandbox-exec` and
 `shoal-landlock-helper` are used to confine scoped agents):
 
 ```sh
-cargo install --path crates/shoal
-cargo install --path crates/shoal-kernel
-cargo install --path crates/shoal-mcp
-cargo install --path crates/shoal-exec
-cargo install --path crates/shoal-leash
+cargo install shoal-sh --locked
 ```
 
 `~/.cargo/bin` must be on the `PATH` inherited by Claude Code. The plugin configuration launches

@@ -218,8 +218,15 @@ fn probe_pty(out: &mut Vec<Check>) {
     });
 }
 fn probe_dir(name: &str, path: &Path, out: &mut Vec<Check>) {
+    // A directory shoal has not needed yet (fresh install) is fine as long as
+    // its nearest existing ancestor is writable, so it can be created on demand.
+    let missing = !path.exists();
     let result = (|| {
-        let f = tempfile::NamedTempFile::new_in(path)?;
+        let probe_in = path
+            .ancestors()
+            .find(|dir| dir.is_dir())
+            .unwrap_or_else(|| Path::new("."));
+        let f = tempfile::NamedTempFile::new_in(probe_in)?;
         drop(f);
         Ok::<_, std::io::Error>(())
     })();
@@ -231,7 +238,13 @@ fn probe_dir(name: &str, path: &Path, out: &mut Vec<Check>) {
             Level::Fail
         },
         detail: result
-            .map(|()| path.display().to_string())
+            .map(|()| {
+                if missing {
+                    format!("{} (not created yet; will be on first use)", path.display())
+                } else {
+                    path.display().to_string()
+                }
+            })
             .unwrap_or_else(|e| format!("{}: {e}", path.display())),
     })
 }
@@ -312,6 +325,7 @@ fn tool_available_on_path(tool: &str, path: Option<&std::ffi::OsStr>) -> bool {
 }
 fn probe_journal(o: &Options, out: &mut Vec<Check>) {
     let result = (|| {
+        std::fs::create_dir_all(&o.state_dir).map_err(|e| e.to_string())?;
         let d = tempfile::Builder::new()
             .prefix("doctor-journal-")
             .tempdir_in(&o.state_dir)
@@ -446,6 +460,29 @@ fn probe_policy_file(path: &Path) -> Result<ProbeFile, String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn fresh_install_with_no_state_or_config_dirs_has_no_failures() {
+        let t = tempfile::tempdir().unwrap();
+        let o = Options {
+            runtime_dir: t.path().join("run"),
+            state_dir: t.path().join("state/shoal"),
+            config_dir: t.path().join("config/shoal"),
+            socket: t.path().join("run/shoal/none.sock"),
+            session: "none".into(),
+            language_journal_enabled: false,
+            render_width: Some(100),
+            config_error: None,
+        };
+        let r = run(&o);
+        let failed: Vec<_> = r
+            .checks
+            .iter()
+            .filter(|c| matches!(c.level, Level::Fail))
+            .map(|c| format!("{}: {}", c.name, c.detail))
+            .collect();
+        assert!(failed.is_empty(), "fresh install must not FAIL: {failed:?}");
+    }
+
     #[test]
     fn temp_xdg_report_is_deterministic() {
         let t = tempfile::tempdir().unwrap();
