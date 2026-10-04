@@ -450,9 +450,10 @@ fn open_does_not_chmod_a_preexisting_directory_it_did_not_create() {
     std::fs::create_dir(&shared).unwrap();
     std::fs::write(shared.join("unrelated.txt"), b"x").unwrap();
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let err = SecretStore::open(&shared)
-        .err()
-        .expect("loose shared dir is refused");
+    let err = match SecretStore::open(&shared) {
+        Err(e) => e,
+        Ok(_) => panic!("loose shared dir must be refused"),
+    };
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
     assert_eq!(
