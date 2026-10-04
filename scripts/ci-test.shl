@@ -7,5 +7,5 @@ assert(cargo_lock != null && cargo_lock.locked, "CI could not lock cargo through
 run("cargo", "build", "--workspace", "--all-targets", "--locked")
 run("scripts/help-audit.shl")
 run("cargo", "test", "--workspace", "--locked")
-run("cargo", "test", "-p", "shoal", "--test", "conformance", "--locked", "--", "--nocapture")
+run("cargo", "test", "-p", "shoal-sh", "--test", "cli_conformance", "--locked", "--", "--nocapture")
 echo "workspace test gate passed"
