@@ -97,7 +97,7 @@ cargo run -p shoal-sh --bin shoal -- -c $'let answer = 6 * 7\nanswer'
 cargo run -p shoal-sh --bin shoal -- examples/example.shl
 ```
 
-The repository currently ships **49 declarative adapters** and a normative corpus of **1,355
+The repository currently ships **49 declarative adapters** and a normative corpus of **1,374
 cases across 79 suites**. The corpus is the executable language contract.
 
 ## The model
@@ -156,18 +156,21 @@ crate ownership, execution, protocols, persistence, and security. The site keeps
 accessible relationship diagrams in compact pan/zoom viewers while preserving every existing
 `/docs/` and `/internals/` URL.
 
-## Workspace
+## Layout
 
-| Area | Responsibility |
+Shoal ships as one crate, `shoal-sh` (`crates/shoal-sh`), that builds the `shoal` binary and its
+companions. Its modules map to the architecture below.
+
+| Module | Responsibility |
 |---|---|
-| `shoal-syntax`, `shoal-ast` | modal lexer, parser, AST, formatter |
-| `shoal-value`, `shoal-eval` | value algebra, methods, evaluator, streams, effects |
-| `shoal-exec` | capture, PTY execution, cancellation, sandbox handoff |
-| `shoal-reef`, `shoal-adapters` | reproducible tool resolution and typed CLI schemas |
-| `shoal-journal` | SQLite journal and blake3 content-addressed storage |
-| `shoal-leash` | plans, grants, hash pins, OS enforcement |
-| `shoal-proto`, `shoal-kernel`, `shoal-mcp` | principal-private sessions and agent protocols |
-| `shoal-prompt`, `shoal-lsp`, `shoal` | prompt, editor tooling, CLI and REPL host |
+| `syntax`, `ast` | modal lexer, parser, AST, formatter |
+| `value`, `eval` | value algebra, methods, evaluator, streams, effects |
+| `exec` | capture, PTY execution, cancellation, sandbox handoff |
+| `reef`, `adapters` | reproducible tool resolution and typed CLI schemas |
+| `journal` | SQLite journal and blake3 content-addressed storage |
+| `leash` | plans, grants, hash pins, OS enforcement |
+| `proto`, `kernel`, `mcp` | principal-private sessions and agent protocols |
+| `prompt`, `lsp`, `cli` | prompt, editor tooling, CLI and REPL host |
 
 The [Architecture Atlas](https://alliecatowo.github.io/shoal/internals/) traces crate boundaries,
 runtime flows, security boundaries, protocol contracts, and implementation status back to source.

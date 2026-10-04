@@ -17,10 +17,10 @@ byte offset in expression or command mode, and may rewind/re-lex in the other mo
 statement head. This is how conventional expressions and shell-like command words coexist without
 turning every word into an untyped string.
 
-Sources: [`lexer.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-syntax/src/lexer.rs),
-[`parser.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-syntax/src/parser.rs), parser
-submodules in [`parser/`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-syntax/src/parser),
-and [`format.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-syntax/src/format.rs).
+Sources: [`lexer.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/syntax/lexer.rs),
+[`parser.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/syntax/parser.rs), parser
+submodules in [`parser/`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/syntax/parser),
+and [`format.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/syntax/format.rs).
 
 ## Position-addressed modal lexer
 

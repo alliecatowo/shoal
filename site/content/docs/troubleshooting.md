@@ -75,7 +75,7 @@ If a workspace lock/dependency failure remains, include the exact compiler and f
 For a source build:
 
 ```bash
-cargo build --release -p shoal
+cargo build --release -p shoal-sh --bins
 ./target/release/shoal --version
 export PATH="$PWD/target/release:$PATH"
 ```
@@ -83,7 +83,7 @@ export PATH="$PWD/target/release:$PATH"
 For Cargo install:
 
 ```bash
-cargo install --path crates/shoal
+cargo install --path crates/shoal-sh --locked   # or: cargo install shoal-sh --locked
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 rehash 2>/dev/null || true
 ```
@@ -103,7 +103,7 @@ current source artifacts.
 
 The repository-managed install and verification tasks deliberately build the
 entire release workspace. Do not replace that bootstrap with a package-only
-`cargo build -p shoal --release`: Cargo feature unification can select a
+`cargo build -p shoal-sh --release`: Cargo feature unification can select a
 different cached top-level artifact, making a correct installation appear
 stale (or allowing a stale companion artifact to escape verification).
 
@@ -116,11 +116,10 @@ The main dispatcher asks the OS to find `shoal-lsp`/`shoal-mcp` through `PATH`; 
 ```bash
 command -v shoal-lsp
 command -v shoal-mcp
-cargo install --path crates/shoal-lsp
-cargo install --path crates/shoal-mcp
+cargo install shoal-sh --locked   # installs shoal-lsp and shoal-mcp alongside shoal
 ```
 
-If you built the workspace but installed only `shoal`, either add `target/release` to `PATH` or install each companion package. See [Companion CLI reference](@/docs/companion-cli-reference.md).
+If you built from a checkout but installed only `shoal`, either add `target/release` to `PATH` or run `cargo install --path crates/shoal-sh --locked`, which installs every companion binary. See [Companion CLI reference](@/docs/companion-cli-reference.md).
 
 ### Sandbox helper missing
 
@@ -133,8 +132,7 @@ shoal-sandbox-exec helper not installed beside executable
 The spawn layer searches beside the current executable. Build/install it into the same bin directory:
 
 ```bash
-cargo build --release -p shoal-exec --bin shoal-sandbox-exec
-cargo install --path crates/shoal-exec
+cargo install --path crates/shoal-sh --locked   # installs shoal-sandbox-exec and shoal-landlock-helper
 ```
 
 Confirm sibling paths:

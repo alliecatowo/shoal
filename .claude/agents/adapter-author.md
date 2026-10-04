@@ -56,7 +56,7 @@ right shape. If you have the real binary available locally, running it once to c
 fixture sample is good practice — but the *test* must not require the binary to be present.
 
 ```sh
-CARGO_TARGET_DIR=target-adapters cargo test -p shoal-adapters --locked
+CARGO_TARGET_DIR=target-adapters cargo test -p shoal-sh --locked adapters
 ```
 
 If your adapter also warrants conformance-corpus cases (e.g. exercising the resolution/binding path,

@@ -51,9 +51,9 @@ accDescr: The value algebra contains collections and lazy streams; external exec
   CAS --> Value
 ```
 
-Sources: [`Value`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/lib.rs),
-[`value_types.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/value_types.rs), and
-[`methods`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-value/src/methods).
+Sources: [`Value`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/mod.rs),
+[`value_types.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/value_types.rs), and
+[`methods`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/value/methods).
 
 ## Equality and identity
 

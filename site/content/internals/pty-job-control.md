@@ -22,10 +22,10 @@ Shoal has two related PTY mechanisms with different consumers:
 Both create a child as session/process-group leader, retain the PTY master, reap explicitly, and kill
 the whole group on abandonment. They do not share one runtime object or registry.
 
-Sources: [`pty.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-exec/src/pty.rs),
-[`pty_session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-exec/src/pty_session.rs),
+Sources: [`pty.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/exec/pty.rs),
+[`pty_session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/exec/pty_session.rs),
 and the REPL bridge in
-[`repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal/src/repl.rs).
+[`repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/cli/repl.rs).
 
 ## Why PTY position matters
 

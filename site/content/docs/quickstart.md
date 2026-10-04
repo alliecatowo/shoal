@@ -16,6 +16,17 @@ Shoal is a structured shell: commands still launch programs, but successful work
 
 This project is an early preview. Build it from source, keep another shell available, and read [current limits](@/docs/status-limits.md) before treating it as your login shell.
 
+## Install
+
+```bash
+# Homebrew (macOS and Linux)
+brew install alliecatowo/tap/shoal
+
+# or from crates.io (the crate is `shoal-sh`; the command is `shoal`)
+cargo install shoal-sh --locked
+shoal --version
+```
+
 ## Build from source
 
 Shoal currently targets Linux and macOS. You need a current stable Rust toolchain, Git, and the native build dependencies required by your platform.
@@ -23,18 +34,18 @@ Shoal currently targets Linux and macOS. You need a current stable Rust toolchai
 ```bash
 git clone https://github.com/alliecatowo/shoal.git
 cd shoal
-cargo build --release -p shoal
+cargo build --release -p shoal-sh --bins
 ./target/release/shoal --version
 ```
 
 For a user-local Cargo installation:
 
 ```bash
-cargo install --path crates/shoal
+cargo install --path crates/shoal-sh --locked   # or: cargo install shoal-sh --locked
 shoal --version
 ```
 
-The repository also contains companion binaries for the kernel, MCP bridge, language server, diagnostics, history, secrets, and sandbox helpers. A plain interactive session only requires the `shoal` binary; agent-hosted sessions need `shoal-kernel` and `shoal-mcp` on `PATH` as described in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md).
+The `shoal-sh` package builds `shoal` plus companion binaries for the kernel, MCP bridge, language server, diagnostics, history, secrets, and sandbox helpers. A plain interactive session only requires the `shoal` binary; agent-hosted sessions need `shoal-kernel` and `shoal-mcp` on `PATH` (`cargo install` and Homebrew put them all there) as described in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md).
 
 ## Start the interactive shell
 

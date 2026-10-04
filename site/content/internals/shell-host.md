@@ -59,7 +59,7 @@ accDescr: Shows the components and relationships described in REPL assembly sequ
   end
 ```
 
-Source: [`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal/src/repl.rs).
+Source: [`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/cli/repl.rs).
 
 ## Configuration architecture
 

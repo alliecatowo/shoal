@@ -17,10 +17,10 @@ filesystem events, file tails, timers, and in-language channels all enter the sa
 pipeline. The unification is real at the value/method layer, but source buffers and the kernel wire
 still have different durability and backpressure properties.
 
-Sources: [`shoal-value/src/stream`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-value/src/stream),
-[`shoal-eval/src/streams.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/streams.rs) and its owned lossless-pump module `streams/buffer.rs`,
-[`channels.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/channels.rs), and
-[`methods/stream.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value/src/methods/stream.rs).
+Sources: [`shoal-value/src/stream`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/value/stream),
+[`shoal-eval/src/streams.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/streams.rs) and its owned lossless-pump module `streams/buffer.rs`,
+[`channels.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/channels.rs), and
+[`methods/stream.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/value/methods/stream.rs).
 
 ## Core pull protocol
 

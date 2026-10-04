@@ -44,8 +44,8 @@ accDescr: Core, prompt, and Reef configuration meet at the host; only Reef scope
   Resolution --> View["content-addressed executable view / PATH"]
 ```
 
-Sources: [`shoal-reef`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-reef/src) and
-[`shoal-eval` Reef integration](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-eval/src).
+Sources: [`shoal-reef`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/reef) and
+[`shoal-eval` Reef integration](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/eval).
 
 ## Scope discovery and precedence
 

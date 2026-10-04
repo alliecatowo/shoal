@@ -17,11 +17,11 @@ lives in `shoal-syntax`, while execution lives across evaluator modules. This sp
 clients share vocabulary without depending on the runtime, but it creates a lockstep obligation
 between registry membership and dispatch guards.
 
-Sources: [`commands.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-syntax/src/commands.rs),
+Sources: [`commands.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/syntax/commands.rs),
 `crates/shoal-syntax/src/commands/metadata.rs`,
-[`builtins.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/builtins.rs),
-[`command.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/command.rs), and
-[`host.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/host.rs).
+[`builtins.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/builtins.rs),
+[`command.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/command.rs), and
+[`host.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/host.rs).
 
 ## Canonical vocabulary
 

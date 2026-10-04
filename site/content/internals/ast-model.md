@@ -17,8 +17,8 @@ meaning: there is no environment, resolved executable, open handle, policy verdi
 `Value` in an AST. Syntax, evaluator, kernel parse responses, journal AST snapshots, and formatters
 all depend on this stability.
 
-Source: [`crates/shoal-ast/src/ast.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-ast/src/ast.rs)
-and [`span.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-ast/src/span.rs).
+Source: [`crates/shoal-ast/src/ast.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/ast/ast.rs)
+and [`span.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/ast/span.rs).
 
 ## Ownership boundary
 

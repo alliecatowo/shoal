@@ -309,6 +309,6 @@ Every audit finding → the task(s) that retire it.
 cargo fmt --all --check
 cargo +stable clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p shoal --test conformance --locked -- --nocapture   # quote final counts
-CARGO_TARGET_DIR=target-mcp cargo test -p shoal-mcp --test live_kernel --locked   # kernel/MCP work
+cargo test -p shoal-sh --test eval_conformance --locked -- --nocapture   # quote final counts
+CARGO_TARGET_DIR=target-mcp cargo test -p shoal-sh --test mcp_live_kernel --locked   # kernel/MCP work
 ```

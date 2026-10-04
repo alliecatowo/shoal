@@ -28,6 +28,10 @@ class Shoal < Formula
   def install
     # The archive holds one directory of prebuilt executables plus docs.
     bin.install Dir["shoal*"].select { |f| File.file?(f) && File.executable?(f) }
+    man1.install Dir["man/*.1"] if Dir.exist?("man")
+    bash_completion.install "completions/shoal.bash" => "shoal" if File.exist?("completions/shoal.bash")
+    zsh_completion.install "completions/_shoal" if File.exist?("completions/_shoal")
+    fish_completion.install "completions/shoal.fish" if File.exist?("completions/shoal.fish")
     doc.install "README.md"
   end
 

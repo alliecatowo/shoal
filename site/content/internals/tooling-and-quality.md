@@ -56,7 +56,7 @@ It does not currently implement a workspace/project index, references, rename, s
 semantic tokens, code actions, file watching, or type-aware completion. Those features require a
 reusable cross-document semantic graph beyond the current direct-module lookup.
 
-Source: [`shoal-lsp/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-lsp/src/lib.rs).
+Source: [`shoal-lsp/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/lsp/mod.rs).
 
 ## Doctor
 
@@ -84,7 +84,7 @@ typed schema errors, structural limits, and policy-specific admission therefore 
 
 ## Normative conformance corpus
 
-`spec/cases/` contains 79 TOML suite files and 1,364 `[[case]]` records. Cases declare globally named
+`spec/cases/` contains 79 TOML suite files and 1,374 `[[case]]` records. Cases declare globally named
 source, expected rendered value or stable error code, optional message substring, parse-error
 expectation, filesystem fixtures, and an explicit skip reason.
 
@@ -204,10 +204,10 @@ bug the way a multi-hour/day corpus-accumulating campaign would, but it does mea
 The repository defines four Criterion entrypoints for the expensive representative workloads:
 
 ```bash
-cargo bench -p shoal-syntax --bench syntax
-cargo bench -p shoal-value --bench table
-cargo bench -p shoal-journal --bench journal
-cargo bench -p shoal-exec --bench spawn
+cargo bench -p shoal-sh --bench syntax_syntax
+cargo bench -p shoal-sh --bench value_table
+cargo bench -p shoal-sh --bench journal_journal
+cargo bench -p shoal-sh --bench exec_spawn
 ```
 
 The table benchmark retains one million rows and the journal benchmark seeds 100,000 entries, so
@@ -338,7 +338,7 @@ thirteen color-asserting highlighter tests failed even though the product was co
 `NO_COLOR` — a test-isolation defect (deep audit H13), not a product bug. `styles_for`/
 `styles_with_bindings` now route through a shared `with_forced_color` helper that unsets `NO_COLOR`
 under `crate::ENV_TEST_LOCK` for the duration of the call and restores whatever was there before.
-All 13 highlighter tests now pass identically with `NO_COLOR=1 cargo test -p shoal` and with
+All 13 highlighter tests now pass identically with `NO_COLOR=1 cargo test -p shoal-sh` and with
 `NO_COLOR` unset; verify with both invocations after touching this module.
 
 ## Choosing the right test

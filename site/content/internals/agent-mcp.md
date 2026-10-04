@@ -34,7 +34,7 @@ accDescr: Shows the components and relationships described in Bridge topology.
 The facade advertises MCP protocol version `2025-06-18`, tools, resources, and resource
 subscriptions. It does not expose prompts.
 
-Source: [`shoal-mcp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-mcp/src).
+Source: [`shoal-mcp`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/mcp).
 
 ## Startup and transport
 

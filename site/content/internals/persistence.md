@@ -53,7 +53,7 @@ absolute `journal.state_dir` in layered config intentionally moves the shell, do
 CLI journal; relative paths resolve from each process's startup cwd. `shoal-history --state-dir`
 has highest precedence and targets durable kernels launched with an explicit CLI root.
 
-Source: [`shoal-journal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-journal/src).
+Source: [`shoal-journal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/journal).
 
 ## Schema
 

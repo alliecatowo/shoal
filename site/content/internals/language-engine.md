@@ -37,8 +37,8 @@ Spans are half-open byte offsets into the source. They are carried through AST n
 language errors where possible. Any feature that synthesizes or transforms an AST must preserve
 that distinction: a byte offset is not a Unicode scalar index and not a terminal column.
 
-Sources: [`shoal-ast`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-ast/src) and
-[`shoal-syntax`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-syntax/src).
+Sources: [`shoal-ast`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/ast) and
+[`shoal-syntax`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-sh/src/syntax).
 
 ## AST inventory
 
@@ -181,7 +181,7 @@ accDescr: Shows the components and relationships described in Command dispatch.
 
 The exact source order includes redirect handling, glob expansion, typed list/glob parameters, and
 external resolution details. Read
-[`command.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/command.rs)
+[`command.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-sh/src/eval/command.rs)
 before inserting a new command family.
 
 Callable resolution happens even for `^`-forced heads; force bypasses a non-callable shadow and

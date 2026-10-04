@@ -5,15 +5,47 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release must never ship a commit that main's CI has not passed. The tag is
+  # normally pushed right after the release PR merges, so wait for CI to finish.
+  gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require a green CI run on main for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq .status)"
+          case "$status" in identical|behind) ;; *) echo "::error::tag commit is not on main ($status)"; exit 1 ;; esac
+          for i in $(seq 1 80); do
+            row="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --event push --json status,conclusion --jq '.[0] // empty | "\(.status) \(.conclusion)"')"
+            echo "attempt $i: ${row:-no CI run yet}"
+            case "$row" in
+              "completed success") exit 0 ;;
+              "completed "*) echo "::error::CI did not pass for $GITHUB_SHA ($row)"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "::error::timed out waiting for CI on $GITHUB_SHA"; exit 1
+
   build:
     name: build ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +59,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - name: Tag matches workspace version
         shell: bash
         run: |
@@ -39,7 +71,7 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross linker (aarch64 linux)
@@ -61,13 +93,27 @@ jobs:
             ! -name '*.d' ! -name '*.rlib' ! -name '*.so' ! -name '*.dylib' \
             -exec cp {} "$dist/" \;
           cp README.md LICENSE* "$dist/" 2>/dev/null || true
+          cp -R man "$dist/man"
+          # Shell completions come from the freshly built binary; skip only for the
+          # cross-compiled target, whose binary cannot run on this runner.
+          if [ "${{ matrix.target }}" != "aarch64-unknown-linux-gnu" ]; then
+            mkdir -p "$dist/completions"
+            bin="target/${{ matrix.target }}/release/shoal"
+            "$bin" completions bash > "$dist/completions/shoal.bash"
+            "$bin" completions zsh > "$dist/completions/_shoal"
+            "$bin" completions fish > "$dist/completions/shoal.fish"
+          fi
           tar czf "$dist.tar.gz" "$dist"
           # sha256sum on Linux, shasum on macOS
           (sha256sum "$dist.tar.gz" 2>/dev/null || shasum -a 256 "$dist.tar.gz") > "$dist.tar.gz.sha256"
           echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
           echo "ASSET_SUM=$dist.tar.gz.sha256" >> "$GITHUB_ENV"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ env.ASSET }}
       - name: Upload to release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             ${{ env.ASSET }}
@@ -82,7 +128,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Render formula from the published checksums
         run: |
@@ -152,12 +198,12 @@ jobs:
       contents: read
       id-token: write # crates.io trusted publishing
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - name: Install pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Authenticate to crates.io (OIDC)
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
       - name: Publish shoal-sh
         run: cargo publish -p shoal-sh --locked
         env:
