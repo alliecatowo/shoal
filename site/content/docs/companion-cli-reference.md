@@ -59,16 +59,7 @@ export PATH="$PWD/target/release:$PATH"
 For Cargo's user bin directory, install packages explicitly:
 
 ```bash
-cargo install --path crates/shoal
-cargo install --path crates/shoal-kernel
-cargo install --path crates/shoal-mcp
-cargo install --path crates/shoal-lsp
-cargo install --path crates/shoal-auth
-cargo install --path crates/shoal-secret
-cargo install --path crates/shoal-history
-cargo install --path crates/shoal-doctor
-cargo install --path crates/shoal-exec
-cargo install --path crates/shoal-leash
+cargo install --path crates/shoal-sh   # installs shoal and every companion binary
 ```
 
 The repository's mise tasks build and install the complete set together, so a

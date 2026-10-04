@@ -6,11 +6,11 @@ fuzz_target!(|data: &[u8]| {
     let Ok(source) = std::str::from_utf8(data) else {
         return;
     };
-    if let shoal_syntax::ParseStatus::Complete(program) = shoal_syntax::parse_status(source) {
-        let formatted = shoal_syntax::format_program(&program);
+    if let shoal_sh::syntax::ParseStatus::Complete(program) = shoal_sh::syntax::parse_status(source) {
+        let formatted = shoal_sh::syntax::format_program(&program);
         assert!(matches!(
-            shoal_syntax::parse_status(&formatted),
-            shoal_syntax::ParseStatus::Complete(_)
+            shoal_sh::syntax::parse_status(&formatted),
+            shoal_sh::syntax::ParseStatus::Complete(_)
         ));
     }
 });

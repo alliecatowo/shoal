@@ -32,6 +32,11 @@ short and point to those stable files instead of recreating old numbered design 
 The detailed ledger is
 [`site/content/internals/crate-ledger.md`](site/content/internals/crate-ledger.md). The short map:
 
+**Layout note:** all the components below are modules of ONE crate, `crates/shoal-sh` (crates.io name
+`shoal-sh`, lib `shoal_sh`, binary `shoal`). `shoal-eval` means `crates/shoal-sh/src/eval`, and so on;
+`shoal` (the CLI) is `src/cli`. Companion binaries live in `src/bin/`. Tests/benches are under
+`crates/shoal-sh/{tests,benches}/<module>/` and named `<module>_<file>` (e.g. `--test eval_conformance`).
+
 ```text
 syntax + model
   shoal-ast       canonical AST/desugaring structures
@@ -117,13 +122,13 @@ cargo test --workspace --locked
 For language/evaluator work, isolate the corpus while iterating and quote its final counts:
 
 ```sh
-cargo test -p shoal --test conformance --locked -- --nocapture
+cargo test -p shoal-sh --test cli_conformance --locked -- --nocapture
 ```
 
 For kernel, MCP, resources, events, CAS refs, or PTY changes, also run:
 
 ```sh
-CARGO_TARGET_DIR=target-mcp cargo test -p shoal-mcp --test live_kernel --locked
+CARGO_TARGET_DIR=target-mcp cargo test -p shoal-sh --test mcp_live_kernel --locked
 ```
 
 That test starts a real kernel/socket stack and exercises attach, structured exec, elision and
@@ -133,9 +138,9 @@ facade boundary.
 ## Dogfooding
 
 ```sh
-cargo run -p shoal
-cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
-cargo run -p shoal -- examples/example.shl
+cargo run -p shoal-sh --bin shoal
+cargo run -p shoal-sh --bin shoal -- -c $'let answer = 6 * 7\nanswer'
+cargo run -p shoal-sh --bin shoal -- examples/example.shl
 ```
 
 Exercise workflows rather than isolated arithmetic: structured external output, aliases, Reef,

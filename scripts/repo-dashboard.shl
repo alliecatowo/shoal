@@ -26,7 +26,7 @@ let head = run("git", "rev-parse", "--short=12", "HEAD").out.str().trim()
   automation: {
     workflows: glob(".github/workflows/*.yml", hidden: true).expand().len(),
     man_pages: glob("man/*.1").expand().len(),
-    adapters: glob("adapters/*.toml").expand().len(),
+    adapters: glob("crates/shoal-sh/adapters/*.toml").expand().len(),
     fuzz_targets: glob("fuzz/fuzz_targets/*.rs").expand().len(),
   },
 }

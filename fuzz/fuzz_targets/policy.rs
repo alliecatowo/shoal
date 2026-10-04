@@ -13,10 +13,10 @@ fuzz_target!(|data: &[u8]| {
     let Ok(policy_source) = std::str::from_utf8(&data[..split]) else {
         return;
     };
-    let Ok(policy) = shoal_leash::Policy::from_toml(policy_source) else {
+    let Ok(policy) = shoal_sh::leash::Policy::from_toml(policy_source) else {
         return;
     };
-    let Ok(plan) = serde_json::from_slice::<shoal_leash::Plan>(&data[split + SEPARATOR.len()..])
+    let Ok(plan) = serde_json::from_slice::<shoal_sh::leash::Plan>(&data[split + SEPARATOR.len()..])
     else {
         return;
     };

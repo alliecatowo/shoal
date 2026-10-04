@@ -1,0 +1,290 @@
+[package]
+name = "shoal-sh"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.89"
+description = "A typed, journaled, capability-leashed shell with first-class values, structured pipelines and an agent (MCP) kernel"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/alliecatowo/shoal"
+documentation = "https://docs.rs/shoal-sh"
+readme = "../../README.md"
+keywords = ["shell", "repl", "terminal", "structured-data", "sandbox"]
+categories = ["command-line-utilities"]
+autotests = false
+autobenches = false
+autobins = false
+build = "build.rs"
+
+[lib]
+name = "shoal_sh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shoal"
+path = "src/main.rs"
+
+[[bin]]
+name = "shoal-doctor"
+path = "src/bin/shoal-doctor.rs"
+
+[[bin]]
+name = "shoal-history"
+path = "src/bin/shoal-history.rs"
+
+[[bin]]
+name = "shoal-kernel"
+path = "src/bin/shoal-kernel.rs"
+
+[[bin]]
+name = "shoal-landlock-helper"
+path = "src/bin/shoal-landlock-helper.rs"
+
+[[bin]]
+name = "shoal-lsp"
+path = "src/bin/shoal-lsp.rs"
+
+[[bin]]
+name = "shoal-mcp"
+path = "src/bin/shoal-mcp.rs"
+
+[[bin]]
+name = "shoal-sandbox-exec"
+path = "src/bin/shoal-sandbox-exec.rs"
+
+[[bin]]
+name = "shoal-secret"
+path = "src/bin/shoal-secret.rs"
+
+[[bin]]
+name = "shoal-token"
+path = "src/bin/shoal-token.rs"
+
+[[test]]
+name = "adapters_adapter_fixtures"
+path = "tests/adapters/adapter_fixtures.rs"
+
+[[test]]
+name = "adapters_output_hostile"
+path = "tests/adapters/output_hostile.rs"
+
+[[test]]
+name = "auth_cli_paths"
+path = "tests/auth/cli_paths.rs"
+
+[[test]]
+name = "eval_child_context_propagation"
+path = "tests/eval/child_context_propagation.rs"
+
+[[test]]
+name = "eval_conformance"
+path = "tests/eval/conformance.rs"
+
+[[test]]
+name = "eval_exit_and_stream"
+path = "tests/eval/exit_and_stream.rs"
+
+[[test]]
+name = "eval_leash_activation"
+path = "tests/eval/leash_activation.rs"
+
+[[test]]
+name = "eval_ports"
+path = "tests/eval/ports.rs"
+
+[[test]]
+name = "eval_redirection_semantics"
+path = "tests/eval/redirection_semantics.rs"
+
+[[test]]
+name = "eval_reef_integration"
+path = "tests/eval/reef_integration.rs"
+
+[[test]]
+name = "eval_streams"
+path = "tests/eval/streams.rs"
+
+[[test]]
+name = "exec_exec"
+path = "tests/exec/exec.rs"
+
+[[test]]
+name = "exec_sandbox"
+path = "tests/exec/sandbox.rs"
+
+[[test]]
+name = "history_state_root"
+path = "tests/history/state_root.rs"
+
+[[test]]
+name = "kernel_daemon"
+path = "tests/kernel/daemon.rs"
+
+[[test]]
+name = "leash_landlock"
+path = "tests/leash/landlock.rs"
+
+[[test]]
+name = "lsp_framed_stdio"
+path = "tests/lsp/framed_stdio.rs"
+
+[[test]]
+name = "mcp_live_kernel"
+path = "tests/mcp/live_kernel.rs"
+
+[[test]]
+name = "mcp_subscriptions"
+path = "tests/mcp/subscriptions.rs"
+
+[[test]]
+name = "prompt_format_parser"
+path = "tests/prompt/format_parser.rs"
+
+[[test]]
+name = "prompt_modules"
+path = "tests/prompt/modules.rs"
+
+[[test]]
+name = "prompt_render_parity"
+path = "tests/prompt/render_parity.rs"
+
+[[test]]
+name = "prompt_speed"
+path = "tests/prompt/speed.rs"
+
+[[test]]
+name = "proto_properties"
+path = "tests/proto/properties.rs"
+
+[[test]]
+name = "secret_cli_paths"
+path = "tests/secret/cli_paths.rs"
+
+[[test]]
+name = "syntax_defects"
+path = "tests/syntax/defects.rs"
+
+[[test]]
+name = "syntax_dispatch"
+path = "tests/syntax/dispatch.rs"
+
+[[test]]
+name = "syntax_properties"
+path = "tests/syntax/properties.rs"
+
+[[test]]
+name = "syntax_test_caret"
+path = "tests/syntax/test_caret.rs"
+
+[[test]]
+name = "cli_config_wiring"
+path = "tests/cli/config_wiring.rs"
+
+[[test]]
+name = "cli_conformance"
+path = "tests/cli/conformance.rs"
+
+[[test]]
+name = "cli_init_failure"
+path = "tests/cli/init_failure.rs"
+
+[[test]]
+name = "cli_interactive"
+path = "tests/cli/interactive.rs"
+
+[[test]]
+name = "cli_project_trust"
+path = "tests/cli/project_trust.rs"
+
+[[bench]]
+name = "eval_pipeline"
+path = "benches/eval/pipeline.rs"
+harness = false
+
+[[bench]]
+name = "exec_spawn"
+path = "benches/exec/spawn.rs"
+harness = false
+
+[[bench]]
+name = "journal_journal"
+path = "benches/journal/journal.rs"
+harness = false
+
+[[bench]]
+name = "kernel_protocol"
+path = "benches/kernel/protocol.rs"
+harness = false
+
+[[bench]]
+name = "prompt_render"
+path = "benches/prompt/render.rs"
+harness = false
+
+[[bench]]
+name = "syntax_syntax"
+path = "benches/syntax/syntax.rs"
+harness = false
+
+[[bench]]
+name = "value_table"
+path = "benches/value/table.rs"
+harness = false
+
+[lints]
+workspace = true
+
+[dependencies]
+aes = { version = "0.9", features = ["zeroize"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+anyhow = "1"
+base64 = "0.23"
+blake3 = "1.8"
+crossterm = "0.29"
+csv = "1.4.0"
+ctrlc = "3"
+fd-lock = "4"
+getrandom = "0.4"
+glob = "0.3.3"
+http = "1"
+indexmap = { version = "2.14.0", features = ["serde"] }
+jiff = "0.2.32"
+libc = "0.2"
+notify = "8.2.0"
+nu-ansi-term = "0.50.3"
+portable-pty = "0.9"
+rand = "0.10"
+reedline = { version = "0.52.0", features = ["external_printer"] }
+regex = "1.13.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_norway = "0.9.42"
+shell-words = "1.1.1"
+signal-hook = "0.4"
+strip-ansi-escapes = "0.2.1"
+subtle = "2.6"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
+toml = "1.1.2"
+tower-lsp = "0.20"
+unicode-segmentation = "1.12"
+unicode-width = "0.2.2"
+ureq = "3.3.0"
+vt100 = "0.16.2"
+wasmtime = { version = "49", default-features=false, features = ["component-model", "cranelift", "runtime", "wat"] }
+zeroize = "1"
+zstd = "0.14"
+
+[target."cfg(target_os = \"linux\")".dependencies]
+landlock = "0.4.5"
+
+[dev-dependencies]
+criterion = "0.8"
+pretty_assertions = "1.4.1"
+proptest = "1.7"
+wasmprinter = "0.258"
+wat = "1"
+wit-component = { version = "0.258", features = ["dummy-module"] }
+wit-parser = "0.258"

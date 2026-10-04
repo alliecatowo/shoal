@@ -1,0 +1,782 @@
+//! Process execution engine for the shoal shell.
+//!
+//! Blocking and thread-based (no async runtime). Two execution modes, per
+//! site/content/internals/language-conformance-contract.md (the PTY position rule — this crate implements the mechanism):
+//!
+//! - [`ExecMode::Capture`] — value position: stdout/stderr are pipes, stdin is
+//!   configured per [`StdinSpec`], the child has no controlling tty and is
+//!   placed in its own process group (`setpgid(0, 0)`). Both pipes are drained
+//!   concurrently so a child filling either one can never deadlock.
+//! - [`ExecMode::PtyTee`] — statement position: the child runs on a real PTY
+//!   as session leader. Output streams raw to the real terminal *and* is teed
+//!   into the returned buffer; real stdin is forwarded to the PTY with the
+//!   terminal in raw mode for the duration (restored panic-safely by a drop
+//!   guard); window-size changes are propagated by polling. When the hosting
+//!   process has no tty (tests, CI), the child still gets a PTY but raw mode
+//!   and stdin forwarding are skipped gracefully.
+//!
+//! Cancellation (site/content/internals/language-conformance-contract.md): a [`CancelToken`] is polled roughly every 50 ms;
+//! once cancelled, the child's *process group* receives `SIGINT`, escalating
+//! to `SIGTERM` after 3 s and `SIGKILL` after 3 more. The run then returns
+//! normally with the fatal signal recorded by name.
+//!
+//! Signal deaths (site/content/internals/language-conformance-contract.md) surface as `signal: Some("SIGSEGV")` etc. with
+//! `status: None` — never the shell-style `128+n` encoding. Children are
+//! always reaped (no zombies), and spawn failures such as `E2BIG` surface as
+//! [`std::io::Error`].
+//!
+//! Job control (site/content/internals/language-conformance-contract.md): a PtyTee **foreground** child is waited on with
+//! `WUNTRACED`, so a Ctrl-Z (SIGTSTP delivered to the child's foreground
+//! process group by the pty line discipline) is observable as a *stop* rather
+//! than hanging the shell. On a stop, [`run`] returns an [`ExecResult`] with
+//! `stopped: true` and parks the still-live PTY (master + child) so the host
+//! can later resume it in the foreground (`fg`) or background (`bg`) via
+//! [`PtyJob`]/[`take_stopped_job`]. This is strictly additive: a child that
+//! runs to completion behaves byte-identically to before, and Capture mode has
+//! no stop concept at all.
+
+mod bounded;
+mod cancel;
+mod capture;
+mod capture_budget;
+mod pty;
+mod pty_session;
+mod sandbox;
+mod status;
+mod watcher;
+mod which;
+
+use std::ffi::OsString;
+use std::io::{self, Read};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+pub use bounded::{BoundedCommandOutput, run_bounded_command};
+pub use cancel::{CancelToken, ProcessControlSnapshot};
+pub use capture::{StreamingChild, spawn_capture};
+pub use capture_budget::{
+    DEFAULT_CAPTURE_AGGREGATE_MEMORY_CAP, DEFAULT_CAPTURE_AGGREGATE_SPILL_CAP,
+    MAX_ACTIVE_CAPTURE_SPILL_FILES, MAX_CAPTURE_AGGREGATE_MEMORY_CAP,
+    MAX_CAPTURE_AGGREGATE_SPILL_CAP, MAX_CAPTURE_HARD_CAP, MAX_CAPTURE_SPILL_CAP,
+    aggregate_memory_cap as capture_aggregate_memory_cap,
+    aggregate_spill_cap as capture_aggregate_spill_cap,
+    set_aggregate_memory_cap as set_capture_aggregate_memory_cap,
+    set_aggregate_spill_cap as set_capture_aggregate_spill_cap,
+};
+pub use pty::{PtyJob, shutdown_stopped_jobs, take_background_job, take_stopped_job};
+pub use pty_session::{
+    PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS, PTY_MAX_COLS, PTY_MAX_ROWS, PtyOpenSpec, PtySession,
+    ScreenSnapshot, named_key,
+};
+pub use which::{which, which_in};
+
+/// Resolve `argv[0]` (an absolute path as-is, or a bare name via the `PATH`
+/// entry of `env`) and return the blake3-hex of its on-disk bytes — the same
+/// digest `shoal_sh::reef::hashcache::hash_bytes` / `shoal_sh::leash::preflight_spawn`
+/// produce, so a `proc_spawn` pin an author copies from `reef`/`which` compares
+/// equal. `None` when the binary can't be located or read. Used by kernel hosts
+/// to build the [`shoal_sh::leash::Effect::ProcSpawn`] `bin_hash` for the PTY-open
+/// spawn gate without re-implementing resolution/hashing.
+#[must_use]
+pub fn resolve_and_hash(argv: &[OsString], env: &[(OsString, OsString)]) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    resolve_and_hash_in(argv, env, &cwd)
+}
+
+/// Resolve and hash `argv[0]` using `cwd` for empty/relative `PATH`
+/// components and relative slash paths. This is the spawn-equivalent variant
+/// for hosts whose session cwd differs from their daemon process cwd.
+#[must_use]
+pub fn resolve_and_hash_in(
+    argv: &[OsString],
+    env: &[(OsString, OsString)],
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let program = which::resolve_program(argv, env, cwd).ok()?;
+    hash_regular_file(&program).ok()
+}
+
+fn hash_regular_file(path: &std::path::Path) -> io::Result<String> {
+    let expected = std::fs::metadata(path)?;
+    if !expected.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hash target is not a regular file",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "opened hash target is not a regular file",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Default hard cap on the bytes buffered in memory when capturing a command's
+/// output in value position (site/content/internals/language-conformance-contract.md). Once a captured buffer reaches this
+/// size it stops growing in RAM. 64 MiB is high enough that ordinary command
+/// output is never affected, yet low enough that `let x = (yes)` /
+/// `let x = (cat /dev/zero)` cannot OOM the shell.
+///
+/// What happens past the cap depends on whether the spec requested a spill
+/// ([`ExecSpec::spill`]): with no spill, overflow is discarded and
+/// [`ExecResult::truncated`] is set (the RAM floor, unchanged); with a spill,
+/// the full stream is streamed to a disk file (blake3-addressed, up to
+/// [`capture_spill_cap`]) and returned as [`ExecResult::stdout_spill`] so the
+/// caller can adopt it into the CAS as a ref-backed value (site/content/internals/language-conformance-contract.md
+/// disk-spill promise). The 64 MiB resident buffer is then the value's preview.
+pub const DEFAULT_CAPTURE_HARD_CAP: usize = 64 * 1024 * 1024;
+
+/// Default hard cap on the bytes streamed to a **disk** spill file when a
+/// capture requests one ([`ExecSpec::spill`]) and its output exceeds the RAM
+/// cap. Bounds disk the way [`DEFAULT_CAPTURE_HARD_CAP`] bounds RAM: without
+/// it, `let x = (yes)` would fill the disk instead of OOMing. 256 MiB is large
+/// enough that ordinary captures spill whole; past it the spill stops and
+/// [`CaptureSpill::truncated`] is set. A process-wide aggregate ceiling is
+/// enforced independently across concurrent files.
+pub const DEFAULT_CAPTURE_SPILL_CAP: u64 = 256 * 1024 * 1024;
+
+/// `0` sentinel = not yet resolved; the first [`capture_hard_cap`] call seeds it
+/// from the `SHOAL_CAPTURE_CAP_BYTES` env var (a positive integer) or the
+/// default, so the cap is configurable without an API/ABI change to `ExecSpec`.
+static CAPTURE_HARD_CAP: AtomicUsize = AtomicUsize::new(0);
+
+/// The active in-memory capture hard cap in bytes (see
+/// [`DEFAULT_CAPTURE_HARD_CAP`]). Resolved once from `SHOAL_CAPTURE_CAP_BYTES`
+/// or the default, unless overridden by [`set_capture_hard_cap`].
+pub fn capture_hard_cap() -> usize {
+    let cached = CAPTURE_HARD_CAP.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let resolved = std::env::var("SHOAL_CAPTURE_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CAPTURE_HARD_CAP)
+        .min(MAX_CAPTURE_HARD_CAP);
+    CAPTURE_HARD_CAP.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
+/// Override the in-memory per-stream cap. Values are clamped to the hard sane
+/// range `1..=MAX_CAPTURE_HARD_CAP`.
+pub fn set_capture_hard_cap(bytes: usize) {
+    CAPTURE_HARD_CAP.store(bytes.clamp(1, MAX_CAPTURE_HARD_CAP), Ordering::Relaxed);
+}
+
+/// `0` sentinel = not yet resolved (see [`CAPTURE_HARD_CAP`]).
+static CAPTURE_SPILL_CAP: AtomicU64 = AtomicU64::new(0);
+
+/// The active disk-spill hard cap in bytes (see [`DEFAULT_CAPTURE_SPILL_CAP`]).
+/// Resolved once from `SHOAL_CAPTURE_SPILL_CAP_BYTES` or the default, unless
+/// overridden by [`set_capture_spill_cap`].
+pub fn capture_spill_cap() -> u64 {
+    let cached = CAPTURE_SPILL_CAP.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let resolved = std::env::var("SHOAL_CAPTURE_SPILL_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CAPTURE_SPILL_CAP)
+        .min(MAX_CAPTURE_SPILL_CAP);
+    CAPTURE_SPILL_CAP.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
+/// Override the per-stream disk-spill cap. Values are clamped to the hard sane
+/// range `1..=MAX_CAPTURE_SPILL_CAP`.
+pub fn set_capture_spill_cap(bytes: u64) {
+    CAPTURE_SPILL_CAP.store(bytes.clamp(1, MAX_CAPTURE_SPILL_CAP), Ordering::Relaxed);
+}
+
+/// A fully-resolved request to execute one external process.
+#[derive(Debug, Clone)]
+pub struct ExecSpec {
+    /// `argv[0]` is the program. If it contains a `/` it is executed as-is;
+    /// otherwise it is resolved with [`which`] against the `PATH` entry of
+    /// [`ExecSpec::env`] (falling back to the host process `PATH` when the
+    /// spec's environment carries none).
+    pub argv: Vec<OsString>,
+    /// Working directory for the child.
+    pub cwd: PathBuf,
+    /// The **complete** child environment — nothing is inherited implicitly.
+    pub env: Vec<(OsString, OsString)>,
+    /// What the child sees on stdin (see [`StdinSpec`] for per-mode notes).
+    pub stdin: StdinSpec,
+    /// Capture (value position) or PTY-tee (statement position).
+    pub mode: ExecMode,
+    /// Optional OS-enforcement request (site/content/internals/language-conformance-contract.md). `None` (the default) is the
+    /// existing unsandboxed behavior. When `Some`, [`run`]/[`spawn_capture`]
+    /// apply the strongest available mechanism before exec in the child and
+    /// report what actually happened via [`ExecResult::enforcement`]; see
+    /// [`shoal_sh::leash::SandboxPolicy`].
+    pub sandbox: Option<crate::leash::SandboxPolicy>,
+    /// Optional disk-spill request for value-position capture (site/content/internals/language-conformance-contract.md).
+    /// `None` (the default) preserves the pre-spill behavior *exactly*: stdout
+    /// is buffered up to [`capture_hard_cap`] and any overflow is discarded
+    /// with [`ExecResult::truncated`] set. When `Some`, a capture whose stdout
+    /// exceeds the RAM cap streams the **full** stream to a blake3-addressed
+    /// file under [`SpillConfig::dir`] (bounded by [`capture_spill_cap`]),
+    /// returned as [`ExecResult::stdout_spill`]; the resident buffer becomes a
+    /// bounded preview. Only honored in [`ExecMode::Capture`].
+    pub spill: Option<SpillConfig>,
+}
+
+/// Where and whether a value-position capture may spill oversized stdout to
+/// disk (site/content/internals/language-conformance-contract.md). The caller (which owns the content-addressed store) hands
+/// in a directory it will later adopt the spill file from; keeping the CAS
+/// itself out of `shoal-exec` preserves the crate's dependency layering.
+#[derive(Debug, Clone)]
+pub struct SpillConfig {
+    /// Directory the spill file is created in. Should be on the same
+    /// filesystem the caller ingests it into. Must already exist.
+    pub dir: PathBuf,
+}
+
+/// A value-position capture whose stdout exceeded [`capture_hard_cap`] and was
+/// streamed to disk (site/content/internals/language-conformance-contract.md). The file at [`CaptureSpill::path`] holds the
+/// captured bytes (the full stream unless [`CaptureSpill::truncated`]), and
+/// [`CaptureSpill::hash`] is their blake3, so the caller can adopt it into a
+/// content-addressed store as a ref-backed value. Moving the file transfers its
+/// content; if the value is simply dropped, Shoal removes the temporary file
+/// and releases its process-wide spill reservation deterministically.
+#[derive(Debug, Clone)]
+pub struct CaptureSpill {
+    /// Path of the on-disk spill file. The shared owner removes it on final
+    /// drop unless the caller has moved it into durable storage.
+    pub path: PathBuf,
+    /// blake3 hex of the bytes actually stored in the file.
+    pub hash: String,
+    /// Length in bytes of the stored content (the value's true length unless
+    /// [`CaptureSpill::truncated`] is set).
+    pub len: u64,
+    /// `true` when the stream itself exceeded [`capture_spill_cap`] and the
+    /// spill was truncated to that bound (the stored bytes are a prefix).
+    pub truncated: bool,
+    _ownership: Arc<CaptureSpillOwnership>,
+}
+
+#[derive(Debug)]
+struct CaptureSpillOwnership {
+    path: PathBuf,
+    _lease: capture_budget::SpillLease,
+}
+
+impl Drop for CaptureSpillOwnership {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
+impl CaptureSpill {
+    pub(crate) fn new(
+        path: PathBuf,
+        hash: String,
+        len: u64,
+        truncated: bool,
+        lease: capture_budget::SpillLease,
+    ) -> Self {
+        Self {
+            _ownership: Arc::new(CaptureSpillOwnership {
+                path: path.clone(),
+                _lease: lease,
+            }),
+            path,
+            hash,
+            len,
+            truncated,
+        }
+    }
+}
+
+/// What to connect to the child's stdin.
+///
+/// In [`ExecMode::Capture`] the variants map directly onto the child's fd 0.
+/// In [`ExecMode::PtyTee`] the child's stdin is always the PTY slave;
+/// `Inherit` forwards the real terminal's input (when it is a tty), while
+/// `Bytes`/`File` write the given data into the PTY master and `Null` sends
+/// nothing. `Stream` is Capture-only because a PTY has no portable input
+/// half-close with which to signal the end of a finite stream.
+#[derive(Debug, Clone)]
+pub enum StdinSpec {
+    /// `/dev/null` (Capture) / nothing forwarded (PtyTee).
+    Null,
+    /// Inherit the parent's stdin (Capture) / forward the real tty (PtyTee).
+    Inherit,
+    /// Feed the given bytes, then close (Capture) or stop writing (PtyTee).
+    Bytes(Vec<u8>),
+    /// Feed the contents of a file.
+    File(PathBuf),
+    /// Feed bounded chunks supplied incrementally by an owning producer.
+    /// Supported only by [`ExecMode::Capture`].
+    Stream(StdinStream),
+}
+
+/// Producer half of a bounded incremental stdin channel.
+#[derive(Debug, Clone)]
+pub struct StdinSink(SyncSender<Vec<u8>>);
+
+/// Maximum number of chunks retained by an incremental stdin queue.
+pub const MAX_STDIN_STREAM_CHUNKS: usize = 16;
+
+/// Maximum admitted size of one incremental stdin chunk.
+pub const MAX_STDIN_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A nonblocking incremental-stdin send failure.
+#[derive(Debug)]
+pub enum StdinTrySendError {
+    /// The bounded queue currently has no room; retrying is allowed.
+    Full(Vec<u8>),
+    /// The child side has closed; retrying cannot succeed.
+    Disconnected(Vec<u8>),
+    /// The chunk exceeds [`MAX_STDIN_STREAM_CHUNK_BYTES`].
+    ChunkTooLarge(Vec<u8>),
+}
+
+impl StdinTrySendError {
+    /// Recover ownership of the chunk that was not admitted.
+    pub fn into_inner(self) -> Vec<u8> {
+        match self {
+            Self::Full(chunk) | Self::Disconnected(chunk) | Self::ChunkTooLarge(chunk) => chunk,
+        }
+    }
+}
+
+impl StdinSink {
+    /// Attempt to enqueue one bounded chunk without blocking. The producer
+    /// owns its backpressure/cancellation policy and can retry a returned full
+    /// chunk. Oversized chunks fail closed rather than defeating the queue's
+    /// retained-byte bound.
+    pub fn try_send(&self, chunk: Vec<u8>) -> Result<(), StdinTrySendError> {
+        if chunk.len() > MAX_STDIN_STREAM_CHUNK_BYTES {
+            return Err(StdinTrySendError::ChunkTooLarge(chunk));
+        }
+        self.0.try_send(chunk).map_err(|error| match error {
+            TrySendError::Full(chunk) => StdinTrySendError::Full(chunk),
+            TrySendError::Disconnected(chunk) => StdinTrySendError::Disconnected(chunk),
+        })
+    }
+}
+
+/// Single-consumer half stored inside [`StdinSpec::Stream`]. Cloning an
+/// `ExecSpec` shares the same one-shot receiver; exactly one execution may
+/// claim it.
+#[derive(Clone)]
+pub struct StdinStream(Arc<Mutex<Option<Receiver<Vec<u8>>>>>);
+
+impl std::fmt::Debug for StdinStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StdinStream(..)")
+    }
+}
+
+impl StdinStream {
+    fn take(&self) -> io::Result<Receiver<Vec<u8>>> {
+        let mut receiver = self.0.lock().map_err(|_| {
+            // A panic while this one-shot cell was locked leaves it unknowable
+            // whether the receiver was already moved into an execution. Never
+            // recover the inner Option: doing so could duplicate ownership of
+            // the child stdin stream.
+            io::Error::other("incremental stdin stream ownership state is poisoned")
+        })?;
+        receiver.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "incremental stdin stream was already consumed",
+            )
+        })
+    }
+}
+
+/// Create a bounded incremental stdin path. `capacity` is clamped to
+/// `1..=`[`MAX_STDIN_STREAM_CHUNKS`] so neither side can accidentally request
+/// an unbounded queue or rendezvous.
+pub fn stream_stdin(capacity: usize) -> (StdinSink, StdinSpec) {
+    let (tx, rx) = sync_channel(capacity.clamp(1, MAX_STDIN_STREAM_CHUNKS));
+    (
+        StdinSink(tx),
+        StdinSpec::Stream(StdinStream(Arc::new(Mutex::new(Some(rx))))),
+    )
+}
+
+/// Execution mode — the mechanism behind the site/content/internals/language-conformance-contract.md PTY position rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMode {
+    /// stdout/stderr = pipes, stdin per spec, no controlling tty, child in
+    /// its own process group.
+    Capture,
+    /// Child on a real PTY (its own session): bytes stream raw to the REAL
+    /// terminal AND are teed into the returned stdout buffer; real stdin is
+    /// forwarded to the PTY (terminal in raw mode for the duration); window
+    /// resizes propagated; stderr merged into stdout (pty semantics).
+    PtyTee,
+}
+
+/// The outcome of one completed child process.
+#[derive(Debug, Clone)]
+pub struct ExecResult {
+    /// `Some(code)` on normal exit; `None` when the child died to a signal.
+    pub status: Option<i32>,
+    /// `Some("SIGSEGV")` etc. on signal death (never a `128+n` encoding).
+    pub signal: Option<String>,
+    /// Captured bytes (PtyTee: the teed, merged stream).
+    pub stdout: Vec<u8>,
+    /// Captured bytes (PtyTee: empty — stderr is merged into the pty stream).
+    pub stderr: Vec<u8>,
+    /// `true` when captured output hit the in-memory hard cap
+    /// ([`capture_hard_cap`]) and was truncated: the buffered `stdout`/`stderr`
+    /// (or the PtyTee `stdout`) is a prefix of what the child actually produced.
+    /// The child still ran to completion and, for PtyTee, the real terminal saw
+    /// the full stream — only the returned buffer is bounded.
+    ///
+    /// When [`ExecResult::stdout_spill`] is `Some`, stdout was **not** lost to
+    /// this flag — it overflowed the RAM cap but was preserved on disk; `stdout`
+    /// here is the bounded preview. `truncated` then reflects only stderr (or a
+    /// spill that itself hit [`capture_spill_cap`], mirrored in
+    /// [`CaptureSpill::truncated`]).
+    pub truncated: bool,
+    /// `Some` when this was a value-position capture ([`ExecSpec::spill`] set)
+    /// whose stdout overflowed the RAM cap and was streamed to disk (site/content/internals/language-conformance-contract.md).
+    /// The caller owns the referenced file and must adopt it into its CAS (or
+    /// delete it). `None` on every other path — no spill was requested, or
+    /// stdout fit within the RAM cap and is fully resident in `stdout`.
+    pub stdout_spill: Option<CaptureSpill>,
+    /// Wall-clock time from spawn to reap.
+    pub dur: std::time::Duration,
+    /// The child's process id (also its process-group id).
+    pub pid: u32,
+    /// The child's process-group id. Every child is placed in its own process
+    /// group (Capture: `setpgid(0, 0)` in the child; PtyTee: the child is a
+    /// session leader via `setsid`, so its group id equals its pid). Job control
+    /// (site/content/internals/language-conformance-contract.md) signals the whole group via `kill(-pgid, …)`.
+    pub pgid: u32,
+    /// `true` when a PtyTee foreground child was **stopped** (SIGTSTP/SIGSTOP —
+    /// e.g. the user pressed Ctrl-Z) rather than having exited. The child is
+    /// alive and suspended, its live PTY parked for resumption (see
+    /// [`take_stopped_job`]); `status`/`signal` are both `None`. Always `false`
+    /// for Capture and for any normally-terminated child. A [`run`] caller that
+    /// never uses job control can ignore this field — it stays `false` unless a
+    /// real terminal stop occurs.
+    pub stopped: bool,
+    /// `Some` iff `ExecSpec::sandbox` was set, reporting the OS-enforcement
+    /// tier that was **actually** applied to this child (site/content/internals/language-conformance-contract.md tier
+    /// honesty) — never `enforced: true` unless it really was. `None` means
+    /// no sandbox was requested; it does not mean one was silently applied.
+    pub enforcement: Option<crate::leash::EnforcementStatus>,
+}
+
+impl ExecResult {
+    /// Whether `stdout` contains the complete stream rather than a bounded
+    /// prefix. Callers must check this before interpreting it structurally.
+    pub fn stdout_is_complete(&self) -> bool {
+        !self.truncated && self.stdout_spill.is_none()
+    }
+}
+
+/// Install the interactive shell's job-control signal dispositions (site/content/internals/language-conformance-contract.md):
+/// a no-op **handler** (not `SIG_IGN`) for `SIGTSTP`, `SIGTTOU`, and `SIGTTIN`,
+/// so the shell itself is never suspended by a stray Ctrl-Z or by the terminal-
+/// control operations of the handoff. Crucially this uses a handler rather than
+/// `SIG_IGN` because `exec` resets *caught* signals to `SIG_DFL` in a child
+/// while `SIG_IGN` would persist across exec — so spawned children still get the
+/// default disposition, which is exactly what lets Ctrl-Z stop them on their pty.
+/// Idempotent; a host (the REPL) calls this once at startup when interactive.
+/// OS refusal is surfaced so the shell never claims job-control safety while
+/// still carrying the default stop dispositions.
+pub fn install_shell_job_control_signals() -> io::Result<()> {
+    extern "C" fn noop(_sig: libc::c_int) {}
+    for sig in [libc::SIGTSTP, libc::SIGTTOU, libc::SIGTTIN] {
+        // SAFETY: installing a trivial (empty, async-signal-safe) handler with a
+        // zeroed sigaction whose mask we clear and SA_RESTART set.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop as *const () as usize;
+            if libc::sigemptyset(&raw mut sa.sa_mask) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            sa.sa_flags = libc::SA_RESTART;
+            if libc::sigaction(sig, &raw const sa, std::ptr::null_mut()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Send `SIGTSTP` to a whole process group (`kill(-pgid, SIGTSTP)`) — the job-
+/// control "suspend this job" primitive (site/content/internals/language-conformance-contract.md). Memory-safe; a `SIGTSTP` to
+/// an already-stopped group is a harmless no-op. Exposed so hosts/the evaluator
+/// can drive suspend/resume without a direct `libc` dependency.
+pub fn suspend_group(pgid: i32) {
+    // SAFETY: signalling a process group is memory-safe.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTSTP);
+    }
+}
+
+/// Send `SIGCONT` to a whole process group — the "resume this job" primitive.
+pub fn continue_group(pgid: i32) {
+    // SAFETY: signalling a process group is memory-safe.
+    unsafe {
+        libc::kill(-pgid, libc::SIGCONT);
+    }
+}
+
+/// Run `spec` to completion, blocking the calling thread.
+///
+/// Cancellation: once `cancel` trips, the child's process group receives
+/// `SIGINT`, escalating to `SIGTERM` after 3 s and `SIGKILL` after 3 more.
+/// The function still returns `Ok` in that case, with [`ExecResult::signal`]
+/// recording how the child died.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] when the program cannot be resolved
+/// ([`io::ErrorKind::NotFound`]), when spawning fails (`E2BIG` surfaces here
+/// with its OS error code), or when PTY/pipe plumbing fails.
+pub fn run(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
+    match spec.mode {
+        ExecMode::Capture => capture::run_capture(spec, cancel),
+        ExecMode::PtyTee => pty::run_pty(spec, cancel),
+    }
+}
+
+/// Run a capture-only [`ExecSpec`] with the hostile-helper guarantees of
+/// [`run_bounded_command`], while still applying [`ExecSpec::sandbox`] and the
+/// caller's complete environment/cwd. A requested filesystem sandbox is a hard
+/// requirement here: because this small result type has no enforcement-status
+/// channel, the command is refused rather than silently running unconfined.
+/// The retained stdout+stderr prefix is capped at `output_cap`; `timeout` and
+/// `cancel` terminate and reap the whole process group.
+///
+/// This is intended for short control-plane probes and provider hooks. It
+/// rejects PTY mode, non-null stdin, and spill requests rather than silently
+/// changing their semantics.
+pub fn run_bounded(
+    mut spec: ExecSpec,
+    timeout: Duration,
+    output_cap: usize,
+    cancel: &CancelToken,
+) -> io::Result<BoundedCommandOutput> {
+    if spec.mode != ExecMode::Capture
+        || !matches!(&spec.stdin, StdinSpec::Null)
+        || spec.spill.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded execution requires capture mode, null stdin, and no spill",
+        ));
+    }
+    if spec.argv.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded execution requires argv[0]",
+        ));
+    }
+    let filesystem_sandbox_requested = spec.sandbox.as_ref().is_some_and(|policy| {
+        policy.filesystem_requested
+            || !policy.fs.read.is_empty()
+            || !policy.fs.write.is_empty()
+            || !policy.fs.delete.is_empty()
+    });
+    let enforcement = sandbox::apply(&mut spec)?;
+    if filesystem_sandbox_requested
+        && !enforcement
+            .as_ref()
+            .is_some_and(|status| status.filesystem_enforced)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded provider command requires filesystem sandbox enforcement",
+        ));
+    }
+    let mut command = std::process::Command::new(&spec.argv[0]);
+    command
+        .args(&spec.argv[1..])
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(spec.env);
+    bounded::run_bounded_command_cancellable(&mut command, timeout, output_cap, cancel)
+}
+
+/// Run through the child-only Landlock/Seatbelt launcher, always with a
+/// **hard** guarantee: the parent is never restricted, and the request
+/// fails closed (no spawn at all) if the strongest backend on this platform
+/// is unavailable, rather than ever running unconfined. Prefer
+/// `ExecSpec::sandbox` (with `hermetic: true` for the same fail-closed
+/// guarantee, or `false` to degrade honestly instead of refusing) for new
+/// callers — this function is kept for source compatibility.
+pub fn run_sandboxed(
+    spec: ExecSpec,
+    cancel: &CancelToken,
+    sandbox: crate::leash::FsSandbox,
+    verified: Option<&crate::leash::SpawnPreflight>,
+) -> io::Result<ExecResult> {
+    let hard_won = verified.is_some();
+    let wrapped = sandbox_spec(spec, sandbox, verified)?;
+    let mut result = run(wrapped, cancel)?;
+    result
+        .enforcement
+        .get_or_insert_with(|| hard_landlock_status(hard_won));
+    Ok(result)
+}
+
+/// Streaming capture variant of [`run_sandboxed`].
+pub fn spawn_capture_sandboxed(
+    spec: ExecSpec,
+    cancel: &CancelToken,
+    sandbox: crate::leash::FsSandbox,
+    verified: Option<&crate::leash::SpawnPreflight>,
+) -> io::Result<StreamingChild> {
+    if spec.mode != ExecMode::Capture {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spawn_capture_sandboxed requires Capture mode",
+        ));
+    }
+    spawn_capture(sandbox_spec(spec, sandbox, verified)?, cancel)
+}
+
+fn hard_landlock_status(spawn_exec_enforced: bool) -> crate::leash::EnforcementStatus {
+    crate::leash::EnforcementStatus {
+        available_tier: crate::leash::EnforcementTier::A,
+        active_tier: Some(crate::leash::EnforcementTier::A),
+        enforced: true,
+        detail: "Landlock applied via run_sandboxed's hard-requirement helper wrapping".into(),
+        landlock_abi: crate::leash::landlock_abi(),
+        filesystem_enforced: true,
+        spawn_exec_enforced,
+        network_enforced: false,
+        cpu_limit_enforced: false,
+        memory_limit_enforced: false,
+    }
+}
+
+fn sandbox_spec(
+    mut spec: ExecSpec,
+    sandbox: crate::leash::FsSandbox,
+    verified: Option<&crate::leash::SpawnPreflight>,
+) -> io::Result<ExecSpec> {
+    if crate::leash::landlock_abi().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard Landlock enforcement unavailable",
+        ));
+    }
+    let program = which::resolve_program(&spec.argv, &spec.env, &spec.cwd)?;
+    if let Some(expected) = verified {
+        let actual = crate::leash::preflight_spawn(&program, std::slice::from_ref(&expected.hash))?;
+        if !expected.allowed || actual.hash != expected.hash {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "verified spawn hash does not match resolved binary",
+            ));
+        }
+    }
+    let helper = sandbox::sandbox_helper()?;
+    spec.argv = sandbox::wrap(
+        helper,
+        &sandbox,
+        crate::leash::NetPolicy::Unrestricted,
+        crate::leash::ProcessLimits::default(),
+        program,
+        &spec.argv,
+    );
+    Ok(spec)
+}
+
+#[cfg(test)]
+mod stdin_stream_poison_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_stdin_receiver_fails_closed_without_claiming_it() {
+        let (_sink, stdin) = stream_stdin(1);
+        let StdinSpec::Stream(stream) = stdin else {
+            panic!("stream_stdin must return an incremental stream");
+        };
+        let poison_target = stream.clone();
+        let poisoner = std::thread::Builder::new()
+            .name("poison-stdin-stream".into())
+            .spawn(move || {
+                let _receiver = poison_target
+                    .0
+                    .lock()
+                    .expect("stdin receiver starts healthy");
+                panic!("inject stdin receiver poison");
+            })
+            .expect("spawn stdin poisoner");
+        assert!(poisoner.join().is_err());
+
+        for _ in 0..2 {
+            let error = stream
+                .take()
+                .expect_err("poisoned ownership must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                "incremental stdin stream ownership state is poisoned"
+            );
+        }
+        assert!(stream.0.is_poisoned(), "ownership poison is never cleared");
+    }
+
+    #[test]
+    fn production_stdin_receiver_has_no_panicking_lock_access() {
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let compact = production.split_whitespace().collect::<String>();
+        for forbidden in [".lock().unwrap(", ".lock().expect("] {
+            assert!(
+                !compact.contains(forbidden),
+                "production exec synchronization contains `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_hashing_streams_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("program");
+        let bytes = vec![b'x'; 3 * 64 * 1024 + 17];
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            hash_regular_file(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_eq!(
+            hash_regular_file(directory.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn production_executable_hashing_never_reads_whole_files() {
+        let production = include_str!("mod.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("std::fs::read(&program)"));
+        assert!(production.contains("[0u8; 64 * 1024]"));
+    }
+}

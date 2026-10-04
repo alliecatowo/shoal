@@ -67,9 +67,10 @@ deliberate port (see [Current status and limits](https://alliecatowo.github.io/s
 
 Prebuilt Linux and macOS (x86_64 and arm64) binaries are attached to each
 [GitHub release](https://github.com/alliecatowo/shoal/releases) with SHA-256 checksums. Shoal is
-not on crates.io yet (the `shoal` crate name is taken by an unrelated project). To build from source:
-`cargo install --git https://github.com/alliecatowo/shoal shoal shoal-kernel shoal-mcp shoal-exec shoal-leash`
-(`shoal` alone runs standalone with a warning; the kernel, MCP bridge, and sandbox helpers are separate binaries).
+published on crates.io as `shoal-sh` (the `shoal` crate name belongs to an unrelated project); the
+command is still `shoal`. To build from source:
+`cargo install shoal-sh` (or `cargo install --git https://github.com/alliecatowo/shoal shoal-sh`), which installs `shoal`, `shoal-kernel`, `shoal-mcp`, the sandbox helpers and the other companion binaries.
+
 
 Install a release with Homebrew (macOS and Linux), or download a tarball for your platform from the
 [releases page](https://github.com/alliecatowo/shoal/releases/latest):
@@ -90,10 +91,10 @@ mise run install
 shoal
 
 # Evaluate source
-cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
+cargo run -p shoal-sh --bin shoal -- -c $'let answer = 6 * 7\nanswer'
 
 # Run a script
-cargo run -p shoal -- examples/example.shl
+cargo run -p shoal-sh --bin shoal -- examples/example.shl
 ```
 
 The repository currently ships **49 declarative adapters** and a normative corpus of **1,355
@@ -185,7 +186,7 @@ page/help execution, diagram governance, and the documentation build.
 Run only the executable language contract with:
 
 ```bash
-cargo test -p shoal --test conformance --locked -- --nocapture
+cargo test -p shoal-sh --test cli_conformance --locked -- --nocapture
 ```
 
 Contributors and coding agents should start with [CLAUDE.md](CLAUDE.md), then follow its links to
