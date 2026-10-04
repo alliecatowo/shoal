@@ -12,7 +12,7 @@ mod handlers_stream;
 mod handlers_task;
 mod handlers_value;
 mod lifecycle;
-mod peer;
+pub(crate) mod peer;
 mod session;
 mod state;
 mod wire;

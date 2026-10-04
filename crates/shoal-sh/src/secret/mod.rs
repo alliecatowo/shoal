@@ -159,8 +159,15 @@ impl Drop for PlainSecrets {
 impl SecretStore {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let s = Self { dir: dir.into() };
+        let existed = s.dir.exists();
         fs::create_dir_all(&s.dir)?;
-        secure_dir(&s.dir)?;
+        if existed {
+            // Never chmod a directory we did not create (it may be $HOME or a
+            // shared dir): require it to be ours and already private.
+            verify_private_dir(&s.dir)?;
+        } else {
+            secure_dir(&s.dir)?;
+        }
         // Key creation must share the same interprocess transaction lock as
         // map updates: two first-openers must never install different keys.
         s.with_exclusive_lock(|| {
@@ -501,6 +508,48 @@ fn validate_json_shape(
 }
 fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+#[cfg(unix)]
+fn verify_private_dir(p: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = fs::metadata(p)?;
+    // SAFETY: geteuid has no preconditions.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "secret dir {} is not owned by the current user",
+                p.display()
+            ),
+        ));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        // Tighten only a directory that is evidently a secret store (empty or
+        // holding just our files). Anything else (e.g. $HOME) is not ours to chmod.
+        let ours = fs::read_dir(p)?.all(|entry| {
+            entry.is_ok_and(|e| {
+                matches!(
+                    e.file_name().to_str(),
+                    Some("master.key" | "secrets.json" | ".secrets.lock")
+                )
+            })
+        });
+        if !ours {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "secret dir {} is accessible by other users and holds other files; use a dedicated directory or `chmod 700` it",
+                    p.display()
+                ),
+            ));
+        }
+        return secure_dir(p);
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn verify_private_dir(_: &Path) -> io::Result<()> {
+    Ok(())
 }
 #[cfg(unix)]
 fn secure_dir(p: &Path) -> io::Result<()> {

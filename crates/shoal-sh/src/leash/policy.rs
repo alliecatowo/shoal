@@ -252,13 +252,11 @@ impl Policy {
             Effect::FsRead { paths } => paths_verdict(paths, &p.fs_read),
             Effect::FsWrite { paths } => paths_verdict(paths, &p.fs_write),
             Effect::FsDelete { paths } => paths_verdict(paths, &p.fs_delete),
-            Effect::ProcSpawn { bin_hash, argv0 } => bool_verdict(p.proc_spawn.iter().any(|g| {
-                g == bin_hash
-                    || g == argv0
-                    || Path::new(argv0)
-                        .file_name()
-                        .is_some_and(|n| n == g.as_str())
-            })),
+            Effect::ProcSpawn { bin_hash, argv0 } => bool_verdict(
+                p.proc_spawn
+                    .iter()
+                    .any(|g| spawn_pin_matches(g, bin_hash, argv0)),
+            ),
             Effect::NetConnect { host, port } => {
                 bool_verdict(p.net_connect.iter().any(|g| host_grant(g, host, *port)))
             }
@@ -536,12 +534,67 @@ fn grants_include_root(grants: &[String]) -> bool {
 fn grant_roots(grants: &[String]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = grants
         .iter()
-        .filter_map(|g| grant_root(g))
+        .flat_map(|g| expand_grant_roots(g))
         .filter(|p| p.exists())
         .collect();
     out.sort();
     out.dedup();
     out
+}
+
+/// Like [`grant_root`] but narrower for mid-path wildcards: `/a/b*/c` yields
+/// each existing `/a/bX/c` instead of the whole `/a` subtree. A trailing
+/// wildcard (`/work/*.txt`, `/work/**`) still lowers to its directory, which
+/// the OS backends cannot narrow further; the semantic check stays exact.
+fn expand_grant_roots(grant: &str) -> Vec<PathBuf> {
+    const MAX_EXPANSION: usize = 256;
+    let Some(first) = grant_root(grant) else {
+        return Vec::new();
+    };
+    let expanded = if let Some(rest) = grant.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(rest)
+    } else {
+        PathBuf::from(grant)
+    };
+    let comps: Vec<Component> = expanded.components().collect();
+    let mut bases = vec![PathBuf::new()];
+    for (i, comp) in comps.iter().enumerate() {
+        let last = i + 1 == comps.len();
+        match comp {
+            Component::RootDir | Component::Prefix(_) => {
+                bases.iter_mut().for_each(|b| b.push(comp.as_os_str()));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => bases.iter_mut().for_each(|b| {
+                b.pop();
+            }),
+            Component::Normal(seg) => {
+                let seg = seg.to_string_lossy();
+                if !has_glob_meta(&seg) {
+                    bases.iter_mut().for_each(|b| b.push(&*seg));
+                } else if last || seg == "**" {
+                    return bases;
+                } else {
+                    let mut next = Vec::new();
+                    for b in &bases {
+                        let pat = format!("{}/{}", Pattern::escape(&b.to_string_lossy()), seg);
+                        if let Ok(paths) = glob::glob(&pat) {
+                            next.extend(paths.flatten().filter(|p| p.is_dir()));
+                        }
+                    }
+                    next.truncate(MAX_EXPANSION);
+                    if next.is_empty() {
+                        return Vec::new();
+                    }
+                    bases = next;
+                }
+            }
+        }
+    }
+    if bases.is_empty() { vec![first] } else { bases }
 }
 
 fn flatten_namespace(table: &mut toml::Table, namespace: &str, fields: &[&str]) {
@@ -811,8 +864,105 @@ fn path_grant(grant: &str, path: &Path) -> bool {
     } else {
         grant.to_owned()
     };
-    let normalized = normalize(path);
-    Pattern::new(&expanded).is_ok_and(|p| p.matches_path(&normalized))
+    let target = resolve_existing_prefix(&normalize(path));
+    let pattern = canonical_grant_pattern(&expanded);
+    // `*`/`?` must not cross `/` (`work/*.txt` is not `work/sub/deep.txt`);
+    // `**` as a whole component still recurses.
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    Pattern::new(&pattern).is_ok_and(|p| p.matches_path_with(&target, opts))
+}
+
+/// Canonicalize the longest existing ancestor of `path` (resolving symlinks)
+/// and re-append the not-yet-existing tail, so a symlink inside a granted tree
+/// that points outside it no longer satisfies the grant.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(real) = cur.canonicalize() {
+            let mut out = real;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (cur.file_name().map(|n| n.to_owned()), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                cur = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Rewrite a grant so its concrete leading directory is canonical (symlinks
+/// resolved, glob metacharacters escaped), leaving the glob tail untouched.
+fn canonical_grant_pattern(expanded: &str) -> String {
+    let mut root = PathBuf::new();
+    let mut rest: Vec<String> = Vec::new();
+    for comp in Path::new(expanded).components() {
+        match comp {
+            Component::RootDir | Component::Prefix(_) => root.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir if rest.is_empty() => {
+                root.pop();
+            }
+            Component::ParentDir => {
+                rest.pop();
+            }
+            Component::Normal(seg) => {
+                let seg = seg.to_string_lossy().into_owned();
+                if !rest.is_empty() || has_glob_meta(&seg) {
+                    rest.push(seg);
+                } else {
+                    root.push(seg);
+                }
+            }
+        }
+    }
+    let root = resolve_existing_prefix(&root);
+    let mut out = Pattern::escape(&root.to_string_lossy());
+    for seg in rest {
+        if !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(&seg);
+    }
+    out
+}
+
+/// Directories commonly holding trusted system binaries. A bare-name pin
+/// (`proc_spawn = ["cargo"]`) admits an absolute argv0 only from one of these;
+/// anywhere else the pin must be the full resolved path or a content hash.
+const SYSTEM_BIN_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/opt/homebrew/bin",
+];
+
+fn spawn_pin_matches(grant: &str, bin_hash: &str, argv0: &str) -> bool {
+    if grant == bin_hash {
+        return true;
+    }
+    let argv = Path::new(argv0);
+    if !argv0.contains('/') {
+        return grant == argv0;
+    }
+    // argv0 is a path: compare resolved absolute paths, never the basename.
+    if grant.contains('/') {
+        let g = resolve_existing_prefix(&normalize(Path::new(grant)));
+        return g == resolve_existing_prefix(&normalize(argv));
+    }
+    argv.file_name().is_some_and(|n| n == grant)
+        && argv
+            .parent()
+            .is_some_and(|d| SYSTEM_BIN_DIRS.iter().any(|s| d == Path::new(s)))
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -906,5 +1056,63 @@ mod input_tests {
             .unwrap();
         assert!(!production.contains("fs::read_to_string"));
         assert!(production.contains("POLICY_MAX_BYTES + 1"));
+    }
+}
+
+#[cfg(test)]
+mod semantics_tests {
+    use super::*;
+
+    fn allows(grant: &str, path: &Path) -> bool {
+        path_grant(grant, path)
+    }
+
+    #[test]
+    fn single_star_does_not_cross_path_separators() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        let g = format!("{}/work/*.txt", root.display());
+        assert!(allows(&g, &root.join("work/a.txt")));
+        assert!(!allows(&g, &root.join("work/sub/deep.txt")));
+        let rec = format!("{}/work/**", root.display());
+        assert!(allows(&rec, &root.join("work/sub/deep.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_out_of_a_grant_does_not_satisfy_it() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::os::unix::fs::symlink(root.join("secret"), root.join("work/link")).unwrap();
+        let g = format!("{}/work/**", root.display());
+        assert!(allows(&g, &root.join("work/new.txt")));
+        assert!(!allows(&g, &root.join("work/link/key")));
+    }
+
+    #[test]
+    fn mid_path_wildcards_narrow_os_roots() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        for n in ["b1/c", "b2/c", "other/c"] {
+            std::fs::create_dir_all(root.join(n)).unwrap();
+        }
+        let roots = grant_roots(&[format!("{}/b*/c", root.display())]);
+        assert_eq!(roots, vec![root.join("b1/c"), root.join("b2/c")]);
+        // a trailing wildcard still lowers to its directory
+        let roots = grant_roots(&[format!("{}/b1/*.txt", root.display())]);
+        assert_eq!(roots, vec![root.join("b1")]);
+    }
+
+    #[test]
+    fn proc_spawn_pin_compares_resolved_paths_not_basename() {
+        assert!(spawn_pin_matches("true", "", "true"));
+        assert!(spawn_pin_matches("true", "", "/usr/bin/true"));
+        assert!(!spawn_pin_matches("true", "", "/home/agent/work/true"));
+        assert!(!spawn_pin_matches("true", "", "./true"));
+        assert!(spawn_pin_matches("/opt/tool/run", "", "/opt/tool/run"));
+        assert!(!spawn_pin_matches("/opt/tool/run", "", "/tmp/run"));
+        assert!(spawn_pin_matches("abc123", "abc123", "/anywhere/x"));
     }
 }

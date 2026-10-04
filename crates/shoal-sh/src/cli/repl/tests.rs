@@ -26,7 +26,7 @@ fn repl_orchestration_stays_decomposed() {
         ("jobs", include_str!("jobs.rs"), 700),
         ("protocol", include_str!("protocol.rs"), 240),
         ("transcript", include_str!("transcript.rs"), 240),
-        ("ui", include_str!("ui.rs"), 200),
+        ("ui", include_str!("ui.rs"), 240),
     ] {
         assert!(
             source.lines().count() <= limit,

@@ -197,9 +197,16 @@ fn secure_socket_dir(parent: &Path) -> io::Result<()> {
     };
     let pre_existing = parent.exists();
     fs::create_dir_all(parent).map_err(describe)?;
-    let owned_by_us = fs::metadata(parent)
-        .map(|m| m.uid() == unsafe { geteuid() })
-        .unwrap_or(false);
+    let owner = fs::metadata(parent).map(|m| m.uid()).map_err(describe)?;
+    let owned_by_us = owner == unsafe { geteuid() };
+    if pre_existing && !owned_by_us && owner != 0 {
+        // A directory another non-root user controls (e.g. a pre-created
+        // /tmp/shoal-<uid>) lets them swap or squat our socket path.
+        return Err(describe(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("directory is owned by uid {owner}, not by this user"),
+        )));
+    }
     if pre_existing && !owned_by_us {
         // Not ours to chmod: skip. The socket file created inside it is
         // still 0600, which is the boundary that actually matters.
