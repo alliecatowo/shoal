@@ -287,4 +287,4 @@ proptest = "1.7"
 wasmprinter = "0.258"
 wat = "1"
 wit-component = { version = "0.258", features = ["dummy-module"] }
-wit-parser = "0.258"
+wit-parser = "0.261"
