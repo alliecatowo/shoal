@@ -284,7 +284,7 @@ landlock = "0.4.5"
 criterion = "0.8"
 pretty_assertions = "1.4.1"
 proptest = "1.7"
-wasmprinter = "0.258"
+wasmprinter = "0.261"
 wat = "1"
 wit-component = { version = "0.258", features = ["dummy-module"] }
 wit-parser = "0.258"
