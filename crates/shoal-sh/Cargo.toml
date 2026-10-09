@@ -286,5 +286,5 @@ pretty_assertions = "1.4.1"
 proptest = "1.7"
 wasmprinter = "0.258"
 wat = "1"
-wit-component = { version = "0.258", features = ["dummy-module"] }
+wit-component = { version = "0.261", features = ["dummy-module"] }
 wit-parser = "0.258"
